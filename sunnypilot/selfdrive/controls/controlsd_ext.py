@@ -31,7 +31,7 @@ class ControlsExt(ModelStateBase):
     self.CP_SP = messaging.log_from_bytes(params.get("CarParamsSP", block=True), custom.CarParamsSP)
     cloudlog.info("controlsd_ext got CarParamsSP")
 
-    self.sm_services_ext = ['radarState', 'selfdriveStateSP']
+    self.sm_services_ext = ['radarState', 'selfdriveStateSP', 'carStateSP']
     self.pm_services_ext = ['carControlSP']
 
   def initialize_lateral_control(self, lac, CI, dt):
@@ -72,6 +72,15 @@ class ControlsExt(ModelStateBase):
                                                    ltp.frictionCoefficientFiltered)
     if not CC.latActive:
       self.LaC_secondary.reset()
+      return
+    # cooperative torque only steers when it's the active channel: the carcontroller decides that
+    # (torque_active -- only it knows hands_on / EPAS / handoff) and feeds it back via carStateSP. while its
+    # output is discarded (angle control steering) don't even run the PID, and reset it, so it can't wind up
+    # open-loop and rail. when applied it runs exactly like stock (steeringPressed freezes the integrator;
+    # a genuinely-driving output is closed-loop -> no windup).
+    if not sm['carStateSP'].torqueActive:
+      self.LaC_secondary.reset()
+      self.LaC_secondary.pid.reset()
       return
     steer, _, _ = self.LaC_secondary.update(CC.latActive, sm['carState'], self.VM, lp,
                                             self.steer_limited_by_safety, self.desired_curvature,

@@ -264,6 +264,9 @@ class Car:
     cs_sp_send = messaging.new_message('carStateSP')
     cs_sp_send.valid = CS.canValid
     cs_sp_send.carStateSP = CS_SP
+    # feed the carcontroller's lateral mode back to controlsd (Rivian cooperative torque); generic getattr so
+    # other cars publish False. ~1 frame old (set by the previous apply()), fine vs the 0.1-1s torque windows.
+    cs_sp_send.carStateSP.torqueActive = bool(getattr(getattr(getattr(self.CI, 'CC', None), 'erc', None), 'torque_active', False))
     self.pm.send('carStateSP', cs_sp_send)
 
   def controls_update(self, CS: car.CarState, CC: car.CarControl, CC_SP: custom.CarControlSP):
