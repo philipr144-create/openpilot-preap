@@ -34,6 +34,9 @@ class VCruiseHelper:
     self.v_cruise_kph = V_CRUISE_UNSET
     self.v_cruise_cluster_kph = V_CRUISE_UNSET
     self.v_cruise_kph_last = 0
+    # --- TINKLA SPEED LIMIT LOGIC ---
+    self.last_mcu_speed_limit = 0.0
+    self.mcu_speed_limit_offset_mph = 5.0  # Set your desired MPH offset here
     self.button_timers = {ButtonType.decelCruise: 0, ButtonType.accelCruise: 0}
     self.button_change_states = {btn: {"standstill": False, "enabled": False} for btn in self.button_timers}
 
@@ -69,6 +72,19 @@ class VCruiseHelper:
     if not enabled:
       return
 
+
+    # --- TINKLA SPEED LIMIT LOGIC ---
+    # Automatically update set speed if a new speed limit is detected
+    current_speed_limit = CS.cruiseState.speedLimit * CV.MS_TO_MPH
+    if current_speed_limit > 0 and current_speed_limit != self.last_mcu_speed_limit:
+        self.last_mcu_speed_limit = current_speed_limit
+        
+        # Calculate new target speed in KPH with offset
+        target_kph = (current_speed_limit + self.mcu_speed_limit_offset_mph) * CV.MPH_TO_KPH
+        
+        # Only auto-update if the car is moving faster than the minimum cruise speed
+        if CS.vEgo * CV.MS_TO_KPH > V_CRUISE_MIN:
+            self.v_cruise_kph = target_kph
     long_press = False
     button_type = None
 
@@ -99,6 +115,13 @@ class VCruiseHelper:
     if not self.button_change_states[button_type]["enabled"]:
       return
 
+
+    # --- TINKLA SPEED LIMIT LOGIC ---
+    # Intercept long press to snap to speed limit instead of 5mph jumps
+    if long_press and button_type == ButtonType.accelCruise and self.last_mcu_speed_limit > 0:
+        target_kph = (self.last_mcu_speed_limit + self.mcu_speed_limit_offset_mph) * CV.MPH_TO_KPH
+        self.v_cruise_kph = target_kph
+        return
     v_cruise_delta = v_cruise_delta * (5 if long_press else 1)
     if long_press and self.v_cruise_kph % v_cruise_delta != 0:  # partial interval
       self.v_cruise_kph = CRUISE_NEAREST_FUNC[button_type](self.v_cruise_kph / v_cruise_delta) * v_cruise_delta
