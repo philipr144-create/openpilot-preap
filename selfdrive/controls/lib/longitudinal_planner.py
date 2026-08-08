@@ -16,7 +16,7 @@ from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 
-A_CRUISE_MAX_VALS = [1.6, 1.2, 0.8, 0.6]
+A_CRUISE_MAX_VALS = [2.2, 1.8, 1.2, 0.8]
 A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]
 
 # Pre-AP follow-mode accel cap: imported lazily to avoid circular deps
