@@ -200,7 +200,7 @@ class LongitudinalPlanner:
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
 
     if sm['selfdriveState'].experimentalMode:
-      output_a_target = min(output_a_target_e2e, output_a_target_mpc)
+      output_a_target = min(output_a_target_e2e + 0.5, output_a_target_mpc)
       self.output_should_stop = output_should_stop_e2e or output_should_stop_mpc
       if output_a_target < output_a_target_mpc:
         self.mpc.source = LongitudinalPlanSource.e2e
