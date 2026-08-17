@@ -71,76 +71,6 @@ def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.
                                   desiredAcceleration=float(desired_accel),
                                   shouldStop=bool(should_stop))
 
-
-# TESLA_NAVI_DESIRE_V03
-class TeslaNaviDesire:
-  CAN_ID = 0x3C8
-  
-  # The Tesla distance signal is 5 bits * 10m. Max value is 310m.
-  # Values outside of the 10m-300m range are safely ignored.
-  MAX_DISTANCE_M = 300.0
-  MIN_DISTANCE_M = 10.0
-
-  def __init__(self):
-    self.branch_distance = 0.0
-    self.left_branch = False
-    self.right_branch = False
-    self.reject_left = False
-    self.reject_right = False
-
-  @staticmethod
-  def _get_bit(data, bit):
-    byte = bit // 8
-    bit_in_byte = bit % 8
-    if byte >= len(data):
-      return 0
-    return (data[byte] >> bit_in_byte) & 1
-
-  @staticmethod
-  def _get_bits(data, start_bit, length):
-    value = 0
-    for i in range(length):
-      value |= TeslaNaviDesire._get_bit(data, start_bit + i) << i
-    return value
-
-  def update_can(self, can_msg):
-    data = bytes(can_msg.dat)
-    if len(data) < 5:
-      return
-
-    # route_active check removed for pre-AP MCUs.
-    raw_dist = self._get_bits(data, 32, 5)
-    self.branch_distance = float(raw_dist * 10)
-    
-    self.left_branch = bool(self._get_bit(data, 38))
-    self.right_branch = bool(self._get_bit(data, 39))
-    self.reject_left = bool(self._get_bit(data, 40))
-    self.reject_right = bool(self._get_bit(data, 41))
-
-  def get_desire(self):
-    # A distance of 0 means either no active route, or the maneuver is > 310 meters away.
-    # A distance of 310 usually indicates "out of bounds/signal not available".
-    if self.branch_distance < self.MIN_DISTANCE_M:
-      return log.Desire.none
-
-    if self.branch_distance > self.MAX_DISTANCE_M:
-      return log.Desire.none
-
-    if self.reject_left and not self.reject_right:
-      return log.Desire.keepRight
-
-    if self.reject_right and not self.reject_left:
-      return log.Desire.keepLeft
-
-    if self.left_branch and not self.right_branch:
-      return log.Desire.keepLeft
-
-    if self.right_branch and not self.left_branch:
-      return log.Desire.keepRight
-
-    return log.Desire.none
-
-
 class FrameMeta:
   frame_id: int = 0
   timestamp_sof: int = 0
@@ -343,7 +273,7 @@ def main(demo=False):
 
   # messaging
   pm = PubMaster(["modelV2", "drivingModelData", "cameraOdometry"])
-  sm = SubMaster(["deviceState", "carState", "roadCameraState", "liveCalibration", "driverMonitoringState", "carControl", "liveDelay", "can"])
+  sm = SubMaster(["deviceState", "carState", "roadCameraState", "liveCalibration", "driverMonitoringState", "carControl", "liveDelay"])
 
   publish_state = PublishState()
   params = Params()
@@ -374,17 +304,6 @@ def main(demo=False):
   prev_action = log.ModelDataV2.Action()
 
   DH = DesireHelper()
-
-  # TESLA_NAVI_DESIRE_V03
-  tesla_nav = TeslaNaviDesire()
-  
-  # Read param directly from file to avoid UnknownKeyName crash
-  tesla_nav_enabled = False
-  try:
-    with open("/data/params/d/TeslaNavDesireEnabled", "r") as f:
-      tesla_nav_enabled = (f.read().strip() == "1")
-  except Exception:
-    pass
 
   while True:
     # Keep receiving frames until we are at least 1 frame ahead of previous extra frame
@@ -420,20 +339,7 @@ def main(demo=False):
       meta_extra = meta_main
 
     sm.update(0)
-
-    # TESLA_NAVI_DESIRE_V03
-    if tesla_nav_enabled and sm.updated["can"]:
-      for can_msg in sm["can"]:
-        if can_msg.address == tesla_nav.CAN_ID:
-          tesla_nav.update_can(can_msg)
-          break
-
     desire = DH.desire
-
-    if tesla_nav_enabled:
-      tesla_desire = tesla_nav.get_desire()
-      if tesla_desire != log.Desire.none and desire == log.Desire.none:
-        desire = tesla_desire
     is_rhd = sm["driverMonitoringState"].isRHD
     frame_id = sm["roadCameraState"].frameId
     v_ego = max(sm["carState"].vEgo, 0.)

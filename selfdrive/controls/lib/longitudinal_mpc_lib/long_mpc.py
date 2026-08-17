@@ -61,7 +61,7 @@ MIN_X_LEAD_FACTOR = 0.5
 
 def get_jerk_factor(personality=log.LongitudinalPersonality.standard):
   if personality==log.LongitudinalPersonality.relaxed:
-    return 1.0
+    return 2.0
   elif personality==log.LongitudinalPersonality.standard:
     return 1.0
   elif personality==log.LongitudinalPersonality.aggressive:
@@ -83,6 +83,16 @@ def get_T_FOLLOW(personality=log.LongitudinalPersonality.standard, nap_follow_di
     return 1.25
   else:
     raise NotImplementedError("Longitudinal personality not supported")
+
+def get_cruise_accel_limits(personality=log.LongitudinalPersonality.standard):
+  if personality==log.LongitudinalPersonality.relaxed:
+    return -0.8, 0.8
+  elif personality==log.LongitudinalPersonality.standard:
+    return -1.2, 1.2
+  elif personality==log.LongitudinalPersonality.aggressive:
+    return -1.5, 2.0
+  else:
+    return -1.2, 1.6
 
 def get_stopped_equivalence_factor(v_lead):
   return (v_lead**2) / (2 * COMFORT_BRAKE)
@@ -331,11 +341,15 @@ class LongitudinalMpc:
     lead_0_obstacle = lead_xv_0[:,0] + get_stopped_equivalence_factor(lead_xv_0[:,1])
     lead_1_obstacle = lead_xv_1[:,0] + get_stopped_equivalence_factor(lead_xv_1[:,1])
 
+    # Grab personality-specific limits dynamically
+    cruise_min_accel, cruise_max_accel = get_cruise_accel_limits(personality)
+
     # Fake an obstacle for cruise, this ensures smooth acceleration to set speed
     # when the leads are no factor.
-    v_lower = v_ego + (T_IDXS * CRUISE_MIN_ACCEL * 1.05)
+    v_lower = v_ego + (T_IDXS * cruise_min_accel * 1.05)
     # TODO does this make sense when max_a is negative?
-    v_upper = v_ego + (T_IDXS * CRUISE_MAX_ACCEL * 1.05)
+    v_upper = v_ego + (T_IDXS * cruise_max_accel * 1.05)
+
     v_cruise_clipped = np.clip(v_cruise * np.ones(N+1), v_lower, v_upper)
     cruise_obstacle = np.cumsum(T_DIFFS * v_cruise_clipped) + get_safe_obstacle_distance(v_cruise_clipped, t_follow)
 
