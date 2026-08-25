@@ -156,24 +156,11 @@ class LongitudinalPlanner:
     if force_slow_decel:
       v_cruise = 0.0
 
-    # Pre-AP adaptive accel: only limit accel when close to a lead.
-    # When the lead is far (>1.5x safe distance), full profile for gap closing.
-    # When the lead is close (<1.2x safe distance), cap to follow limits to
-    # prevent overshoot → regen → overshoot oscillation. Blend in between.
-    if self.CP.carFingerprint == "TESLA_MODEL_S_PREAP" and self.nap_adaptive_accel and sm['radarState'].leadOne.status:
+    # Pre-AP follow cap: always enforce follow_limit when lead is present to prevent surging
+    if self.CP.carFingerprint == "TESLA_MODEL_S_PREAP" and sm['radarState'].leadOne.status:
       follow_limit = _get_preap_follow_limit(v_ego)
       if follow_limit is not None:
-        from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import get_safe_obstacle_distance, get_T_FOLLOW
-        t_follow = get_T_FOLLOW(sm['selfdriveState'].personality, self.nap_follow_dist)
-        safe_dist = get_safe_obstacle_distance(v_ego, t_follow)
-        lead_dist = sm['radarState'].leadOne.dRel
-        # ratio: 1.0 = at safe distance, <1.0 = closer, >1.0 = further
-        ratio = lead_dist / max(safe_dist, 1.0)
-        # Blend: full cap below 1.2x, no cap above 1.5x, linear between
-        cap_strength = float(np.clip(1.0 - (ratio - 1.2) / 0.3, 0.0, 1.0))
-        if cap_strength > 0:
-          blended = accel_clip[1] * (1.0 - cap_strength) + follow_limit * cap_strength
-          accel_clip[1] = min(accel_clip[1], blended)
+        accel_clip[1] = min(accel_clip[1], follow_limit)
 
     self.mpc.set_weights(prev_accel_constraint, personality=sm['selfdriveState'].personality)
     self.mpc.set_cur_state(self.v_desired_filter.x, self.a_desired)
