@@ -199,7 +199,7 @@ class LongitudinalPlanner:
     # 11.1 m/s = 25 mph, 4.5 m/s = 10 mph
     if (sm['carState'].leftBlinker or sm['carState'].rightBlinker) and v_ego < 11.1 and v_ego > 4.5:
       # Force a smooth -1.0 m/s^2 regen coast-down until we hit 10 mph
-      output_a_target = min(output_a_target, -1.0)
+      output_a_target = min(output_a_target, -2.5)
     # ---------------------------------
     
     for idx in range(2):
