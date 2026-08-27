@@ -100,7 +100,7 @@ def gen_lat_ocp():
                                   v_ego_offset * psi_ego,
                                   v_ego_offset * psi_rate_ego,
                                   v_ego_offset * psi_rate_ego_dot,
-                                  psi_rate_ego_dot / (v_ego + 0.1))
+                                  psi_rate_ego_dot / (v_ego + 0.2))
   ocp.model.cost_y_expr_e = vertcat(y_ego,
                                    v_ego_offset * psi_ego,
                                    v_ego_offset * psi_rate_ego)
