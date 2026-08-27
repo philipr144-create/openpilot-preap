@@ -8,7 +8,21 @@ from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.lib.text_measure import measure_text_cached
 from openpilot.system.ui.widgets import Widget
 
-# Constants
+try:
+  from openpilot.common.params import Params as _NAPParams
+  _params = _NAPParams()
+except Exception:
+  _params = None
+
+try:
+  from opendbc.car.tesla.preap.nap_params import NAPParamKeys
+  FOLLOW_KEY = NAPParamKeys.FOLLOW_DISTANCE
+except Exception:
+  FOLLOW_KEY = "FollowDistance"
+
+PERSONALITY_KEY = "LongitudinalPersonality"
+PERSONALITIES = ["Relaxed", "Standard", "Aggressive"]
+
 SET_SPEED_NA = 255
 KM_TO_MILE = 0.621371
 CRUISE_DISABLED_CHAR = '–'
@@ -24,20 +38,21 @@ class UIConfig:
   set_speed_height: int = 204
   wheel_icon_size: int = 144
 
-
 @dataclass(frozen=True)
 class FontSizes:
   current_speed: int = 176
   speed_unit: int = 66
   max_speed: int = 40
   set_speed: int = 90
+  ctrl_btn: int = 60
+  ctrl_lbl: int = 45
 
 
 @dataclass(frozen=True)
 class Colors:
   WHITE = rl.WHITE
   DISENGAGED = rl.Color(145, 155, 149, 255)
-  OVERRIDE = rl.Color(145, 155, 149, 255)  # Added
+  OVERRIDE = rl.Color(145, 155, 149, 255)
   ENGAGED = rl.Color(128, 216, 166, 255)
   DISENGAGED_BG = rl.Color(0, 0, 0, 153)
   OVERRIDE_BG = rl.Color(145, 155, 149, 204)
@@ -49,6 +64,7 @@ class Colors:
   BORDER_TRANSLUCENT = rl.Color(255, 255, 255, 75)
   HEADER_GRADIENT_START = rl.Color(0, 0, 0, 114)
   HEADER_GRADIENT_END = rl.BLANK
+  BTN_ACTIVE = rl.Color(128, 216, 166, 255)
 
 
 UI_CONFIG = UIConfig()
@@ -59,7 +75,6 @@ COLORS = Colors()
 class HudRenderer(Widget):
   def __init__(self):
     super().__init__()
-    """Initialize the HUD renderer."""
     self.is_cruise_set: bool = False
     self.is_cruise_available: bool = True
     self.set_speed: float = SET_SPEED_NA
@@ -72,8 +87,61 @@ class HudRenderer(Widget):
 
     self._exp_button: ExpButton = ExpButton(UI_CONFIG.button_size, UI_CONFIG.wheel_icon_size)
 
+    # Local state for onscreen controls
+    self.follow_dist: int = 3
+    self.personality: int = 1
+    self._last_param_check_frame: int = 0
+    
+    self._btn_pressed = None
+    self._dist_minus_rect = rl.Rectangle(0, 0, 0, 0)
+    self._dist_plus_rect = rl.Rectangle(0, 0, 0, 0)
+    self._pers_minus_rect = rl.Rectangle(0, 0, 0, 0)
+    self._pers_plus_rect = rl.Rectangle(0, 0, 0, 0)
+
+  def _update_params(self) -> None:
+    """Read params periodically to stay synced with other input methods."""
+    if _params is None:
+      return
+    try:
+      d_raw = _params.get(FOLLOW_KEY)
+      if d_raw:
+        val = int(d_raw.decode('utf-8') if isinstance(d_raw, bytes) else d_raw)
+        if 1 <= val <= 7:
+          self.follow_dist = val
+
+      p_raw = _params.get(PERSONALITY_KEY)
+      if p_raw:
+        val = int(p_raw.decode('utf-8') if isinstance(p_raw, bytes) else p_raw)
+        if 0 <= val <= 2:
+          self.personality = val
+    except Exception:
+      pass
+
+  def _set_dist(self, change: int) -> None:
+    new_val = max(1, min(7, self.follow_dist + change))
+    if new_val != self.follow_dist:
+      self.follow_dist = new_val
+      if _params:
+        try:
+          _params.put(FOLLOW_KEY, str(self.follow_dist))
+        except:
+          pass
+
+  def _set_pers(self, change: int) -> None:
+    new_val = max(0, min(2, self.personality + change))
+    if new_val != self.personality:
+      self.personality = new_val
+      if _params:
+        try:
+          _params.put(PERSONALITY_KEY, str(self.personality))
+        except:
+          pass
+
   def _update_state(self) -> None:
-    """Update HUD state based on car state and controls state."""
+    self._last_param_check_frame += 1
+    if self._last_param_check_frame % 15 == 0:
+      self._update_params()
+
     sm = ui_state.sm
     if sm.recv_frame["carState"] < ui_state.started_frame:
       self.is_cruise_set = False
@@ -101,8 +169,8 @@ class HudRenderer(Widget):
     self.speed = max(0.0, v_ego * speed_conversion)
 
   def _render(self, rect: rl.Rectangle) -> None:
-    """Render HUD elements to the screen."""
-    # Draw the header background
+    self._handle_touch_input()
+
     rl.draw_rectangle_gradient_v(
       int(rect.x),
       int(rect.y),
@@ -121,11 +189,80 @@ class HudRenderer(Widget):
     button_y = rect.y + UI_CONFIG.border_size
     self._exp_button.render(rl.Rectangle(button_x, button_y, UI_CONFIG.button_size, UI_CONFIG.button_size))
 
+    self._draw_onscreen_controls(rect)
+
+  def _handle_touch_input(self) -> None:
+    mouse_pos = rl.get_mouse_position()
+    mouse_down = rl.is_mouse_button_down(rl.MouseButton.MOUSE_BUTTON_LEFT)
+    
+    active_btn = None
+    if rl.check_collision_point_rec(mouse_pos, self._dist_minus_rect): active_btn = "dist_min"
+    elif rl.check_collision_point_rec(mouse_pos, self._dist_plus_rect): active_btn = "dist_plus"
+    elif rl.check_collision_point_rec(mouse_pos, self._pers_minus_rect): active_btn = "pers_min"
+    elif rl.check_collision_point_rec(mouse_pos, self._pers_plus_rect): active_btn = "pers_plus"
+    
+    if mouse_down:
+      if self._btn_pressed is None and active_btn:
+        self._btn_pressed = active_btn
+    else:
+      if self._btn_pressed:
+        if active_btn == self._btn_pressed:
+          if active_btn == "dist_min": self._set_dist(-1)
+          elif active_btn == "dist_plus": self._set_dist(1)
+          elif active_btn == "pers_min": self._set_pers(-1)
+          elif active_btn == "pers_plus": self._set_pers(1)
+        self._btn_pressed = None
+
+  def _draw_onscreen_controls(self, rect: rl.Rectangle) -> None:
+    x = rect.x + 60
+    btn_w = 90
+    lbl_w = 260
+    h = 90
+    gap = 15
+    
+    # 1. Personality Row
+    y_pers = rect.y + rect.height - (h * 2) - gap - 50
+    self._pers_minus_rect = rl.Rectangle(x, y_pers, btn_w, h)
+    self._draw_btn(self._pers_minus_rect, "<", self._btn_pressed == "pers_min")
+    
+    lbl_rect1 = rl.Rectangle(x + btn_w + gap, y_pers, lbl_w, h)
+    self._draw_label(lbl_rect1, PERSONALITIES[self.personality])
+    
+    self._pers_plus_rect = rl.Rectangle(x + btn_w + gap + lbl_w + gap, y_pers, btn_w, h)
+    self._draw_btn(self._pers_plus_rect, ">", self._btn_pressed == "pers_plus")
+    
+    # 2. Distance Row
+    y_dist = rect.y + rect.height - h - 50
+    self._dist_minus_rect = rl.Rectangle(x, y_dist, btn_w, h)
+    self._draw_btn(self._dist_minus_rect, "-", self._btn_pressed == "dist_min")
+    
+    lbl_rect2 = rl.Rectangle(x + btn_w + gap, y_dist, lbl_w, h)
+    self._draw_label(lbl_rect2, f"DIST: {self.follow_dist}")
+    
+    self._dist_plus_rect = rl.Rectangle(x + btn_w + gap + lbl_w + gap, y_dist, btn_w, h)
+    self._draw_btn(self._dist_plus_rect, "+", self._btn_pressed == "dist_plus")
+
+  def _draw_btn(self, r: rl.Rectangle, text: str, pressed: bool) -> None:
+    bg = COLORS.BLACK_TRANSLUCENT if not pressed else rl.Color(40, 40, 40, 220)
+    border = COLORS.BTN_ACTIVE if pressed else COLORS.BORDER_TRANSLUCENT
+    rl.draw_rectangle_rounded(r, 0.35, 10, bg)
+    rl.draw_rectangle_rounded_lines_ex(r, 0.35, 10, 5, border)
+    
+    w = measure_text_cached(self._font_bold, text, FONT_SIZES.ctrl_btn).x
+    offset_y = 10 if text in ["-", "+"] else 15
+    rl.draw_text_ex(self._font_bold, text, rl.Vector2(r.x + (r.width - w) / 2, r.y + offset_y), FONT_SIZES.ctrl_btn, 0, COLORS.WHITE)
+
+  def _draw_label(self, r: rl.Rectangle, text: str) -> None:
+    rl.draw_rectangle_rounded(r, 0.35, 10, COLORS.BLACK_TRANSLUCENT)
+    rl.draw_rectangle_rounded_lines_ex(r, 0.35, 10, 4, COLORS.BORDER_TRANSLUCENT)
+    
+    w = measure_text_cached(self._font_semi_bold, text, FONT_SIZES.ctrl_lbl).x
+    rl.draw_text_ex(self._font_semi_bold, text, rl.Vector2(r.x + (r.width - w) / 2, r.y + 22), FONT_SIZES.ctrl_lbl, 0, COLORS.WHITE)
+
   def user_interacting(self) -> bool:
-    return self._exp_button.is_pressed
+    return self._exp_button.is_pressed or (self._btn_pressed is not None)
 
   def _draw_set_speed(self, rect: rl.Rectangle) -> None:
-    """Draw the MAX speed indicator box."""
     set_speed_width = UI_CONFIG.set_speed_width_metric if ui_state.is_metric else UI_CONFIG.set_speed_width_imperial
     x = rect.x + 60 + (UI_CONFIG.set_speed_width_imperial - set_speed_width) // 2
     y = rect.y + 45
@@ -168,7 +305,6 @@ class HudRenderer(Widget):
     )
 
   def _draw_current_speed(self, rect: rl.Rectangle) -> None:
-    """Draw the current vehicle speed and unit."""
     speed_text = str(round(self.speed))
     speed_text_size = measure_text_cached(self._font_bold, speed_text, FONT_SIZES.current_speed)
     speed_pos = rl.Vector2(rect.x + rect.width / 2 - speed_text_size.x / 2, 180 - speed_text_size.y / 2)
