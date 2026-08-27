@@ -9,24 +9,19 @@ from openpilot.system.ui.lib.text_measure import measure_text_cached
 from openpilot.system.ui.widgets import Widget
 
 try:
-  from openpilot.common.params import Params as _NAPParams
-  _params = _NAPParams()
+  from openpilot.common.params import Params
+  _params = Params()
 except Exception:
   _params = None
 
-try:
-  from opendbc.car.tesla.preap.nap_params import NAPParamKeys
-  FOLLOW_KEY = NAPParamKeys.FOLLOW_DISTANCE
-except Exception:
-  FOLLOW_KEY = "FollowDistance"
-
+# Hardcoded to match the exact physical parameter files
+FOLLOW_KEY_STR = "NAPFollowDistance"
 PERSONALITY_KEY = "LongitudinalPersonality"
 PERSONALITIES = ["Relaxed", "Standard", "Aggressive"]
 
 SET_SPEED_NA = 255
 KM_TO_MILE = 0.621371
 CRUISE_DISABLED_CHAR = '–'
-
 
 @dataclass(frozen=True)
 class UIConfig:
@@ -44,9 +39,8 @@ class FontSizes:
   speed_unit: int = 66
   max_speed: int = 40
   set_speed: int = 90
-  ctrl_btn: int = 60
-  ctrl_lbl: int = 45
-
+  ctrl_btn: int = 90
+  ctrl_lbl: int = 55
 
 @dataclass(frozen=True)
 class Colors:
@@ -66,31 +60,29 @@ class Colors:
   HEADER_GRADIENT_END = rl.BLANK
   BTN_ACTIVE = rl.Color(128, 216, 166, 255)
 
-
 UI_CONFIG = UIConfig()
 FONT_SIZES = FontSizes()
 COLORS = Colors()
 
-
 class HudRenderer(Widget):
   def __init__(self):
     super().__init__()
-    self.is_cruise_set: bool = False
-    self.is_cruise_available: bool = True
-    self.set_speed: float = SET_SPEED_NA
-    self.speed: float = 0.0
-    self.v_ego_cluster_seen: bool = False
+    self.is_cruise_set = False
+    self.is_cruise_available = True
+    self.set_speed = SET_SPEED_NA
+    self.speed = 0.0
+    self.v_ego_cluster_seen = False
 
-    self._font_semi_bold: rl.Font = gui_app.font(FontWeight.SEMI_BOLD)
-    self._font_bold: rl.Font = gui_app.font(FontWeight.BOLD)
-    self._font_medium: rl.Font = gui_app.font(FontWeight.MEDIUM)
+    self._font_semi_bold = gui_app.font(FontWeight.SEMI_BOLD)
+    self._font_bold = gui_app.font(FontWeight.BOLD)
+    self._font_medium = gui_app.font(FontWeight.MEDIUM)
 
-    self._exp_button: ExpButton = ExpButton(UI_CONFIG.button_size, UI_CONFIG.wheel_icon_size)
+    self._exp_button = ExpButton(UI_CONFIG.button_size, UI_CONFIG.wheel_icon_size)
 
-    # Local state for onscreen controls
-    self.follow_dist: int = 3
-    self.personality: int = 1
-    self._last_param_check_frame: int = 0
+    self.follow_dist = 3
+    self.personality = 1
+    self._last_param_check_frame = 0
+    self._ignore_param_reads_until = 0
     
     self._btn_pressed = None
     self._dist_minus_rect = rl.Rectangle(0, 0, 0, 0)
@@ -98,44 +90,43 @@ class HudRenderer(Widget):
     self._pers_minus_rect = rl.Rectangle(0, 0, 0, 0)
     self._pers_plus_rect = rl.Rectangle(0, 0, 0, 0)
 
-  def _update_params(self) -> None:
-    """Read params periodically to stay synced with other input methods."""
-    if _params is None:
-      return
+  def _safe_write_param(self, key: str, val: int) -> None:
+    if _params is None: return
+    # Lock out disk reads for ~3 seconds so UI doesn't rubber-band
+    self._ignore_param_reads_until = self._last_param_check_frame + 60
     try:
-      d_raw = _params.get(FOLLOW_KEY)
+      _params.put_nonblocking(key, str(val).encode('utf8'))
+    except Exception:
+      try: _params.put(key, str(val).encode('utf8'))
+      except Exception: pass
+
+  def _update_params(self) -> None:
+    if _params is None: return
+    if self._last_param_check_frame < self._ignore_param_reads_until: return
+    
+    try:
+      d_raw = _params.get(FOLLOW_KEY_STR)
       if d_raw:
         val = int(d_raw.decode('utf-8') if isinstance(d_raw, bytes) else d_raw)
-        if 1 <= val <= 7:
-          self.follow_dist = val
+        if 1 <= val <= 7: self.follow_dist = val
 
       p_raw = _params.get(PERSONALITY_KEY)
       if p_raw:
         val = int(p_raw.decode('utf-8') if isinstance(p_raw, bytes) else p_raw)
-        if 0 <= val <= 2:
-          self.personality = val
-    except Exception:
-      pass
+        if 0 <= val <= 2: self.personality = val
+    except Exception: pass
 
   def _set_dist(self, change: int) -> None:
     new_val = max(1, min(7, self.follow_dist + change))
     if new_val != self.follow_dist:
       self.follow_dist = new_val
-      if _params:
-        try:
-          _params.put(FOLLOW_KEY, str(self.follow_dist))
-        except:
-          pass
+      self._safe_write_param(FOLLOW_KEY_STR, self.follow_dist)
 
   def _set_pers(self, change: int) -> None:
     new_val = max(0, min(2, self.personality + change))
     if new_val != self.personality:
       self.personality = new_val
-      if _params:
-        try:
-          _params.put(PERSONALITY_KEY, str(self.personality))
-        except:
-          pass
+      self._safe_write_param(PERSONALITY_KEY, self.personality)
 
   def _update_state(self) -> None:
     self._last_param_check_frame += 1
@@ -153,14 +144,10 @@ class HudRenderer(Widget):
     car_state = sm['carState']
 
     v_cruise_cluster = car_state.vCruiseCluster
-    self.set_speed = (
-      controls_state.vCruiseDEPRECATED if v_cruise_cluster == 0.0 else v_cruise_cluster
-    )
+    self.set_speed = controls_state.vCruiseDEPRECATED if v_cruise_cluster == 0.0 else v_cruise_cluster
     self.is_cruise_set = 0 < self.set_speed < SET_SPEED_NA
     self.is_cruise_available = self.set_speed != -1
-
-    if self.is_cruise_set and not ui_state.is_metric:
-      self.set_speed *= KM_TO_MILE
+    if self.is_cruise_set and not ui_state.is_metric: self.set_speed *= KM_TO_MILE
 
     v_ego_cluster = car_state.vEgoCluster
     self.v_ego_cluster_seen = self.v_ego_cluster_seen or v_ego_cluster != 0.0
@@ -170,25 +157,12 @@ class HudRenderer(Widget):
 
   def _render(self, rect: rl.Rectangle) -> None:
     self._handle_touch_input()
-
-    rl.draw_rectangle_gradient_v(
-      int(rect.x),
-      int(rect.y),
-      int(rect.width),
-      UI_CONFIG.header_height,
-      COLORS.HEADER_GRADIENT_START,
-      COLORS.HEADER_GRADIENT_END,
-    )
-
-    if self.is_cruise_available:
-      self._draw_set_speed(rect)
-
+    rl.draw_rectangle_gradient_v(int(rect.x), int(rect.y), int(rect.width), UI_CONFIG.header_height, COLORS.HEADER_GRADIENT_START, COLORS.HEADER_GRADIENT_END)
+    if self.is_cruise_available: self._draw_set_speed(rect)
     self._draw_current_speed(rect)
-
     button_x = rect.x + rect.width - UI_CONFIG.border_size - UI_CONFIG.button_size
     button_y = rect.y + UI_CONFIG.border_size
     self._exp_button.render(rl.Rectangle(button_x, button_y, UI_CONFIG.button_size, UI_CONFIG.button_size))
-
     self._draw_onscreen_controls(rect)
 
   def _handle_touch_input(self) -> None:
@@ -215,30 +189,25 @@ class HudRenderer(Widget):
 
   def _draw_onscreen_controls(self, rect: rl.Rectangle) -> None:
     x = rect.x + 60
-    btn_w = 90
-    lbl_w = 260
-    h = 90
-    gap = 15
+    btn_w = 140
+    lbl_w = 320
+    h = 130
+    gap = 25
+    base_y = rect.y + rect.height - h - 250
     
-    # 1. Personality Row
-    y_pers = rect.y + rect.height - (h * 2) - gap - 50
+    y_pers = base_y - h - gap
     self._pers_minus_rect = rl.Rectangle(x, y_pers, btn_w, h)
     self._draw_btn(self._pers_minus_rect, "<", self._btn_pressed == "pers_min")
-    
     lbl_rect1 = rl.Rectangle(x + btn_w + gap, y_pers, lbl_w, h)
     self._draw_label(lbl_rect1, PERSONALITIES[self.personality])
-    
     self._pers_plus_rect = rl.Rectangle(x + btn_w + gap + lbl_w + gap, y_pers, btn_w, h)
     self._draw_btn(self._pers_plus_rect, ">", self._btn_pressed == "pers_plus")
     
-    # 2. Distance Row
-    y_dist = rect.y + rect.height - h - 50
+    y_dist = base_y
     self._dist_minus_rect = rl.Rectangle(x, y_dist, btn_w, h)
     self._draw_btn(self._dist_minus_rect, "-", self._btn_pressed == "dist_min")
-    
     lbl_rect2 = rl.Rectangle(x + btn_w + gap, y_dist, lbl_w, h)
     self._draw_label(lbl_rect2, f"DIST: {self.follow_dist}")
-    
     self._dist_plus_rect = rl.Rectangle(x + btn_w + gap + lbl_w + gap, y_dist, btn_w, h)
     self._draw_btn(self._dist_plus_rect, "+", self._btn_pressed == "dist_plus")
 
@@ -247,17 +216,15 @@ class HudRenderer(Widget):
     border = COLORS.BTN_ACTIVE if pressed else COLORS.BORDER_TRANSLUCENT
     rl.draw_rectangle_rounded(r, 0.35, 10, bg)
     rl.draw_rectangle_rounded_lines_ex(r, 0.35, 10, 5, border)
-    
     w = measure_text_cached(self._font_bold, text, FONT_SIZES.ctrl_btn).x
-    offset_y = 10 if text in ["-", "+"] else 15
+    offset_y = 15 if text in ["-", "+"] else 25
     rl.draw_text_ex(self._font_bold, text, rl.Vector2(r.x + (r.width - w) / 2, r.y + offset_y), FONT_SIZES.ctrl_btn, 0, COLORS.WHITE)
 
   def _draw_label(self, r: rl.Rectangle, text: str) -> None:
     rl.draw_rectangle_rounded(r, 0.35, 10, COLORS.BLACK_TRANSLUCENT)
     rl.draw_rectangle_rounded_lines_ex(r, 0.35, 10, 4, COLORS.BORDER_TRANSLUCENT)
-    
     w = measure_text_cached(self._font_semi_bold, text, FONT_SIZES.ctrl_lbl).x
-    rl.draw_text_ex(self._font_semi_bold, text, rl.Vector2(r.x + (r.width - w) / 2, r.y + 22), FONT_SIZES.ctrl_lbl, 0, COLORS.WHITE)
+    rl.draw_text_ex(self._font_semi_bold, text, rl.Vector2(r.x + (r.width - w) / 2, r.y + 35), FONT_SIZES.ctrl_lbl, 0, COLORS.WHITE)
 
   def user_interacting(self) -> bool:
     return self._exp_button.is_pressed or (self._btn_pressed is not None)
@@ -266,50 +233,28 @@ class HudRenderer(Widget):
     set_speed_width = UI_CONFIG.set_speed_width_metric if ui_state.is_metric else UI_CONFIG.set_speed_width_imperial
     x = rect.x + 60 + (UI_CONFIG.set_speed_width_imperial - set_speed_width) // 2
     y = rect.y + 45
-
     set_speed_rect = rl.Rectangle(x, y, set_speed_width, UI_CONFIG.set_speed_height)
     rl.draw_rectangle_rounded(set_speed_rect, 0.35, 10, COLORS.BLACK_TRANSLUCENT)
     rl.draw_rectangle_rounded_lines_ex(set_speed_rect, 0.35, 10, 6, COLORS.BORDER_TRANSLUCENT)
-
     max_color = COLORS.GREY
     set_speed_color = COLORS.DARK_GREY
     if self.is_cruise_set:
       set_speed_color = COLORS.WHITE
-      if ui_state.status == UIStatus.ENGAGED:
-        max_color = COLORS.ENGAGED
-      elif ui_state.status == UIStatus.DISENGAGED:
-        max_color = COLORS.DISENGAGED
-      elif ui_state.status == UIStatus.OVERRIDE:
-        max_color = COLORS.OVERRIDE
-
+      if ui_state.status == UIStatus.ENGAGED: max_color = COLORS.ENGAGED
+      elif ui_state.status == UIStatus.DISENGAGED: max_color = COLORS.DISENGAGED
+      elif ui_state.status == UIStatus.OVERRIDE: max_color = COLORS.OVERRIDE
     max_text = tr("MAX")
     max_text_width = measure_text_cached(self._font_semi_bold, max_text, FONT_SIZES.max_speed).x
-    rl.draw_text_ex(
-      self._font_semi_bold,
-      max_text,
-      rl.Vector2(x + (set_speed_width - max_text_width) / 2, y + 27),
-      FONT_SIZES.max_speed,
-      0,
-      max_color,
-    )
-
+    rl.draw_text_ex(self._font_semi_bold, max_text, rl.Vector2(x + (set_speed_width - max_text_width) / 2, y + 27), FONT_SIZES.max_speed, 0, max_color)
     set_speed_text = CRUISE_DISABLED_CHAR if not self.is_cruise_set else str(round(self.set_speed))
     speed_text_width = measure_text_cached(self._font_bold, set_speed_text, FONT_SIZES.set_speed).x
-    rl.draw_text_ex(
-      self._font_bold,
-      set_speed_text,
-      rl.Vector2(x + (set_speed_width - speed_text_width) / 2, y + 77),
-      FONT_SIZES.set_speed,
-      0,
-      set_speed_color,
-    )
+    rl.draw_text_ex(self._font_bold, set_speed_text, rl.Vector2(x + (set_speed_width - speed_text_width) / 2, y + 77), FONT_SIZES.set_speed, 0, set_speed_color)
 
   def _draw_current_speed(self, rect: rl.Rectangle) -> None:
     speed_text = str(round(self.speed))
     speed_text_size = measure_text_cached(self._font_bold, speed_text, FONT_SIZES.current_speed)
     speed_pos = rl.Vector2(rect.x + rect.width / 2 - speed_text_size.x / 2, 180 - speed_text_size.y / 2)
     rl.draw_text_ex(self._font_bold, speed_text, speed_pos, FONT_SIZES.current_speed, 0, COLORS.WHITE)
-
     unit_text = tr("km/h") if ui_state.is_metric else tr("mph")
     unit_text_size = measure_text_cached(self._font_medium, unit_text, FONT_SIZES.speed_unit)
     unit_pos = rl.Vector2(rect.x + rect.width / 2 - unit_text_size.x / 2, 290 - unit_text_size.y / 2)
