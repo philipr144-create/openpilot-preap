@@ -14,7 +14,6 @@ try:
 except Exception:
   _params = None
 
-# Hardcoded to match the exact physical parameter files
 FOLLOW_KEY_STR = "NAPFollowDistance"
 PERSONALITY_KEY = "LongitudinalPersonality"
 PERSONALITIES = ["Relaxed", "Standard", "Aggressive"]
@@ -72,18 +71,14 @@ class HudRenderer(Widget):
     self.set_speed = SET_SPEED_NA
     self.speed = 0.0
     self.v_ego_cluster_seen = False
-
     self._font_semi_bold = gui_app.font(FontWeight.SEMI_BOLD)
     self._font_bold = gui_app.font(FontWeight.BOLD)
     self._font_medium = gui_app.font(FontWeight.MEDIUM)
-
     self._exp_button = ExpButton(UI_CONFIG.button_size, UI_CONFIG.wheel_icon_size)
-
     self.follow_dist = 3
     self.personality = 1
     self._last_param_check_frame = 0
     self._ignore_param_reads_until = 0
-    
     self._btn_pressed = None
     self._dist_minus_rect = rl.Rectangle(0, 0, 0, 0)
     self._dist_plus_rect = rl.Rectangle(0, 0, 0, 0)
@@ -92,7 +87,6 @@ class HudRenderer(Widget):
 
   def _safe_write_param(self, key: str, val: int) -> None:
     if _params is None: return
-    # Lock out disk reads for ~3 seconds so UI doesn't rubber-band
     self._ignore_param_reads_until = self._last_param_check_frame + 60
     try:
       _params.put_nonblocking(key, str(val).encode('utf8'))
@@ -103,13 +97,11 @@ class HudRenderer(Widget):
   def _update_params(self) -> None:
     if _params is None: return
     if self._last_param_check_frame < self._ignore_param_reads_until: return
-    
     try:
       d_raw = _params.get(FOLLOW_KEY_STR)
       if d_raw:
         val = int(d_raw.decode('utf-8') if isinstance(d_raw, bytes) else d_raw)
         if 1 <= val <= 7: self.follow_dist = val
-
       p_raw = _params.get(PERSONALITY_KEY)
       if p_raw:
         val = int(p_raw.decode('utf-8') if isinstance(p_raw, bytes) else p_raw)
@@ -123,32 +115,29 @@ class HudRenderer(Widget):
       self._safe_write_param(FOLLOW_KEY_STR, self.follow_dist)
 
   def _set_pers(self, change: int) -> None:
-    new_val = max(0, min(2, self.personality + change))
-    if new_val != self.personality:
-      self.personality = new_val
-      self._safe_write_param(PERSONALITY_KEY, self.personality)
+    new_val = max(0, min(2, int(self.personality) + int(change)))
+
+    if new_val != int(self.personality):
+      try:
+        # This is the same persistent parameter used by Settings/selfdrived.
+        Params().put(PERSONALITY_KEY, str(new_val))
+        self.personality = new_val
+        print(f"[HUD] LongitudinalPersonality -> {new_val}")
+      except Exception as e:
+        print(f"[HUD] Failed to write LongitudinalPersonality: {e}")
 
   def _update_state(self) -> None:
     self._last_param_check_frame += 1
-    if self._last_param_check_frame % 15 == 0:
-      self._update_params()
-
+    if self._last_param_check_frame % 15 == 0: self._update_params()
     sm = ui_state.sm
     if sm.recv_frame["carState"] < ui_state.started_frame:
-      self.is_cruise_set = False
-      self.set_speed = SET_SPEED_NA
-      self.speed = 0.0
-      return
-
-    controls_state = sm['controlsState']
-    car_state = sm['carState']
-
+      self.is_cruise_set = False; self.set_speed = SET_SPEED_NA; self.speed = 0.0; return
+    controls_state = sm['controlsState']; car_state = sm['carState']
     v_cruise_cluster = car_state.vCruiseCluster
     self.set_speed = controls_state.vCruiseDEPRECATED if v_cruise_cluster == 0.0 else v_cruise_cluster
     self.is_cruise_set = 0 < self.set_speed < SET_SPEED_NA
     self.is_cruise_available = self.set_speed != -1
     if self.is_cruise_set and not ui_state.is_metric: self.set_speed *= KM_TO_MILE
-
     v_ego_cluster = car_state.vEgoCluster
     self.v_ego_cluster_seen = self.v_ego_cluster_seen or v_ego_cluster != 0.0
     v_ego = v_ego_cluster if self.v_ego_cluster_seen else car_state.vEgo
@@ -168,7 +157,6 @@ class HudRenderer(Widget):
   def _handle_touch_input(self) -> None:
     mouse_pos = rl.get_mouse_position()
     mouse_down = rl.is_mouse_button_down(rl.MouseButton.MOUSE_BUTTON_LEFT)
-    
     active_btn = None
     if rl.check_collision_point_rec(mouse_pos, self._dist_minus_rect): active_btn = "dist_min"
     elif rl.check_collision_point_rec(mouse_pos, self._dist_plus_rect): active_btn = "dist_plus"
@@ -176,8 +164,7 @@ class HudRenderer(Widget):
     elif rl.check_collision_point_rec(mouse_pos, self._pers_plus_rect): active_btn = "pers_plus"
     
     if mouse_down:
-      if self._btn_pressed is None and active_btn:
-        self._btn_pressed = active_btn
+      if self._btn_pressed is None and active_btn: self._btn_pressed = active_btn
     else:
       if self._btn_pressed:
         if active_btn == self._btn_pressed:
@@ -189,10 +176,7 @@ class HudRenderer(Widget):
 
   def _draw_onscreen_controls(self, rect: rl.Rectangle) -> None:
     x = rect.x + 60
-    btn_w = 140
-    lbl_w = 320
-    h = 130
-    gap = 25
+    btn_w = 140; lbl_w = 320; h = 130; gap = 25
     base_y = rect.y + rect.height - h - 250
     
     y_pers = base_y - h - gap
@@ -226,9 +210,7 @@ class HudRenderer(Widget):
     w = measure_text_cached(self._font_semi_bold, text, FONT_SIZES.ctrl_lbl).x
     rl.draw_text_ex(self._font_semi_bold, text, rl.Vector2(r.x + (r.width - w) / 2, r.y + 35), FONT_SIZES.ctrl_lbl, 0, COLORS.WHITE)
 
-  def user_interacting(self) -> bool:
-    return self._exp_button.is_pressed or (self._btn_pressed is not None)
-
+  def user_interacting(self) -> bool: return self._exp_button.is_pressed or (self._btn_pressed is not None)
   def _draw_set_speed(self, rect: rl.Rectangle) -> None:
     set_speed_width = UI_CONFIG.set_speed_width_metric if ui_state.is_metric else UI_CONFIG.set_speed_width_imperial
     x = rect.x + 60 + (UI_CONFIG.set_speed_width_imperial - set_speed_width) // 2
@@ -249,7 +231,6 @@ class HudRenderer(Widget):
     set_speed_text = CRUISE_DISABLED_CHAR if not self.is_cruise_set else str(round(self.set_speed))
     speed_text_width = measure_text_cached(self._font_bold, set_speed_text, FONT_SIZES.set_speed).x
     rl.draw_text_ex(self._font_bold, set_speed_text, rl.Vector2(x + (set_speed_width - speed_text_width) / 2, y + 77), FONT_SIZES.set_speed, 0, set_speed_color)
-
   def _draw_current_speed(self, rect: rl.Rectangle) -> None:
     speed_text = str(round(self.speed))
     speed_text_size = measure_text_cached(self._font_bold, speed_text, FONT_SIZES.current_speed)
