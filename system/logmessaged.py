@@ -7,6 +7,8 @@ from openpilot.common.logging_extra import SwagLogFileFormatter
 from openpilot.system.hardware.hw import Paths
 from openpilot.common.swaglog import get_file_handler
 
+MAX_PUBLISH_LOG_BYTES = 64 * 1024
+
 
 def main() -> NoReturn:
   log_handler = get_file_handler()
@@ -29,9 +31,18 @@ def main() -> NoReturn:
       if level >= log_level:
         log_handler.emit(record)
 
-      if len(record) > 2*1024*1024:
-        print("WARNING: log too big to publish", len(record))
-        print(record[:100])
+      # The default logMessage queue is 250 KiB and retains three
+      # message copies. Keep published records safely below one third.
+      # The complete record was already written to swaglog above.
+      record_size = len(dat) - 1
+
+      if record_size > MAX_PUBLISH_LOG_BYTES:
+        print(
+          "WARNING: oversized log written to swaglog "
+          "but not published",
+          record_size,
+        )
+        print(record[:500])
         continue
 
       # then we publish them

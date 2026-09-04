@@ -81,8 +81,43 @@ class LongControl:
 
     else:  # LongCtrlState.pid
       error = a_target - CS.aEgo
-      output_accel = self.pid.update(error, speed=CS.vEgo,
-                                     feedforward=a_target)
+
+      # PREAP_OUTER_PID_ANTI_WINDUP_V1
+      # The Pre-AP pedal has substantial drivetrain delay. Do not allow an
+      # integral correction learned in one direction to fight a measured
+      # acceleration error in the opposite direction for several seconds.
+      #
+      # Ordinary reversals unwind smoothly. Strong braking requests unwind
+      # faster. The stopping state remains separate and retains its complete
+      # configured braking authority.
+      if (
+          self.CP.carFingerprint == "TESLA_MODEL_S_PREAP"
+          and abs(error) >= 0.04
+          and self.pid.i * error < 0.0
+      ):
+        unwind_rate = 0.60
+
+        if a_target <= -0.75:
+          unwind_rate = 2.00
+
+        unwind_step = unwind_rate * DT_CTRL
+
+        if self.pid.i > 0.0:
+          self.pid.i = max(
+            0.0,
+            self.pid.i - unwind_step,
+          )
+        else:
+          self.pid.i = min(
+            0.0,
+            self.pid.i + unwind_step,
+          )
+
+      output_accel = self.pid.update(
+        error,
+        speed=CS.vEgo,
+        feedforward=a_target,
+      )
 
     self.last_output_accel = np.clip(output_accel, accel_limits[0], accel_limits[1])
     return self.last_output_accel

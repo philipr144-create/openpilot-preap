@@ -171,7 +171,19 @@ def init_overlay() -> None:
 
   git_diff = run(["git", "diff", "--submodule=diff"], OVERLAY_MERGED)
   params.put("GitDiff", git_diff)
-  cloudlog.info(f"git diff output:\n{git_diff}")
+
+  # Keep the complete diff in Params, but limit its diagnostic log size.
+  max_git_diff_log_chars = 32 * 1024
+  git_diff_log = git_diff[:max_git_diff_log_chars]
+
+  if len(git_diff) > max_git_diff_log_chars:
+    git_diff_log += (
+      f"\n...[truncated "
+      f"{len(git_diff) - max_git_diff_log_chars} characters; "
+      f"full diff stored in GitDiff]"
+    )
+
+  cloudlog.info(f"git diff output:\n{git_diff_log}")
 
 
 def finalize_update() -> None:

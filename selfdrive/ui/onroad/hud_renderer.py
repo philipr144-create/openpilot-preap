@@ -16,7 +16,7 @@ except Exception:
 
 FOLLOW_KEY_STR = "NAPFollowDistance"
 PERSONALITY_KEY = "LongitudinalPersonality"
-PERSONALITIES = ["Relaxed", "Standard", "Aggressive"]
+PERSONALITIES = ["Aggressive", "Standard", "Relaxed"]
 
 SET_SPEED_NA = 255
 KM_TO_MILE = 0.621371
@@ -89,9 +89,9 @@ class HudRenderer(Widget):
     if _params is None: return
     self._ignore_param_reads_until = self._last_param_check_frame + 60
     try:
-      _params.put_nonblocking(key, str(val).encode('utf8'))
+      _params.put_nonblocking(key, int(val))
     except Exception:
-      try: _params.put(key, str(val).encode('utf8'))
+      try: _params.put(key, int(val))
       except Exception: pass
 
   def _update_params(self) -> None:
@@ -99,12 +99,12 @@ class HudRenderer(Widget):
     if self._last_param_check_frame < self._ignore_param_reads_until: return
     try:
       d_raw = _params.get(FOLLOW_KEY_STR)
-      if d_raw:
-        val = int(d_raw.decode('utf-8') if isinstance(d_raw, bytes) else d_raw)
+      if d_raw is not None:
+        val = int(d_raw)
         if 1 <= val <= 7: self.follow_dist = val
       p_raw = _params.get(PERSONALITY_KEY)
-      if p_raw:
-        val = int(p_raw.decode('utf-8') if isinstance(p_raw, bytes) else p_raw)
+      if p_raw is not None:
+        val = int(p_raw)
         if 0 <= val <= 2: self.personality = val
     except Exception: pass
 
@@ -120,7 +120,7 @@ class HudRenderer(Widget):
     if new_val != int(self.personality):
       try:
         # This is the same persistent parameter used by Settings/selfdrived.
-        Params().put(PERSONALITY_KEY, str(new_val))
+        Params().put(PERSONALITY_KEY, int(new_val))
         self.personality = new_val
         print(f"[HUD] LongitudinalPersonality -> {new_val}")
       except Exception as e:
