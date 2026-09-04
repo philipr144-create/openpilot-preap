@@ -197,6 +197,14 @@ class LongitudinalPlanner:
         output_a_target_mpc = max(output_a_target_mpc, self.output_a_target - 0.5)
     else:
       self.phantom_brake_counter = 0
+
+    # Phantom braking buffer
+    if output_a_target_mpc < self.output_a_target - 0.5:
+      self.phantom_brake_counter += 1
+      if self.phantom_brake_counter < 5:
+        output_a_target_mpc = max(output_a_target_mpc, self.output_a_target - 0.5)
+    else:
+      self.phantom_brake_counter = 0
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
 
