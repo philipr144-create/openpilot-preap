@@ -53,7 +53,7 @@ T_IDXS_LST = [index_function(idx, max_val=MAX_T, max_idx=N) for idx in range(N+1
 T_IDXS = np.array(T_IDXS_LST)
 FCW_IDXS = T_IDXS < 5.0
 T_DIFFS = np.diff(T_IDXS, prepend=[0.])
-COMFORT_BRAKE = 2.0
+COMFORT_BRAKE = 1.5
 STOP_DISTANCE = 7.5
 CRUISE_MIN_ACCEL = -1.2
 CRUISE_MAX_ACCEL = 1.6
@@ -71,28 +71,29 @@ def get_jerk_factor(personality=log.LongitudinalPersonality.standard):
 
 
 def get_T_FOLLOW(personality=log.LongitudinalPersonality.standard, nap_follow_dist=None):
-  # NAP configurable follow distance: 1-7 maps to 0.7s - 1.9s in 0.2s steps
+  if personality == log.LongitudinalPersonality.relaxed:
+    base_gap = 1.75
+  elif personality == log.LongitudinalPersonality.standard:
+    base_gap = 1.45
+  else:
+    base_gap = 1.25
+
   if nap_follow_dist is not None and 1 <= nap_follow_dist <= 7:
-    return 0.7 + (nap_follow_dist - 1) * 0.2
+    offset = (nap_follow_dist - 4) * 0.15
+    return round(base_gap + offset, 2)
 
-  if personality==log.LongitudinalPersonality.relaxed:
-    return 1.75
-  elif personality==log.LongitudinalPersonality.standard:
-    return 1.45
-  elif personality==log.LongitudinalPersonality.aggressive:
-    return 1.25
-  else:
-    raise NotImplementedError("Longitudinal personality not supported")
+  return base_gap
 
-def get_cruise_accel_limits(personality=log.LongitudinalPersonality.standard):
-  if personality==log.LongitudinalPersonality.relaxed:
+def get_cruise_accel_limits(
+    personality=log.LongitudinalPersonality.standard):
+  if personality == log.LongitudinalPersonality.relaxed:
     return -0.8, 0.8
-  elif personality==log.LongitudinalPersonality.standard:
+  elif personality == log.LongitudinalPersonality.standard:
     return -1.2, 1.2
-  elif personality==log.LongitudinalPersonality.aggressive:
+  elif personality == log.LongitudinalPersonality.aggressive:
     return -1.5, 2.0
-  else:
-    return -1.2, 1.6
+  return -1.2, 1.6
+
 
 def get_stopped_equivalence_factor(v_lead):
   return (v_lead**2) / (2 * COMFORT_BRAKE)
@@ -327,8 +328,12 @@ class LongitudinalMpc:
     lead_xv = self.extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau)
     return lead_xv
 
-  def update(self, radarstate, v_cruise, personality=log.LongitudinalPersonality.standard, nap_follow_dist=None):
+  def update(
+      self, radarstate, v_cruise,
+      personality=log.LongitudinalPersonality.standard,
+      nap_follow_dist=None, max_accel=ACCEL_MAX):
     t_follow = get_T_FOLLOW(personality, nap_follow_dist)
+    max_accel = float(np.clip(max_accel, 0.0, ACCEL_MAX))
     v_ego = self.x0[1]
     self.status = radarstate.leadOne.status or radarstate.leadTwo.status
 
@@ -341,8 +346,13 @@ class LongitudinalMpc:
     lead_0_obstacle = lead_xv_0[:,0] + get_stopped_equivalence_factor(lead_xv_0[:,1])
     lead_1_obstacle = lead_xv_1[:,0] + get_stopped_equivalence_factor(lead_xv_1[:,1])
 
-    # Grab personality-specific limits dynamically
-    cruise_min_accel, cruise_max_accel = get_cruise_accel_limits(personality)
+    cruise_min_accel, cruise_max_accel = (
+      get_cruise_accel_limits(personality)
+    )
+    cruise_max_accel = min(
+      cruise_max_accel,
+      max_accel,
+    )
 
     # Fake an obstacle for cruise, this ensures smooth acceleration to set speed
     # when the leads are no factor.
@@ -362,7 +372,7 @@ class LongitudinalMpc:
     self.solver.set(N, "yref", self.yref[N][:COST_E_DIM])
 
     self.params[:,0] = ACCEL_MIN
-    self.params[:,1] = ACCEL_MAX
+    self.params[:,1] = max_accel
     self.params[:,2] = np.min(x_obstacles, axis=1)
     self.params[:,3] = np.copy(self.a_prev)
     self.params[:,4] = t_follow

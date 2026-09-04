@@ -38,7 +38,7 @@ ALLOW_THROTTLE_THRESHOLD = 0.4
 MIN_ALLOW_THROTTLE_SPEED = 2.5
 
 # Lookup table for turns
-_A_TOTAL_MAX_V = [1.7, 3.2]
+_A_TOTAL_MAX_V = [2.5, 4.2]
 _A_TOTAL_MAX_BP = [20., 40.]
 
 def get_max_accel(v_ego):
@@ -137,6 +137,12 @@ class LongitudinalPlanner:
     steer_angle_without_offset = sm['carState'].steeringAngleDeg - sm['liveParameters'].angleOffsetDeg
     accel_clip = limit_accel_in_turns(v_ego, steer_angle_without_offset, accel_clip, self.CP)
 
+    # Smooth curve exit: restrict how fast the acceleration cap can increase.
+    # 0.025 per frame (at 20Hz) = 0.5 m/s^2 per second.
+    if not reset_state and accel_clip[1] > self.prev_accel_clip[1]:
+      accel_clip[1] = min(accel_clip[1], self.prev_accel_clip[1] + 0.025)
+    self.prev_accel_clip = list(accel_clip)
+
     if reset_state:
       self.v_desired_filter.x = v_ego
       # Clip aEgo to cruise limits to prevent large accelerations when becoming active
@@ -183,6 +189,14 @@ class LongitudinalPlanner:
     action_t =  self.CP.longitudinalActuatorDelay + DT_MDL
     output_a_target_mpc, output_should_stop_mpc = get_accel_from_plan(self.v_desired_trajectory, self.a_desired_trajectory, CONTROL_N_T_IDX,
                                                                         action_t=action_t, vEgoStopping=self.CP.vEgoStopping)
+
+    # Phantom braking buffer
+    if output_a_target_mpc < self.output_a_target - 0.5:
+      self.phantom_brake_counter += 1
+      if self.phantom_brake_counter < 5:
+        output_a_target_mpc = max(output_a_target_mpc, self.output_a_target - 0.5)
+    else:
+      self.phantom_brake_counter = 0
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
 
