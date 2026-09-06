@@ -38,8 +38,8 @@ ALLOW_THROTTLE_THRESHOLD = 0.4
 MIN_ALLOW_THROTTLE_SPEED = 2.5
 
 # Lookup table for turns
-_A_TOTAL_MAX_V = [2.0, 2.4]
-_A_TOTAL_MAX_BP = [20., 40.]
+_A_TOTAL_MAX_V = [2.0, 2.5]
+_A_TOTAL_MAX_BP = [20., 30.]
 
 def get_max_accel(v_ego):
   return np.interp(v_ego, A_CRUISE_MAX_BP, A_CRUISE_MAX_VALS)
