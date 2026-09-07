@@ -71,18 +71,23 @@ def get_jerk_factor(personality=log.LongitudinalPersonality.standard):
 
 
 def get_T_FOLLOW(personality=log.LongitudinalPersonality.standard, nap_follow_dist=None):
-  if personality == log.LongitudinalPersonality.relaxed:
-    base_gap = 1.75
-  elif personality == log.LongitudinalPersonality.standard:
-    base_gap = 1.45
-  else:
-    base_gap = 1.25
-
+  # PREAP_PERSONALITY_INDEPENDENT_FOLLOW_V1
+  # NAP follow-distance buttons directly select the time gap. Personality
+  # continues to control acceleration and jerk, but no longer changes distance.
+  # This preserves the existing Aggressive mapping across all personalities.
   if nap_follow_dist is not None and 1 <= nap_follow_dist <= 7:
-    offset = (nap_follow_dist - 4) * 0.15
-    return round(base_gap + offset, 2)
+    return round(
+      0.80 + (nap_follow_dist - 1) * 0.15,
+      2,
+    )
 
-  return base_gap
+  # Preserve normal personality behavior when no NAP distance is supplied.
+  if personality == log.LongitudinalPersonality.relaxed:
+    return 1.75
+  elif personality == log.LongitudinalPersonality.standard:
+    return 1.45
+  else:
+    return 1.25
 
 def get_cruise_accel_limits(
     personality=log.LongitudinalPersonality.standard):
