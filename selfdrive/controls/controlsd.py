@@ -30,12 +30,15 @@ ACTUATOR_FIELDS = tuple(car.CarControl.Actuators.schema.fields.keys())
 # tighter radius than the legacy Model S EPAS can track during walking-speed
 # 90-degree turns. Keep stock behavior at 15 mph and above, and only widen
 # strong turns when exactly one blinker establishes turn intent.
+# PREAP_BLINKER_WIDE_TURN_TO_25_V1
+# Full entrance widening remains confined to walking speed, then fades
+# progressively to stock curvature at 25 mph.
 LOW_SPEED_TURN_FULL_EFFECT_MPH = 5.0
-LOW_SPEED_TURN_END_MPH = 15.0
+LOW_SPEED_TURN_END_MPH = 25.0
 LOW_SPEED_TURN_CURVATURE_START = 0.025  # Ignore ordinary lane centering
 LOW_SPEED_TURN_CURVATURE_FULL = 0.080   # Full correction on sharp turns
 LOW_SPEED_TURN_MAX_REDUCTION = 0.18     # Retain at least 82% during entry
-LOW_SPEED_TURN_SMOOTH_END_MPH = 20.0
+LOW_SPEED_TURN_SMOOTH_END_MPH = 25.0
 LOW_SPEED_TURN_EARLY_CURVATURE = 0.008
 LOW_SPEED_TURN_RATE_START = 0.020    # Smooth initial steering buildup
 LOW_SPEED_TURN_RATE_MAX = 0.060      # Entry steering rate

@@ -90,9 +90,17 @@ def get_T_FOLLOW(personality=log.LongitudinalPersonality.standard, nap_follow_di
     return 1.25
 
 def get_cruise_accel_limits(
-    personality=log.LongitudinalPersonality.standard):
+    personality=log.LongitudinalPersonality.standard,
+    v_ego=0.0):
   if personality == log.LongitudinalPersonality.relaxed:
-    return -0.8, 0.8
+    # PREAP_RELAXED_HIGH_SPEED_TAPER_V1
+    # Preserve useful city acceleration, then reduce the 30-50 mph punch.
+    relaxed_max_accel = float(np.interp(
+      max(v_ego, 0.0),
+      [0.0, 8.9408, 13.4112, 22.3520, 31.2928],
+      [0.8, 0.8, 0.68, 0.62, 0.58],
+    ))
+    return -0.8, relaxed_max_accel
   elif personality == log.LongitudinalPersonality.standard:
     return -1.2, 1.2
   elif personality == log.LongitudinalPersonality.aggressive:
@@ -352,7 +360,7 @@ class LongitudinalMpc:
     lead_1_obstacle = lead_xv_1[:,0] + get_stopped_equivalence_factor(lead_xv_1[:,1])
 
     cruise_min_accel, cruise_max_accel = (
-      get_cruise_accel_limits(personality)
+      get_cruise_accel_limits(personality, v_ego)
     )
     cruise_max_accel = min(
       cruise_max_accel,
