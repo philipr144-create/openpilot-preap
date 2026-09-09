@@ -29,7 +29,7 @@ from openpilot.selfdrive.modeld.parse_model_outputs import Parser
 from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_pose_msg, PublishState
 from openpilot.common.file_chunker import read_file_chunked
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
-from openpilot.selfdrive.modeld.navigation_desire import navigation_desire
+from openpilot.selfdrive.modeld.navigation_desire import NavigationDesire
 
 
 PROCESS_NAME = "selfdrive.modeld.modeld"
@@ -306,6 +306,7 @@ def main(demo=False):
   prev_action = log.ModelDataV2.Action()
 
   DH = DesireHelper()
+  nav_desire = NavigationDesire()
 
   while True:
     # Keep receiving frames until we are at least 1 frame ahead of previous extra frame
@@ -343,8 +344,14 @@ def main(demo=False):
     sm.update(0)
 
     desire = DH.desire
+    nav_inputs_valid = (sm.all_checks(['carState', 'carControl'])
+                        and all(0 <= time.monotonic() - sm.logMonoTime[s] / 1e9 <= .5
+                                for s in ('carState', 'carControl')))
+    nav_request = nav_desire.update(sm['carState'], sm['carControl'], nav_inputs_valid,
+                                    driver_desire_none=(desire == log.Desire.none))
     if desire == log.Desire.none:
-      desire = getattr(log.Desire, navigation_desire())
+      desire = getattr(log.Desire, nav_request)
+    nav_desire.publish_diagnostics()
     is_rhd = sm["driverMonitoringState"].isRHD
     frame_id = sm["roadCameraState"].frameId
     v_ego = max(sm["carState"].vEgo, 0.)
