@@ -80,6 +80,7 @@ class LongitudinalPlanner:
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
     self.prev_accel_clip = [ACCEL_MIN, ACCEL_MAX]
     self.output_a_target = 0.0
+    self.phantom_brake_counter = 0
     self.output_should_stop = False
 
     self.v_desired_trajectory = np.zeros(CONTROL_N)
