@@ -15,6 +15,7 @@ from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.controls.lib.corner_assist import CornerAssist
 
 A_CRUISE_MAX_VALS = [1.2, 1.0, 1.0, 0.8]
 A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]
@@ -68,6 +69,7 @@ class LongitudinalPlanner:
     self.fcw = False
     self.dt = dt
     self.allow_throttle = True
+    self.corner_assist = CornerAssist()
 
     self._is_preap = (CP.brand == "tesla" and CP.carFingerprint == "TESLA_MODEL_S_PREAP"
                        and CP.openpilotLongitudinalControl and not CP.pcmCruise)
@@ -109,6 +111,7 @@ class LongitudinalPlanner:
 
   def update(self, sm):
     self._frame += 1
+    self.corner_assist.refresh()
     if self._is_preap and self._frame % 20 == 0:
       self.nap_follow_dist = self._params.get("NAPFollowDistance", return_default=True)
       self.nap_adaptive_accel = self._params.get_bool("NAPAdaptiveAccel")
@@ -220,11 +223,14 @@ class LongitudinalPlanner:
 
     # --- TURN ANTICIPATION BRAKING ---
     # 11.1 m/s = 25 mph, 4.5 m/s = 10 mph
-    if (sm['carState'].leftBlinker or sm['carState'].rightBlinker) and v_ego < 11.1 and v_ego > 4.5:
-      # Force a smooth -1.0 m/s^2 regen coast-down until we hit 10 mph
+    if self.corner_assist.config['blinker_braking'] and (sm['carState'].leftBlinker or sm['carState'].rightBlinker) and 4.5 < v_ego < 11.1:
+      # Optional legacy blinker-only override: -2.5 m/s^2 target.
       output_a_target = min(output_a_target, -2.5)
     # ---------------------------------
     
+    if self._is_preap:
+      output_a_target = self.corner_assist.apply(output_a_target, sm, self.CP, reset_state, accel_coast)
+
     for idx in range(2):
       accel_clip[idx] = np.clip(accel_clip[idx], self.prev_accel_clip[idx] - 0.05, self.prev_accel_clip[idx] + 0.05)
     self.output_a_target = np.clip(output_a_target, accel_clip[0], accel_clip[1])

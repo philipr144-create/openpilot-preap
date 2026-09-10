@@ -10,6 +10,7 @@ DIAGNOSTICS = '/dev/shm/nap_navigation_decision.json'
 TURN_SPEED_MAX = 25 * 0.44704
 TURN_CONFIRM_DISTANCE = 80.0
 TURN_TIMEOUT = 12.0
+EXIT_TIMEOUT = 12.0
 
 
 def read_navigation(path, now):
@@ -67,6 +68,8 @@ class NavigationDesire:
       return desire
 
     if state is None:
+      if self.started is not None:
+        self.blocked = True
       self.confirmed = False
       self.started = None
       return result('none', reason)
@@ -82,15 +85,19 @@ class NavigationDesire:
     self.decision.update(route_id=state['route_id'], maneuver_id=maneuver_id,
                          maneuver_type=kind, modifier=modifier, distance_m=distance)
     if not inputs_valid:
+      if self.started is not None:
+        self.blocked = True
       self.confirmed = False
       self.started = None
       return result('none', 'Vehicle state is stale or invalid; confirm again')
     if cs.steeringPressed or getattr(cs, 'steeringDisengage', False):
-      if self.confirmed or self.started is not None:
-        self.blocked = True
+      # Takeover cancels the current maneuver even before a request starts.
+      self.blocked = True
       self.confirmed = False
       return result('none', 'Driver steering override')
     if not driver_desire_none:
+      if self.started is not None:
+        self.blocked = True
       self.confirmed = False
       self.started = None
       return result('none', 'Existing driver desire has priority')
@@ -103,15 +110,28 @@ class NavigationDesire:
     if side is None:
       return result('none', 'Unsupported direction; no U-turn or sharp-turn automation')
     if kind in ('fork', 'off ramp'):
-      if cs.leftBlinker and cs.rightBlinker:
-        return result('none', 'Hazard lights are on')
-      if signal is not None and signal != side:
-        return result('none', 'Blinker conflicts with route')
+      if not isinstance(maneuver_id, str) or not maneuver_id:
+        return result('none', 'Exit identifier missing')
+      if self.blocked:
+        return result('none', 'This exit was cancelled; no automatic retry')
+      if signal != side:
+        if self.started is not None:
+          self.blocked = True
+        return result('none', 'Matching blinker required throughout exit guidance')
       if not 10 <= distance <= 300:
+        if self.started is not None:
+          self.blocked = True
         return result('none', 'Fork/exit outside 10–300 m window')
+      if self.started is not None and now-self.started >= EXIT_TIMEOUT:
+        self.blocked = True
+        return result('none', 'Exit request timed out; no automatic retry')
       if cs.brakePressed or not cc.latActive:
-        return result('none', 'Release brake and engage lateral control; manual speed control is allowed')
-      return result('keepLeft' if side == 'left' else 'keepRight', 'Fresh fork/exit preference')
+        if self.started is not None:
+          self.blocked = True
+        return result('none', 'Exit guidance inactive; brake or lateral control gate')
+      if self.started is None:
+        self.started = now
+      return result('keepLeft' if side == 'left' else 'keepRight', 'Bounded exit preference with matching blinker')
     if kind not in ('turn', 'end of road'):
       return result('none', 'Maneuver type is display-only: ' + kind)
     if not isinstance(maneuver_id, str) or not maneuver_id:
