@@ -107,8 +107,8 @@ class NavigationDesire:
         return result('none', 'Blinker conflicts with route')
       if not 10 <= distance <= 300:
         return result('none', 'Fork/exit outside 10–300 m window')
-      if cs.brakePressed or not cc.latActive or not cc.longActive:
-        return result('none', 'Release brake and engage lateral and longitudinal control')
+      if cs.brakePressed or not cc.latActive:
+        return result('none', 'Release brake and engage lateral control; manual speed control is allowed')
       return result('keepLeft' if side == 'left' else 'keepRight', 'Fresh fork/exit preference')
     if kind != 'turn':
       return result('none', 'Maneuver type is display-only')
@@ -137,11 +137,11 @@ class NavigationDesire:
       self.confirmed = False
       self.blocked = True
       return result('none', 'Intersection request timed out; manual turn required')
-    if cs.brakePressed or not cc.latActive or not cc.longActive:
+    if cs.brakePressed or not cc.latActive:
       if self.started is not None:
         self.confirmed = False
         self.started = None
-      return result('none', 'Release brake and re-engage; a previously started turn needs a new blinker confirmation')
+      return result('none', 'Release brake and engage lateral control; a previously started turn needs a new blinker confirmation')
     window = min(30.0, max(12.0, speed*2.0))
     if distance > window:
       return result('none', 'Turn confirmed; waiting until close to intersection')
