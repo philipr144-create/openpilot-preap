@@ -1,3 +1,5 @@
+import json
+
 from cereal import log
 from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_MDL
@@ -39,6 +41,8 @@ class DesireHelper:
     self.keep_pulse_timer = 0.0
     self.prev_one_blinker = False
     self.desire = log.Desire.none
+    self.manual_turns_enabled = False
+    self.manual_turn_poll = 0
 
   @staticmethod
   def get_lane_change_direction(CS):
@@ -48,6 +52,32 @@ class DesireHelper:
     v_ego = carstate.vEgo
     one_blinker = carstate.leftBlinker != carstate.rightBlinker
     below_lane_change_speed = v_ego < LANE_CHANGE_SPEED_MIN
+
+    # Restored low-speed manual-blinker turn desires. Independent of longitudinal control.
+    if self.manual_turn_poll % 20 == 0:
+      self.manual_turns_enabled = False
+      try:
+        with open("/data/nap_turn_settings.json") as stream:
+          cfg = json.loads(stream.read(2049))
+        self.manual_turns_enabled = cfg.get("manual_blinker_turns") is True
+      except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    self.manual_turn_poll += 1
+    if self.manual_turns_enabled and 0 <= v_ego < LANE_CHANGE_SPEED_MIN:
+      # Do not carry an in-progress lane-change state into a low-speed turn.
+      self.lane_change_state = LaneChangeState.off
+      self.lane_change_direction = LaneChangeDirection.none
+      self.lane_change_timer = 0.0
+      self.lane_change_ll_prob = 1.0
+      self.keep_pulse_timer = 0.0
+      self.prev_one_blinker = one_blinker
+      self.desire = log.Desire.none
+      if lateral_active and one_blinker and not carstate.steeringPressed:
+        if carstate.leftBlinker and not carstate.leftBlindspot:
+          self.desire = log.Desire.turnLeft
+        elif carstate.rightBlinker and not carstate.rightBlindspot:
+          self.desire = log.Desire.turnRight
+      return
 
     if not lateral_active or self.lane_change_timer > LANE_CHANGE_TIME_MAX:
       self.lane_change_state = LaneChangeState.off
