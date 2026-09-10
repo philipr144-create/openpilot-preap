@@ -21,6 +21,8 @@ def read_navigation(path, now):
     state = json.loads(raw)
     if state.get('enabled') is not True:
       return None, 'Navigation influence is off'
+    if isinstance(state.get('pause_reason'), str) and state['pause_reason']:
+      return None, 'Navigation paused: ' + state['pause_reason'][:180]
     received, expires = state['received_mono'], state['expires_mono']
     if (type(received) not in (int, float) or type(expires) not in (int, float)
         or not math.isfinite(received + expires) or not received <= now < expires
@@ -110,8 +112,8 @@ class NavigationDesire:
       if cs.brakePressed or not cc.latActive:
         return result('none', 'Release brake and engage lateral control; manual speed control is allowed')
       return result('keepLeft' if side == 'left' else 'keepRight', 'Fresh fork/exit preference')
-    if kind != 'turn':
-      return result('none', 'Maneuver type is display-only')
+    if kind not in ('turn', 'end of road'):
+      return result('none', 'Maneuver type is display-only: ' + kind)
     if not isinstance(maneuver_id, str) or not maneuver_id:
       return result('none', 'Intersection identifier missing; reload navigation server')
     if self.blocked:
@@ -148,6 +150,11 @@ class NavigationDesire:
     if self.started is None:
       self.started = now
     return result('turnLeft' if side == 'left' else 'turnRight', 'Driver-confirmed low-speed intersection turn')
+
+  def record_model_selection(self, selected, source, evaluated, frame_id):
+    # Captured after model.run, before DesireHelper updates for the next frame.
+    self.decision.update(selected_desire=selected, final_desire=selected if evaluated else None,
+                         source=source, model_evaluated=bool(evaluated), frame_id=int(frame_id))
 
   def publish_diagnostics(self, now=None):
     now = time.monotonic() if now is None else now

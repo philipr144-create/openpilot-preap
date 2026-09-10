@@ -275,7 +275,7 @@ def main(demo=False):
 
   # messaging
   pm = PubMaster(["modelV2", "drivingModelData", "cameraOdometry"])
-  sm = SubMaster(["deviceState", "carState", "roadCameraState", "liveCalibration", "driverMonitoringState", "carControl", "liveDelay"])
+  sm = SubMaster(["deviceState", "carState", "roadCameraState", "liveCalibration", "driverMonitoringState", "carControl", "liveDelay"], frequency=1 / DT_MDL)
 
   publish_state = PublishState()
   params = Params()
@@ -343,7 +343,8 @@ def main(demo=False):
 
     sm.update(0)
 
-    desire = DH.desire
+    driver_desire = DH.desire
+    desire = driver_desire
     nav_inputs_valid = (sm.all_checks(['carState', 'carControl'])
                         and all(0 <= time.monotonic() - sm.logMonoTime[s] / 1e9 <= .5
                                 for s in ('carState', 'carControl')))
@@ -351,7 +352,6 @@ def main(demo=False):
                                     driver_desire_none=(desire == log.Desire.none))
     if desire == log.Desire.none:
       desire = getattr(log.Desire, nav_request)
-    nav_desire.publish_diagnostics()
     is_rhd = sm["driverMonitoringState"].isRHD
     frame_id = sm["roadCameraState"].frameId
     v_ego = max(sm["carState"].vEgo, 0.)
@@ -392,6 +392,15 @@ def main(demo=False):
 
     mt1 = time.perf_counter()
     model_output = model.run(bufs, transforms, inputs, prepare_only)
+    # Report the actual selection used in this inference, not just the nav adapter.
+    desire_names = {getattr(log.Desire, name): name for name in
+                    ('none', 'turnLeft', 'turnRight', 'laneChangeLeft', 'laneChangeRight', 'keepLeft', 'keepRight')}
+    selected_name = desire_names.get(desire, 'unknown')
+    selected_source = ('manual_blinker_turn' if driver_desire in (log.Desire.turnLeft, log.Desire.turnRight)
+                       else 'driver_desire_helper' if driver_desire != log.Desire.none
+                       else 'navigation' if nav_request != 'none' else 'none')
+    nav_desire.record_model_selection(selected_name, selected_source, model_output is not None, meta_main.frame_id)
+    nav_desire.publish_diagnostics()
     mt2 = time.perf_counter()
     model_execution_time = mt2 - mt1
 
