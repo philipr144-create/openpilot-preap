@@ -37,7 +37,8 @@ LOW_SPEED_TURN_FULL_EFFECT_MPH = 5.0
 LOW_SPEED_TURN_END_MPH = 25.0
 LOW_SPEED_TURN_CURVATURE_START = 0.025  # Ignore ordinary lane centering
 LOW_SPEED_TURN_CURVATURE_FULL = 0.080   # Full correction on sharp turns
-LOW_SPEED_TURN_MAX_REDUCTION = 0.18     # Retain at least 82% during entry
+# PREAP_WIDER_LOW_SPEED_TURN_ENTRY_V1
+LOW_SPEED_TURN_MAX_REDUCTION = 0.24     # Retain at least 82% during entry
 LOW_SPEED_TURN_SMOOTH_END_MPH = 25.0
 LOW_SPEED_TURN_EARLY_CURVATURE = 0.008
 LOW_SPEED_TURN_RATE_START = 0.020    # Smooth initial steering buildup
@@ -48,9 +49,9 @@ LOW_SPEED_TURN_RAMP_SECONDS = 0.70
 
 # Widen only the entrance. Restore full model curvature at the apex so the
 # vehicle can complete its rotation into the destination lane.
-LOW_SPEED_TURN_ENTRY_MIN_SECONDS = 0.25
-LOW_SPEED_TURN_ENTRY_MAX_SECONDS = 0.70
-LOW_SPEED_TURN_ENTRY_RELEASE_CURVATURE = 0.055
+LOW_SPEED_TURN_ENTRY_MIN_SECONDS = 0.45
+LOW_SPEED_TURN_ENTRY_MAX_SECONDS = 0.90
+LOW_SPEED_TURN_ENTRY_RELEASE_CURVATURE = 0.065
 
 
 def low_speed_turn_scale(v_ego: float, desired_curvature: float,
