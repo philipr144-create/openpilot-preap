@@ -24,6 +24,7 @@ from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 from openpilot.common.transformations.model import get_warp_matrix
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
+from openpilot.selfdrive.controls.lib.tap_lane_change import TapModel
 from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, smooth_value, get_curvature_from_plan
 from openpilot.selfdrive.modeld.parse_model_outputs import Parser
 from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_pose_msg, PublishState
@@ -306,7 +307,11 @@ def main(demo=False):
   prev_action = log.ModelDataV2.Action()
 
   DH = DesireHelper()
+  tap_model = TapModel(DH) if CP.carFingerprint == "TESLA_MODEL_S_PREAP" else None
+  tap_lane_change_prob = 1.0
   nav_desire = NavigationDesire()
+  previous_nav_owner = True
+  manual_rearm = False
 
   while True:
     # Keep receiving frames until we are at least 1 frame ahead of previous extra frame
@@ -348,9 +353,29 @@ def main(demo=False):
     nav_inputs_valid = (sm.all_checks(['carState', 'carControl'])
                         and all(0 <= time.monotonic() - sm.logMonoTime[s] / 1e9 <= .5
                                 for s in ('carState', 'carControl')))
+    tap_claimed_by_nav = nav_desire.claims_tap() if tap_model is not None else True
+    tap_handled = tap_model.update(sm['carState'], sm['carControl'], nav_inputs_valid,
+                                   tap_claimed_by_nav, tap_lane_change_prob) if tap_model is not None else False
+    driver_desire = DH.desire
+    desire = driver_desire
     nav_request = nav_desire.update(sm['carState'], sm['carControl'], nav_inputs_valid,
-                                    driver_desire_none=(desire == log.Desire.none))
-    if desire == log.Desire.none:
+                                    driver_desire_none=(desire == log.Desire.none),
+                                    signal_owned_by_tap=((tap_handled and tap_model.status != 'blocked') or (tap_model is not None
+                                                        and tap_model.enabled and not tap_claimed_by_nav)))
+    nav_owned = nav_desire.owns_blinker
+    if previous_nav_owner and not nav_owned:
+      manual_rearm = True
+    if not sm['carState'].leftBlinker and not sm['carState'].rightBlinker:
+      manual_rearm = False
+    previous_nav_owner = nav_owned
+    suppress_manual = nav_owned or manual_rearm
+    if tap_handled:
+      desire = getattr(log.Desire, nav_request) if tap_model.status == 'blocked' and tap_claimed_by_nav else DH.desire
+    elif suppress_manual:
+      DH.suspend_for_navigation(sm['carState'])
+      driver_desire = log.Desire.none
+      desire = getattr(log.Desire, nav_request) if nav_owned else log.Desire.none
+    elif desire == log.Desire.none:
       desire = getattr(log.Desire, nav_request)
     is_rhd = sm["driverMonitoringState"].isRHD
     frame_id = sm["roadCameraState"].frameId
@@ -396,9 +421,10 @@ def main(demo=False):
     desire_names = {getattr(log.Desire, name): name for name in
                     ('none', 'turnLeft', 'turnRight', 'laneChangeLeft', 'laneChangeRight', 'keepLeft', 'keepRight')}
     selected_name = desire_names.get(desire, 'unknown')
-    selected_source = ('manual_blinker_turn' if driver_desire in (log.Desire.turnLeft, log.Desire.turnRight)
+    selected_source = ('tap_lane_change' if tap_handled and tap_model.status != 'blocked'
+                       else 'manual_blinker_turn' if driver_desire in (log.Desire.turnLeft, log.Desire.turnRight)
                        else 'driver_desire_helper' if driver_desire != log.Desire.none
-                       else 'navigation' if nav_request != 'none' else 'none')
+                       else 'navigation' if nav_owned else 'manual_rearm' if manual_rearm else 'none')
     nav_desire.record_model_selection(selected_name, selected_source, model_output is not None, meta_main.frame_id)
     nav_desire.publish_diagnostics()
     mt2 = time.perf_counter()
@@ -419,7 +445,9 @@ def main(demo=False):
       l_lane_change_prob = desire_state[log.Desire.laneChangeLeft]
       r_lane_change_prob = desire_state[log.Desire.laneChangeRight]
       lane_change_prob = l_lane_change_prob + r_lane_change_prob
-      DH.update(sm['carState'], sm['carControl'].latActive, lane_change_prob)
+      tap_lane_change_prob = lane_change_prob
+      if not suppress_manual and not tap_handled:
+        DH.update(sm['carState'], sm['carControl'].latActive, lane_change_prob)
       modelv2_send.modelV2.meta.laneChangeState = DH.lane_change_state
       modelv2_send.modelV2.meta.laneChangeDirection = DH.lane_change_direction
       drivingdata_send.drivingModelData.meta.laneChangeState = DH.lane_change_state

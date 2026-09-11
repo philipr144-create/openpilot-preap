@@ -44,6 +44,47 @@ class DesireHelper:
     self.manual_turns_enabled = False
     self.manual_turn_poll = 0
 
+    # PREAP_MANUAL_TURN_CANCEL_LATCH_V1
+    # Once the driver takes over an active manual city turn, do not request
+    # that turn again until the physical blinker has been canceled.
+    self.manual_turn_command_active = False
+    self.manual_turn_cancelled = False
+
+  def suspend_for_navigation(self, carstate):
+    self.lane_change_state = LaneChangeState.off
+    self.lane_change_direction = LaneChangeDirection.none
+    self.lane_change_timer = 0.0
+    self.lane_change_ll_prob = 1.0
+    self.keep_pulse_timer = 0.0
+    self.prev_one_blinker = bool(carstate.leftBlinker or carstate.rightBlinker)
+    self.desire = log.Desire.none
+
+  def update_tap(self, carstate, lane_change_prob, direction):
+    """One authorized maneuver; completion always returns off, never preLaneChange."""
+    self.prev_one_blinker = bool(carstate.leftBlinker or carstate.rightBlinker)
+    self.keep_pulse_timer = 0.0
+    self.lane_change_direction = LaneChangeDirection.left if direction == 1 else LaneChangeDirection.right
+    if self.lane_change_state == LaneChangeState.off:
+      self.lane_change_state = LaneChangeState.preLaneChange
+      self.lane_change_ll_prob = 1.0
+    if self.lane_change_state == LaneChangeState.preLaneChange:
+      blindspot = carstate.leftBlindspot if direction == 1 else carstate.rightBlindspot
+      if not blindspot:
+        self.lane_change_state = LaneChangeState.laneChangeStarting
+    elif self.lane_change_state == LaneChangeState.laneChangeStarting:
+      self.lane_change_ll_prob = max(self.lane_change_ll_prob - 2 * DT_MDL, 0.0)
+      if lane_change_prob < 0.02 and self.lane_change_ll_prob < 0.01:
+        self.lane_change_state = LaneChangeState.laneChangeFinishing
+    elif self.lane_change_state == LaneChangeState.laneChangeFinishing:
+      self.lane_change_ll_prob = min(self.lane_change_ll_prob + DT_MDL, 1.0)
+      if self.lane_change_ll_prob > 0.99:
+        self.suspend_for_navigation(carstate)
+        return 'complete'
+    self.lane_change_timer += DT_MDL
+    self.desire = DESIRES[self.lane_change_direction][self.lane_change_state]
+    return {LaneChangeState.preLaneChange: 'waiting', LaneChangeState.laneChangeStarting: 'starting',
+            LaneChangeState.laneChangeFinishing: 'finishing'}[self.lane_change_state]
+
   @staticmethod
   def get_lane_change_direction(CS):
     return LaneChangeDirection.left if CS.leftBlinker else LaneChangeDirection.right
@@ -63,6 +104,10 @@ class DesireHelper:
       except (OSError, ValueError, TypeError, AttributeError):
         pass
     self.manual_turn_poll += 1
+    if not one_blinker:
+      self.manual_turn_command_active = False
+      self.manual_turn_cancelled = False
+
     if self.manual_turns_enabled and 0 <= v_ego < LANE_CHANGE_SPEED_MIN:
       # Do not carry an in-progress lane-change state into a low-speed turn.
       self.lane_change_state = LaneChangeState.off
@@ -72,11 +117,26 @@ class DesireHelper:
       self.keep_pulse_timer = 0.0
       self.prev_one_blinker = one_blinker
       self.desire = log.Desire.none
-      if lateral_active and one_blinker and not carstate.steeringPressed:
+
+      # PREAP_MANUAL_TURN_CANCEL_LATCH_V1
+      # Only latch a cancellation after a turn command was actually active.
+      # Releasing the wheel cannot restart it while the same blinker remains on.
+      if carstate.steeringPressed and self.manual_turn_command_active:
+        self.manual_turn_cancelled = True
+        self.manual_turn_command_active = False
+
+      if (
+          lateral_active
+          and one_blinker
+          and not carstate.steeringPressed
+          and not self.manual_turn_cancelled
+      ):
         if carstate.leftBlinker and not carstate.leftBlindspot:
           self.desire = log.Desire.turnLeft
+          self.manual_turn_command_active = True
         elif carstate.rightBlinker and not carstate.rightBlindspot:
           self.desire = log.Desire.turnRight
+          self.manual_turn_command_active = True
       return
 
     if not lateral_active or self.lane_change_timer > LANE_CHANGE_TIME_MAX:

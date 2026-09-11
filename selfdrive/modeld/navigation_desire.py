@@ -13,13 +13,25 @@ TURN_TIMEOUT = 12.0
 EXIT_TIMEOUT = 12.0
 
 
-def read_navigation(path, now):
+def read_navigation(path, now, ownership=None):
   try:
     with open(path) as stream:
       raw = stream.read(2049)
     if len(raw) > 2048:
       return None, 'Navigation snapshot too large'
     state = json.loads(raw)
+    if ownership is not None:
+      # Acquisition is conservative; release needs a fresh explicit server state.
+      if state.get('enabled') is True and state.get('route_active') is True:
+        ownership.owns_blinker = True
+      received, expires = state.get('received_mono'), state.get('expires_mono')
+      fresh = (type(received) in (int, float) and type(expires) in (int, float)
+               and math.isfinite(received) and math.isfinite(expires)
+               and received <= now < expires and 0 < expires-received <= 3)
+      if fresh and (state.get('enabled') is False or
+                    (state.get('enabled') is True and state.get('route_active') is False)):
+        ownership.owns_blinker = False
+
     if state.get('enabled') is not True:
       return None, 'Navigation influence is off'
     if isinstance(state.get('pause_reason'), str) and state['pause_reason']:
@@ -44,6 +56,7 @@ def read_navigation(path, now):
 
 class NavigationDesire:
   def __init__(self, path=SNAPSHOT, diagnostics_path=DIAGNOSTICS):
+    self.owns_blinker = True  # Unknown ownership cannot silently authorize manual fallback.
     self.path = path
     self.diagnostics_path = diagnostics_path
     self.previous_signal = None
@@ -54,25 +67,47 @@ class NavigationDesire:
     self.last_write = -1e9
     self.decision = {}
 
-  def update(self, cs, cc, inputs_valid, driver_desire_none=True, now=None):
+  def claims_tap(self, now=None):
+    now = time.monotonic() if now is None else now
+    state, _ = read_navigation(self.path, now, self)
+    if state is None:
+      return self.owns_blinker  # Unknown/stale active route cannot authorize a tap.
+    if not self.owns_blinker:
+      return False
+    maneuver = state['maneuver']
+    kind, distance = maneuver['type'], maneuver['distance_m']
+    return ((kind in ('fork', 'off ramp') and 10 <= distance <= 300)
+            or (kind in ('turn', 'end of road') and -8 <= distance <= TURN_CONFIRM_DISTANCE)
+            or self.started is not None)
+
+  def update(self, cs, cc, inputs_valid, driver_desire_none=True, now=None, signal_owned_by_tap=False):
     now = time.monotonic() if now is None else now
     signal = ('left' if cs.leftBlinker else 'right') if cs.leftBlinker != cs.rightBlinker else None
+    if signal_owned_by_tap:
+      signal = None
     edge = signal is not None and signal != self.previous_signal
     self.previous_signal = signal
-    state, reason = read_navigation(self.path, now)
+    state, reason = read_navigation(self.path, now, self)
     self.decision = {'received_mono': now, 'desire': 'none', 'reason': reason,
                      'route_id': '', 'maneuver_id': '', 'confirmed': False}
 
     def result(desire, reason):
-      self.decision.update(desire=desire, reason=reason, confirmed=self.confirmed)
+      self.decision.update(desire=desire, reason=reason, confirmed=self.confirmed,
+                           blinker_owner='navigation' if self.owns_blinker else 'manual')
       return desire
 
+    if signal_owned_by_tap:
+      return result('none', 'Signal reserved for experimental tap lane change')
     if state is None:
       if self.started is not None:
         self.blocked = True
       self.confirmed = False
       self.started = None
       return result('none', reason)
+    if not self.owns_blinker:
+      self.confirmed = False
+      self.started = None
+      return result('none', 'No navigation-owned route')
     maneuver = state['maneuver']
     kind, modifier, distance = maneuver['type'], maneuver['modifier'], maneuver['distance_m']
     maneuver_id = state.get('maneuver_id', '')
@@ -95,7 +130,7 @@ class NavigationDesire:
       self.blocked = True
       self.confirmed = False
       return result('none', 'Driver steering override')
-    if not driver_desire_none:
+    if not driver_desire_none and not self.owns_blinker:
       if self.started is not None:
         self.blocked = True
       self.confirmed = False
@@ -109,6 +144,10 @@ class NavigationDesire:
     side = {'left': 'left', 'slight left': 'left', 'right': 'right', 'slight right': 'right'}.get(modifier)
     if side is None:
       return result('none', 'Unsupported direction; no U-turn or sharp-turn automation')
+    if signal is not None and signal != side:
+      self.blocked = True
+      self.confirmed = False
+      return result('none', 'Opposite blinker cancelled this maneuver')
     if kind in ('fork', 'off ramp'):
       if not isinstance(maneuver_id, str) or not maneuver_id:
         return result('none', 'Exit identifier missing')
