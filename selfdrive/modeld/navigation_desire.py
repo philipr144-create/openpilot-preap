@@ -88,6 +88,14 @@ class NavigationDesire:
     edge = signal is not None and signal != self.previous_signal
     self.previous_signal = signal
     state, reason = read_navigation(self.path, now, self)
+    
+    if not hasattr(self, 'params'):
+      from openpilot.common.params import Params
+      self.params = Params()
+    if self.params.get_bool("NAPNavigationManeuvers") is False:
+      state = None
+      reason = 'Disabled in NAP settings'
+
     self.decision = {'received_mono': now, 'desire': 'none', 'reason': reason,
                      'route_id': '', 'maneuver_id': '', 'confirmed': False}
 

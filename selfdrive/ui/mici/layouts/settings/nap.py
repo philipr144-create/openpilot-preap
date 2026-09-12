@@ -68,6 +68,7 @@ class NAPLayoutMici(NavScroller):
     pedal_enabled.set_enabled(ui_state.is_offroad)
 
     adaptive_accel = BigParamControl("adaptive accel limits", NAPParamKeys.ADAPTIVE_ACCEL)
+    tap_lane_change = BigParamControl("tap lane change (experimental)", NAPParamKeys.TAP_LANE_CHANGE)
 
     # ── Pedal hardware ───────────────────────────────
     # default_value=2 matches NAPPedalCanBus declared default in params_keys.h
@@ -165,6 +166,7 @@ class NAPLayoutMici(NavScroller):
     self._scroller.add_widgets([
       pedal_enabled,
       adaptive_accel,
+      tap_lane_change,
       pedal_can_bus,
       pedal_calib_status,
       calibrate_pedal_btn,

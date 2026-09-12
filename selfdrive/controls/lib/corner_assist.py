@@ -52,6 +52,12 @@ class CornerAssist:
     now = time.monotonic() if now is None else now
     if now-self.last_config >= 1 or now < self.last_config:
       self.config = settings()
+      if not hasattr(self, 'params'):
+        from openpilot.common.params import Params
+        self.params = Params()
+      param_val = self.params.get("NAPCornerAssist")
+      if param_val is not None:
+        self.config['corner_assist'] = (param_val == b"1")
       self.last_config = now
 
   def update(self, base, speed, curvature, coast, active, now):

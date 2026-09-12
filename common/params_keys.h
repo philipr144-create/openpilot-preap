@@ -131,6 +131,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"Version", {PERSISTENT, STRING}},
 
     // NAP (NotAutopilot) Pre-AP Tesla params
+    {"NapTapLaneChange", {PERSISTENT, BOOL, "0"}},
     {"NAPBrakeFactor", {PERSISTENT, FLOAT, "1.0"}},
     {"NAPFollowDistance", {PERSISTENT, INT, "4"}},
     {"NAPForcePreAP", {PERSISTENT, BOOL, "1"}},
@@ -142,6 +143,12 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"NAPPedalCalibZero", {PERSISTENT, FLOAT, "0.0"}},
     {"NAPPedalCanBus", {PERSISTENT, INT, "2"}},
     {"NAPAdaptiveAccel", {PERSISTENT, BOOL, "1"}},
+    {"NAPCityTurns", {PERSISTENT, BOOL, "1"}},
+    {"NAPWideLowSpeedTurns", {PERSISTENT, BOOL, "1"}},
+    {"NAPLowSpeedSteeringRate", {PERSISTENT, BOOL, "1"}},
+    {"NAPNavigationManeuvers", {PERSISTENT, BOOL, "1"}},
+    {"NAPCornerAssist", {PERSISTENT, BOOL, "1"}},
+    {"NAPParkedSignalTest", {PERSISTENT, BOOL, "0"}},
     {"NAPPedalEnabled", {PERSISTENT, BOOL}},
     {"NAPPedalProfile", {PERSISTENT, INT, "4"}},
     {"NAPRadarBehindNosecone", {PERSISTENT, BOOL}},

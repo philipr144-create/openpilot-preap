@@ -195,3 +195,54 @@ def find_preset_index(presets: list, value, default: int = 0) -> int:
     return presets.index(value)
   except ValueError:
     return min(range(len(presets)), key=lambda i: abs(presets[i] - value))
+
+
+# --- Pre-AP Custom Toggles ---
+
+PREAP_TOGGLES = [
+    {
+        "param": "NAPCityTurns",
+        "title": "City Turns",
+        "description": "Use the turn signal to help guide city turns below 20 mph.",
+        "type": "bool"
+    },
+    {
+        "param": "NAPWideLowSpeedTurns",
+        "title": "Wider Low-Speed Turns",
+        "description": "Take a wider entrance on tight signaled turns to reduce curb cutting.",
+        "type": "bool"
+    },
+    {
+        "param": "NAPLowSpeedSteeringRate",
+        "title": "Low-Speed Steering Assist",
+        "description": "Allow faster steering movement during tight signaled turns below 25 mph.",
+        "type": "bool"
+    },
+    {
+        "param": "NAPTapLaneChange",
+        "title": "Tap Lane Change",
+        "description": "Request one lane change with a brief turn-signal tap.",
+        "type": "bool"
+    },
+    {
+        "param": "NAPNavigationManeuvers",
+        "title": "Navigation Maneuvers",
+        "description": "Allow fresh navigation instructions to guide upcoming maneuvers.",
+        "type": "bool"
+    },
+    {
+        "param": "NAPCornerAssist",
+        "title": "Corner Assist",
+        "description": "Adjust supported controls when approaching detected corners.",
+        "type": "bool"
+    }
+]
+
+PREAP_DEV_TOGGLES = [
+    {
+        "param": "NAPParkedSignalTest",
+        "title": "Parked Signal Testing",
+        "description": "Allow diagnostic vehicle-signal tests only while safely parked.",
+        "type": "bool"
+    }
+]

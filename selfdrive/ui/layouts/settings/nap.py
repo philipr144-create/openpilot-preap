@@ -21,6 +21,7 @@ from openpilot.selfdrive.ui.layouts.settings.nap_content import (
   RADAR_OFFSET_MAX, RADAR_OFFSET_MIN,
   RESTORE_EPAS_INSTRUCTIONS, TEST_RADAR_INSTRUCTIONS,
   acknowledgments_html, find_preset_index,
+  PREAP_TOGGLES, PREAP_DEV_TOGGLES,
 )
 from opendbc.car.tesla.preap.nap_params import NAPParamKeys, DEFAULTS
 from openpilot.selfdrive.ui.ui_state import ui_state
@@ -96,7 +97,23 @@ class NAPLayout(Widget):
     self._all_items = []
     self._toggle_map = {}  # param_key -> ListItem (for refresh)
 
-    # ── Section 1: Longitudinal Control ──
+    # ── Section 1: Pre-AP Driving Features ──
+    self._all_items.append(section_header_item("Pre-AP Driving Features"))
+    
+    for toggle in PREAP_TOGGLES:
+      param_key = toggle["param"]
+      
+      # Map Tap Lane Change back to its original key to preserve existing user settings
+      if param_key == "NAPTapLaneChange":
+        param_key = NAPParamKeys.TAP_LANE_CHANGE
+        
+      self._add_toggle(
+        param_key,
+        toggle["title"],
+        toggle["description"],
+      )
+
+    # ── Section 2: Longitudinal Control ──
     self._all_items.append(section_header_item("Longitudinal Control"))
 
     self._add_toggle(
@@ -124,7 +141,7 @@ class NAPLayout(Widget):
     )
     self._all_items.append(self._follow_buttons)
 
-    # ── Section 2: Pedal Hardware ──
+    # ── Section 3: Pedal Hardware ──
     self._all_items.append(section_header_item("Pedal Hardware"))
 
 
@@ -152,11 +169,11 @@ class NAPLayout(Widget):
       "Start",
       description="Run the pedal calibration routine. Vehicle must be stationary with ignition on.",
       callback=self._on_calibrate_pedal,
-    )
+      )
     self._calibrate_pedal_btn.action_item.set_enabled(ui_state.is_offroad)
     self._all_items.append(self._calibrate_pedal_btn)
 
-    # ── Section 3: Radar ──
+    # ── Section 4: Radar ──
     self._all_items.append(section_header_item("Radar"))
 
     self._add_toggle(
@@ -205,7 +222,7 @@ class NAPLayout(Widget):
     self._test_radar_btn.action_item.set_enabled(ui_state.is_offroad)
     self._all_items.append(self._test_radar_btn)
 
-    # ── Section 4: iBooster / Braking (not yet implemented — grayed out) ──
+    # ── Section 5: iBooster / Braking (not yet implemented — grayed out) ──
     self._all_items.append(section_header_item("iBooster / Braking"))
 
     self._add_toggle(
@@ -227,7 +244,7 @@ class NAPLayout(Widget):
     self._brake_factor_buttons.action_item.set_enabled(False)
     self._all_items.append(self._brake_factor_buttons)
 
-    # ── Section 5: Advanced ──
+    # ── Section 6: Advanced ──
     self._all_items.append(section_header_item("Advanced"))
 
     # Force Pre-AP is always on for now — grayed out in the ON position
@@ -239,7 +256,14 @@ class NAPLayout(Widget):
       enabled=False,
     )
 
-    # ── Section 6: Actions ──
+    for toggle in PREAP_DEV_TOGGLES:
+      self._add_toggle(
+        toggle["param"],
+        toggle["title"],
+        toggle["description"],
+      )
+
+    # ── Section 7: Actions ──
     self._all_items.append(section_header_item("Actions"))
 
     self._backup_epas_btn = button_item(

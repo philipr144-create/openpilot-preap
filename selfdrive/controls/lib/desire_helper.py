@@ -3,6 +3,7 @@ import json
 from cereal import log
 from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_MDL
+from openpilot.common.params import Params
 
 LaneChangeState = log.LaneChangeState
 LaneChangeDirection = log.LaneChangeDirection
@@ -43,6 +44,7 @@ class DesireHelper:
     self.desire = log.Desire.none
     self.manual_turns_enabled = False
     self.manual_turn_poll = 0
+    self.params = Params()
 
     # PREAP_MANUAL_TURN_CANCEL_LATCH_V1
     # Once the driver takes over an active manual city turn, do not request
@@ -95,20 +97,31 @@ class DesireHelper:
     below_lane_change_speed = v_ego < LANE_CHANGE_SPEED_MIN
 
     # Restored low-speed manual-blinker turn desires. Independent of longitudinal control.
-    if self.manual_turn_poll % 20 == 0:
-      self.manual_turns_enabled = False
-      try:
-        with open("/data/nap_turn_settings.json") as stream:
-          cfg = json.loads(stream.read(2049))
-        self.manual_turns_enabled = cfg.get("manual_blinker_turns") is True
-      except (OSError, ValueError, TypeError, AttributeError):
-        pass
+    if self.manual_turn_poll % 100 == 0:
+      raw_param = self.params.get("NAPCityTurns")
+      if raw_param is not None:
+        self.manual_turns_enabled = (raw_param == b"1")
+      else:
+        self.manual_turns_enabled = False
+        try:
+          with open("/data/nap_turn_settings.json") as stream:
+            cfg = json.loads(stream.read(2049))
+          self.manual_turns_enabled = cfg.get("manual_blinker_turns") is True
+        except (OSError, ValueError, TypeError, AttributeError):
+          pass
     self.manual_turn_poll += 1
+
     if not one_blinker:
       self.manual_turn_command_active = False
       self.manual_turn_cancelled = False
 
-    if self.manual_turns_enabled and 0 <= v_ego < LANE_CHANGE_SPEED_MIN:
+    if not self.manual_turns_enabled:
+      # Clear out any active manual turn state if disabled mid-turn
+      if self.manual_turn_command_active:
+        self.desire = log.Desire.none
+      self.manual_turn_command_active = False
+      self.manual_turn_cancelled = False
+    elif 0 <= v_ego < LANE_CHANGE_SPEED_MIN:
       # Do not carry an in-progress lane-change state into a low-speed turn.
       self.lane_change_state = LaneChangeState.off
       self.lane_change_direction = LaneChangeDirection.none
