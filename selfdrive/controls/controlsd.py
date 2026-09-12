@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import math
+import numpy as np
 from numbers import Number
 
 from cereal import car, log
