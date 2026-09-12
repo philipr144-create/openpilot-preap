@@ -13,9 +13,9 @@ TURN_CONFIRM_DISTANCE = 80.0
 EXIT_SIGNAL_SECONDS = 4.0
 EXIT_SIGNAL_DISTANCE_MIN = 60.0
 EXIT_SIGNAL_DISTANCE_MAX = 120.0
-TURN_SIGNAL_SECONDS = 4.0
-TURN_SIGNAL_DISTANCE_MIN = 30.0
-TURN_SIGNAL_DISTANCE_MAX = 60.0
+TURN_SIGNAL_SECONDS = 5.0
+TURN_SIGNAL_DISTANCE_MIN = 60.0
+TURN_SIGNAL_DISTANCE_MAX = 80.0
 
 
 def read_navigation(path, now, ownership=None):
@@ -243,7 +243,9 @@ class NavigationDesire:
       return result('none', 'Intersection guidance paused; brake or lateral control gate', indicator)
     desire_window = min(30.0, max(12.0, speed*2.0))
     if distance > desire_window:
-      return result('none', 'Turn signal active; waiting until model guidance window', indicator)
+      waiting_reason = ('Turn signal active; waiting until model guidance window' if indicator
+                        else 'Turn confirmed; waiting until signal approach window')
+      return result('none', waiting_reason, indicator)
     return result('turnLeft' if side == 'left' else 'turnRight',
                   'Navigation-authorized low-speed intersection turn',
                   indicator)
