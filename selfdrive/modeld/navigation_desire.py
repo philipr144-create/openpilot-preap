@@ -1,4 +1,4 @@
-"""Driver-confirmed navigation desires; no vehicle-command interfaces."""
+"""Driver-confirmed navigation desires and synthetic announcement requests."""
 import json
 import math
 import os
@@ -7,10 +7,14 @@ import time
 
 SNAPSHOT = '/dev/shm/nap_navigation_desire.json'
 DIAGNOSTICS = '/dev/shm/nap_navigation_decision.json'
+SIGNAL_REQUEST = '/dev/shm/nap_navigation_signal_request.json'
 TURN_SPEED_MAX = 25 * 0.44704
 TURN_CONFIRM_DISTANCE = 80.0
 TURN_TIMEOUT = 12.0
 EXIT_TIMEOUT = 12.0
+EXIT_SIGNAL_SECONDS = 4.0
+EXIT_SIGNAL_DISTANCE_MIN = 60.0
+EXIT_SIGNAL_DISTANCE_MAX = 120.0
 
 
 def read_navigation(path, now, ownership=None):
@@ -55,10 +59,11 @@ def read_navigation(path, now, ownership=None):
 
 
 class NavigationDesire:
-  def __init__(self, path=SNAPSHOT, diagnostics_path=DIAGNOSTICS):
+  def __init__(self, path=SNAPSHOT, diagnostics_path=DIAGNOSTICS, signal_path=SIGNAL_REQUEST):
     self.owns_blinker = True  # Unknown ownership cannot silently authorize manual fallback.
     self.path = path
     self.diagnostics_path = diagnostics_path
+    self.signal_path = signal_path
     self.previous_signal = None
     self.key = None
     self.confirmed = False
@@ -66,10 +71,16 @@ class NavigationDesire:
     self.started = None
     self.last_write = -1e9
     self.decision = {}
+    self.indicator_request = 'none'
+    self.prepared_navigation = None
 
-  def claims_tap(self, now=None):
+  def claims_tap(self, now=None, prepare=False):
     now = time.monotonic() if now is None else now
-    state, _ = read_navigation(self.path, now, self)
+    state, reason = read_navigation(self.path, now, self)
+    if prepare:
+      # modeld asks for ownership immediately before update. Reuse this exact
+      # atomic snapshot so a distance/route update cannot split arbitration.
+      self.prepared_navigation = (state, reason)
     if state is None:
       return self.owns_blinker  # Unknown/stale active route cannot authorize a tap.
     if not self.owns_blinker:
@@ -80,15 +91,23 @@ class NavigationDesire:
             or (kind in ('turn', 'end of road') and -8 <= distance <= TURN_CONFIRM_DISTANCE)
             or self.started is not None)
 
-  def update(self, cs, cc, inputs_valid, driver_desire_none=True, now=None, signal_owned_by_tap=False):
+  def update(self, cs, cc, inputs_valid, driver_desire_none=True, now=None,
+             signal_owned_by_tap=False, physical_direction=None):
     now = time.monotonic() if now is None else now
-    signal = ('left' if cs.leftBlinker else 'right') if cs.leftBlinker != cs.rightBlinker else None
-    if signal_owned_by_tap:
-      signal = None
+    if physical_direction in (0, 1, 2):
+      # Pre-AP passes the filtered physical STW_ACTN_RQ state. Synthetic frames
+      # and their RX reflections can therefore never authorize navigation.
+      signal = {0: None, 1: 'left', 2: 'right'}[physical_direction]
+    else:
+      signal = ('left' if cs.leftBlinker else 'right') if cs.leftBlinker != cs.rightBlinker else None
     edge = signal is not None and signal != self.previous_signal
     self.previous_signal = signal
-    state, reason = read_navigation(self.path, now, self)
-    
+    if self.prepared_navigation is not None:
+      state, reason = self.prepared_navigation
+      self.prepared_navigation = None
+    else:
+      state, reason = read_navigation(self.path, now, self)
+
     if not hasattr(self, 'params'):
       from openpilot.common.params import Params
       self.params = Params()
@@ -97,28 +116,32 @@ class NavigationDesire:
       reason = 'Disabled in NAP settings'
 
     self.decision = {'received_mono': now, 'desire': 'none', 'reason': reason,
-                     'route_id': '', 'maneuver_id': '', 'confirmed': False}
+                     'route_id': '', 'maneuver_id': '', 'confirmed': False,
+                     'physical_signal': signal or 'none',
+                     'tap_signal_active': bool(signal_owned_by_tap)}
+    current_maneuver_id = ''
 
-    def result(desire, reason):
+    def result(desire, reason, indicator_direction=0):
+      self.indicator_request = {0: 'none', 1: 'left', 2: 'right'}[indicator_direction]
+      self._publish_signal(indicator_direction, current_maneuver_id, desire, reason, now)
       self.decision.update(desire=desire, reason=reason, confirmed=self.confirmed,
-                           blinker_owner='navigation' if self.owns_blinker else 'manual')
+                           navigation_route_owned=bool(self.owns_blinker),
+                           blinker_owner=('driver' if signal is not None else 'navigation'
+                                          if indicator_direction else 'tap'
+                                          if signal_owned_by_tap else 'none'),
+                           synthetic_indicator_request=self.indicator_request)
       return desire
 
-    if signal_owned_by_tap:
-      return result('none', 'Signal reserved for experimental tap lane change')
     if state is None:
       if self.started is not None:
         self.blocked = True
       self.confirmed = False
       self.started = None
       return result('none', reason)
-    if not self.owns_blinker:
-      self.confirmed = False
-      self.started = None
-      return result('none', 'No navigation-owned route')
     maneuver = state['maneuver']
     kind, modifier, distance = maneuver['type'], maneuver['modifier'], maneuver['distance_m']
     maneuver_id = state.get('maneuver_id', '')
+    current_maneuver_id = maneuver_id if isinstance(maneuver_id, str) else ''
     key = (state['route_id'], maneuver_id)
     if key != self.key:
       self.key = key
@@ -127,6 +150,12 @@ class NavigationDesire:
       self.started = None
     self.decision.update(route_id=state['route_id'], maneuver_id=maneuver_id,
                          maneuver_type=kind, modifier=modifier, distance_m=distance)
+    if not self.owns_blinker:
+      self.confirmed = False
+      self.started = None
+      return result('none', 'No navigation-owned route')
+    if signal_owned_by_tap:
+      return result('none', 'Active synthetic tap lane change owns the signal')
     if not inputs_valid:
       if self.started is not None:
         self.blocked = True
@@ -161,24 +190,34 @@ class NavigationDesire:
         return result('none', 'Exit identifier missing')
       if self.blocked:
         return result('none', 'This exit was cancelled; no automatic retry')
-      if signal != side:
-        if self.started is not None:
-          self.blocked = True
-        return result('none', 'Matching blinker required throughout exit guidance')
       if not 10 <= distance <= 300:
         if self.started is not None:
           self.blocked = True
+        self.confirmed = False
+        self.started = None
         return result('none', 'Fork/exit outside 10–300 m window')
-      if self.started is not None and now-self.started >= EXIT_TIMEOUT:
-        self.blocked = True
-        return result('none', 'Exit request timed out; no automatic retry')
+      # A real stalk input authorizes the exit once. Synthetic signaling then
+      # announces that decision without feeding back as authorization.
+      if signal == side:
+        self.confirmed = True
+      if not self.confirmed:
+        return result('none', 'Matching physical blinker required to confirm exit guidance')
       if cs.brakePressed or not cc.latActive:
         if self.started is not None:
           self.blocked = True
         return result('none', 'Exit guidance inactive; brake or lateral control gate')
-      if self.started is None:
-        self.started = now
-      return result('keepLeft' if side == 'left' else 'keepRight', 'Bounded exit preference with matching blinker')
+      signal_window = min(EXIT_SIGNAL_DISTANCE_MAX,
+                          max(EXIT_SIGNAL_DISTANCE_MIN, speed * EXIT_SIGNAL_SECONDS))
+      indicator = 0
+      if distance <= signal_window:
+        if self.started is None:
+          self.started = now
+        if now-self.started >= EXIT_TIMEOUT:
+          self.blocked = True
+          return result('none', 'Exit request timed out; no automatic retry')
+        indicator = 1 if side == 'left' else 2
+      return result('keepLeft' if side == 'left' else 'keepRight',
+                    'Driver-confirmed bounded exit preference', indicator)
     if kind not in ('turn', 'end of road'):
       return result('none', 'Maneuver type is display-only: ' + kind)
     if not isinstance(maneuver_id, str) or not maneuver_id:
@@ -189,15 +228,11 @@ class NavigationDesire:
       self.confirmed = False
       self.started = None
       return result('none', 'Intersection outside confirmation window (80 m ahead to 8 m past)')
-    if signal != side:
-      self.confirmed = False
-      self.started = None
-      return result('none', 'Use the matching manual blinker to confirm this turn')
-    if edge and speed < TURN_SPEED_MAX:
+    if not self.confirmed and edge and signal == side and speed < TURN_SPEED_MAX:
       self.confirmed = True
       self.started = None
     if not self.confirmed:
-      return result('none', 'Below 25 mph, switch matching blinker off/on within 80 m to confirm')
+      return result('none', 'Below 25 mph, use the matching physical blinker within 80 m to confirm')
     if speed >= TURN_SPEED_MAX:
       self.confirmed = False
       self.started = None
@@ -216,12 +251,39 @@ class NavigationDesire:
       return result('none', 'Turn confirmed; waiting until close to intersection')
     if self.started is None:
       self.started = now
-    return result('turnLeft' if side == 'left' else 'turnRight', 'Driver-confirmed low-speed intersection turn')
+    return result('turnLeft' if side == 'left' else 'turnRight',
+                  'Driver-confirmed low-speed intersection turn',
+                  1 if side == 'left' else 2)
 
-  def record_model_selection(self, selected, source, evaluated, frame_id):
+  def _publish_signal(self, direction, maneuver_id, desire, reason, now):
+    name = None
+    try:
+      with tempfile.NamedTemporaryFile(mode='w', dir=os.path.dirname(self.signal_path),
+                                       prefix='.nap-nav-signal-', delete=False) as stream:
+        name = stream.name
+        json.dump({'time': now, 'active': direction in (1, 2),
+                   'direction': direction if direction in (1, 2) else 0,
+                   'maneuver_id': maneuver_id if isinstance(maneuver_id, str) else '',
+                   'desire': desire, 'reason': reason}, stream, allow_nan=False)
+      os.replace(name, self.signal_path)
+    except (OSError, ValueError, TypeError):
+      pass  # Signaling must never interrupt model inference.
+    finally:
+      if name:
+        try:
+          os.unlink(name)
+        except OSError:
+          pass
+
+  def record_model_selection(self, selected, source, evaluated, frame_id, *,
+                             signal_owner='none', tap_enabled=False,
+                             tap_status='unavailable', tap_signal_active=False):
     # Captured after model.run, before DesireHelper updates for the next frame.
     self.decision.update(selected_desire=selected, final_desire=selected if evaluated else None,
-                         source=source, model_evaluated=bool(evaluated), frame_id=int(frame_id))
+                         source=source, model_evaluated=bool(evaluated), frame_id=int(frame_id),
+                         signal_owner=signal_owner, blinker_owner=signal_owner,
+                         tap_enabled=bool(tap_enabled),
+                         tap_status=tap_status, tap_signal_active=bool(tap_signal_active))
 
   def publish_diagnostics(self, now=None):
     now = time.monotonic() if now is None else now

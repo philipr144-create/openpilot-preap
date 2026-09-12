@@ -109,6 +109,12 @@ class Simulation(unittest.TestCase):
     self.assertFalse(self.ctrl.suppress)
     self.assertEqual(self.tick(), [])
 
+  def test_enabled_idle_is_not_signal_owner(self):
+    self.tick()
+    self.assertTrue(self.model.enabled)
+    self.assertFalse(self.model.signal_active)
+    self.assertFalse(self.model.locked)
+
   def test_exactly_40_blocked(self):
     self.cs.vEgo = core.SPEED_MIN
     self.tap()
@@ -160,6 +166,12 @@ class Simulation(unittest.TestCase):
       self.assertEqual(self.tick(prob=0), [])
     self.assertEqual(self.dh.desire, log.Desire.none)
     self.assertTrue(self.ctrl.suppress)
+
+    # The replay latch may remain set, but completed tap signaling must release
+    # model ownership after cleanup.
+    handled = self.model.update(self.cs, self.cc, True, False, 0, now=self.now)
+    self.assertFalse(handled)
+    self.assertFalse(self.model.signal_active)
 
   def test_second_tap_cancels_no_restart(self):
     self.active()
@@ -346,7 +358,9 @@ class NavigationTests(unittest.TestCase):
     self.temp = tempfile.TemporaryDirectory()
     self.addCleanup(self.temp.cleanup)
     self.path = Path(self.temp.name) / "nav"
-    self.nav = nav.NavigationDesire(self.path)
+    self.signal_path = Path(self.temp.name) / "signal"
+    self.nav = nav.NavigationDesire(self.path, Path(self.temp.name) / "decision", self.signal_path)
+    self.nav.params = NS(get_bool=lambda _: True)
 
   def state(self, kind="fork", distance=100, enabled=True, active=True):
     self.path.write_text(
@@ -400,6 +414,123 @@ class NavigationTests(unittest.TestCase):
     )
     self.assertFalse(self.nav.blocked)
     self.assertFalse(self.nav.confirmed)
+
+  def test_reflected_synthetic_signal_cannot_confirm_turn(self):
+    self.state(kind="turn", distance=10)
+    c = cs()
+    c.vEgo = 5
+    # carState reports the lamp, but filtered physical stalk is neutral.
+    self.assertEqual(self.nav.update(c, NS(latActive=True), True, now=2,
+                                     physical_direction=0), "none")
+    self.assertFalse(self.nav.confirmed)
+    self.assertEqual(self.nav.indicator_request, "none")
+
+  def test_city_confirmation_latches_but_signals_near_turn(self):
+    self.state(kind="turn", distance=70)
+    c = cs()
+    c.vEgo = 5
+    self.assertEqual(self.nav.update(c, NS(latActive=True), True, now=2,
+                                     physical_direction=1), "none")
+    self.assertTrue(self.nav.confirmed)
+    self.assertEqual(self.nav.indicator_request, "none")
+
+    self.state(kind="turn", distance=10)
+    c.leftBlinker = False
+    self.assertEqual(self.nav.update(c, NS(latActive=True), True, now=2.05,
+                                     physical_direction=0), "turnLeft")
+    self.assertEqual(self.nav.indicator_request, "left")
+    signal = json.loads(self.signal_path.read_text())
+    self.assertTrue(signal["active"])
+    self.assertEqual(signal["direction"], 1)
+
+  def test_exit_guidance_starts_early_but_signal_is_just_in_time(self):
+    self.state(kind="fork", distance=200)
+    c = cs()
+    c.vEgo = 30
+    self.assertEqual(self.nav.update(c, NS(latActive=True), True, now=2,
+                                     physical_direction=1), "keepLeft")
+    self.assertTrue(self.nav.confirmed)
+    self.assertEqual(self.nav.indicator_request, "none")
+
+    self.state(kind="fork", distance=110)
+    c.leftBlinker = False
+    self.assertEqual(self.nav.update(c, NS(latActive=True), True, now=2.05,
+                                     physical_direction=0), "keepLeft")
+    self.assertEqual(self.nav.indicator_request, "left")
+
+
+class NavigationSignalTests(unittest.TestCase):
+  def setUp(self):
+    self.temp = tempfile.TemporaryDirectory()
+    self.addCleanup(self.temp.cleanup)
+    self.request_path = Path(self.temp.name) / "request"
+    self.status_path = Path(self.temp.name) / "status"
+    self.request = core.Snapshot(self.request_path)
+    self.ctrl = core.NavigationSignalController(self.request_path, self.status_path)
+    self.stalk = core.PhysicalStalk()
+    self.cs = NS(canValid=True, vEgo=25.0, leftBlinker=False,
+                 rightBlinker=False, gearShifter="drive")
+    self.now = 1.0
+    self.counter = 0
+
+  def feed(self, direction=0):
+    self.stalk.feed([(round(self.now * 1e9), [(0x45, raw(direction, self.counter), 0)])])
+    self.counter = (self.counter + 1) % 16
+
+  def publish(self, active=True, direction=1, maneuver_id="m"):
+    self.request.write({"active": active, "direction": direction,
+                        "maneuver_id": maneuver_id}, self.now)
+
+  def tick(self, direction=0, active=True, request_direction=1, existing=()):
+    self.now += .02
+    self.feed(direction)
+    self.publish(active, request_direction)
+    return self.ctrl.update(self.stalk, self.cs, lateral_active=True,
+                            overriding=False, existing=existing, now=self.now)
+
+  def test_navigation_signal_uses_existing_frame_builder(self):
+    sends = self.tick(request_direction=2)
+    self.assertEqual([msg[1][2] & 3 for msg in sends], [2])
+    self.assertTrue(self.ctrl.held_sent)
+
+  def test_physical_stalk_has_priority(self):
+    self.tick(request_direction=2)
+    sends = self.tick(direction=1, request_direction=2)
+    self.assertEqual(sends, [])
+    self.assertEqual(self.ctrl.direction, 0)
+    self.assertFalse(self.ctrl.cleanup)
+
+  def test_navigation_release_uses_bounded_cleanup(self):
+    self.tick(request_direction=1)
+    directions = []
+    for _ in range(8):
+      directions.extend(msg[1][2] & 3 for msg in self.tick(active=False))
+      if not self.ctrl.cleanup:
+        break
+    self.assertEqual(directions, [0, 1, 0])
+
+  def test_existing_stw_sender_wins_slot(self):
+    existing = [(0x45, raw(), 0)]
+    self.assertEqual(self.tick(existing=existing), [])
+
+  def test_navigation_preempts_active_tap_signal(self):
+    tap_request = Path(self.temp.name) / "tap-request"
+    tap_ack = Path(self.temp.name) / "tap-ack"
+    tap = core.TapController(tap_request, tap_ack, session="tap-controller")
+    tap.phase = "active"
+    tap.direction = 1
+    tap.started = self.now
+    tap.model = "tap-model"
+    tap.request_id = 7
+    core.Snapshot(tap_ack).write({"controller": tap.session, "model": tap.model,
+                                 "id": tap.request_id, "status": "starting"}, self.now)
+
+    nav_sends = self.tick(request_direction=2)
+    tap_sends = tap.update(self.stalk, self.cs, enabled=True, lateral_active=True,
+                           overriding=False, existing=nav_sends, now=self.now)
+    self.assertEqual([msg[1][2] & 3 for msg in nav_sends], [2])
+    self.assertEqual(tap_sends, [])
+    self.assertEqual(tap.phase, "cancelled")
 
 
 if __name__ == "__main__":

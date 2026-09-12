@@ -312,6 +312,8 @@ def main(demo=False):
   nav_desire = NavigationDesire()
   previous_nav_owner = True
   manual_rearm = False
+  previous_nav_indicator = False
+  nav_cleanup_guard = 0
 
   while True:
     # Keep receiving frames until we are at least 1 frame ahead of previous extra frame
@@ -353,30 +355,55 @@ def main(demo=False):
     nav_inputs_valid = (sm.all_checks(['carState', 'carControl'])
                         and all(0 <= time.monotonic() - sm.logMonoTime[s] / 1e9 <= .5
                                 for s in ('carState', 'carControl')))
-    tap_claimed_by_nav = nav_desire.claims_tap() if tap_model is not None else True
+    tap_claimed_by_nav = nav_desire.claims_tap(prepare=True) if tap_model is not None else True
     tap_handled = tap_model.update(sm['carState'], sm['carControl'], nav_inputs_valid,
                                    tap_claimed_by_nav, tap_lane_change_prob) if tap_model is not None else False
+    tap_signal_active = tap_model.signal_active if tap_model is not None else False
+    physical_direction = tap_model.physical_direction if tap_model is not None else None
     driver_desire = DH.desire
     desire = driver_desire
     nav_request = nav_desire.update(sm['carState'], sm['carControl'], nav_inputs_valid,
                                     driver_desire_none=(desire == log.Desire.none),
-                                    signal_owned_by_tap=((tap_handled and tap_model.status != 'blocked') or (tap_model is not None
-                                                        and tap_model.enabled and not tap_claimed_by_nav)))
+                                    signal_owned_by_tap=(tap_signal_active and not tap_claimed_by_nav),
+                                    physical_direction=physical_direction)
     nav_owned = nav_desire.owns_blinker
     if previous_nav_owner and not nav_owned:
       manual_rearm = True
     if not sm['carState'].leftBlinker and not sm['carState'].rightBlinker:
       manual_rearm = False
     previous_nav_owner = nav_owned
-    suppress_manual = nav_owned or manual_rearm
-    if tap_handled:
-      desire = getattr(log.Desire, nav_request) if tap_model.status == 'blocked' and tap_claimed_by_nav else DH.desire
+    nav_active = nav_request != 'none'
+    nav_indicator_active = nav_desire.indicator_request != 'none'
+    if previous_nav_indicator and not nav_indicator_active:
+      # Keep reflected cancellation pulses out of DesireHelper for one second.
+      nav_cleanup_guard = 20
+    if physical_direction in (1, 2):
+      nav_cleanup_guard = 0  # A new real stalk action always wins immediately.
+    elif nav_cleanup_guard:
+      nav_cleanup_guard -= 1
+    previous_nav_indicator = nav_indicator_active
+    # Route presence is not active signal ownership. Reserve DesireHelper only
+    # in a nav maneuver window, for an active nav request, or during rearm.
+    suppress_manual = tap_claimed_by_nav or nav_active or manual_rearm or nav_cleanup_guard > 0
+    selection_source = 'none'
+    if nav_active:
+      DH.suspend_for_navigation(sm['carState'])
+      driver_desire = log.Desire.none
+      desire = getattr(log.Desire, nav_request)
+      selection_source = 'navigation'
+    elif tap_handled:
+      desire = DH.desire
+      selection_source = 'tap_lane_change' if desire != log.Desire.none else 'tap_suppression'
     elif suppress_manual:
       DH.suspend_for_navigation(sm['carState'])
       driver_desire = log.Desire.none
-      desire = getattr(log.Desire, nav_request) if nav_owned else log.Desire.none
+      desire = log.Desire.none
+      selection_source = ('manual_rearm' if manual_rearm else 'navigation_signal_cleanup'
+                          if nav_cleanup_guard > 0 else 'navigation_wait')
     elif desire == log.Desire.none:
       desire = getattr(log.Desire, nav_request)
+    else:
+      selection_source = 'driver_desire_helper'
     is_rhd = sm["driverMonitoringState"].isRHD
     frame_id = sm["roadCameraState"].frameId
     v_ego = max(sm["carState"].vEgo, 0.)
@@ -421,11 +448,14 @@ def main(demo=False):
     desire_names = {getattr(log.Desire, name): name for name in
                     ('none', 'turnLeft', 'turnRight', 'laneChangeLeft', 'laneChangeRight', 'keepLeft', 'keepRight')}
     selected_name = desire_names.get(desire, 'unknown')
-    selected_source = ('tap_lane_change' if tap_handled and tap_model.status != 'blocked'
-                       else 'manual_blinker_turn' if driver_desire in (log.Desire.turnLeft, log.Desire.turnRight)
-                       else 'driver_desire_helper' if driver_desire != log.Desire.none
-                       else 'navigation' if nav_owned else 'manual_rearm' if manual_rearm else 'none')
-    nav_desire.record_model_selection(selected_name, selected_source, model_output is not None, meta_main.frame_id)
+    signal_owner = ('driver' if physical_direction in (1, 2)
+                    else 'navigation' if nav_desire.indicator_request != 'none'
+                    else 'tap' if tap_signal_active else 'none')
+    nav_desire.record_model_selection(selected_name, selection_source, model_output is not None,
+                                      meta_main.frame_id, signal_owner=signal_owner,
+                                      tap_enabled=tap_model.enabled if tap_model is not None else False,
+                                      tap_status=tap_model.status if tap_model is not None else 'unavailable',
+                                      tap_signal_active=tap_signal_active)
     nav_desire.publish_diagnostics()
     mt2 = time.perf_counter()
     model_execution_time = mt2 - mt1
