@@ -72,8 +72,19 @@ class NavigationDesire:
     self.indicator_request = 'none'
     self.prepared_navigation = None
 
+  def maneuvers_enabled(self):
+    if not hasattr(self, 'params'):
+      from openpilot.common.params import Params
+      self.params = Params()
+    return self.params.get_bool("NAPNavigationManeuvers")
+
   def claims_tap(self, now=None, prepare=False):
     now = time.monotonic() if now is None else now
+    if not self.maneuvers_enabled():
+      self.owns_blinker = False
+      if prepare:
+        self.prepared_navigation = (None, 'Disabled in NAP settings')
+      return False
     state, reason = read_navigation(self.path, now, self)
     if prepare:
       # modeld asks for ownership immediately before update. Reuse this exact
@@ -105,10 +116,7 @@ class NavigationDesire:
     else:
       state, reason = read_navigation(self.path, now, self)
 
-    if not hasattr(self, 'params'):
-      from openpilot.common.params import Params
-      self.params = Params()
-    if self.params.get_bool("NAPNavigationManeuvers") is False:
+    if not self.maneuvers_enabled():
       state = None
       reason = 'Disabled in NAP settings'
 

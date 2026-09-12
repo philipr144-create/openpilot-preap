@@ -396,6 +396,15 @@ class NavigationTests(unittest.TestCase):
     self.state(active=False, enabled=True)
     self.assertFalse(self.nav.claims_tap(now=2))
 
+  def test_navigation_toggle_off_never_claims_tap(self):
+    self.state(kind="fork", distance=100)
+    self.nav.params = NS(get_bool=lambda _: False)
+    self.assertFalse(self.nav.claims_tap(now=2, prepare=True))
+    self.assertFalse(self.nav.owns_blinker)
+    self.assertEqual(self.nav.update(cs(), NS(latActive=True), True, now=2,
+                                     physical_direction=0), "none")
+    self.assertEqual(self.nav.decision["reason"], "Disabled in NAP settings")
+
   def test_stale_active_route_blocks(self):
     self.state()
     self.assertTrue(self.nav.claims_tap(now=10))
