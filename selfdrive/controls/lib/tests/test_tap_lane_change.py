@@ -415,22 +415,23 @@ class NavigationTests(unittest.TestCase):
     self.assertFalse(self.nav.blocked)
     self.assertFalse(self.nav.confirmed)
 
-  def test_reflected_synthetic_signal_cannot_confirm_turn(self):
+  def test_navigation_authorizes_and_signals_turn_without_physical_stalk(self):
     self.state(kind="turn", distance=10)
     c = cs()
     c.vEgo = 5
-    # carState reports the lamp, but filtered physical stalk is neutral.
+    # The route authorizes the maneuver; the neutral physical stalk leaves
+    # signaling to the synthetic navigation controller.
     self.assertEqual(self.nav.update(c, NS(latActive=True), True, now=2,
-                                     physical_direction=0), "none")
-    self.assertFalse(self.nav.confirmed)
-    self.assertEqual(self.nav.indicator_request, "none")
+                                     physical_direction=0), "turnLeft")
+    self.assertTrue(self.nav.confirmed)
+    self.assertEqual(self.nav.indicator_request, "left")
 
   def test_city_confirmation_latches_but_signals_near_turn(self):
     self.state(kind="turn", distance=70)
     c = cs()
     c.vEgo = 5
     self.assertEqual(self.nav.update(c, NS(latActive=True), True, now=2,
-                                     physical_direction=1), "none")
+                                     physical_direction=0), "none")
     self.assertTrue(self.nav.confirmed)
     self.assertEqual(self.nav.indicator_request, "none")
 
@@ -448,12 +449,56 @@ class NavigationTests(unittest.TestCase):
     c = cs()
     c.vEgo = 30
     self.assertEqual(self.nav.update(c, NS(latActive=True), True, now=2,
-                                     physical_direction=1), "keepLeft")
+                                     physical_direction=0), "keepLeft")
     self.assertTrue(self.nav.confirmed)
     self.assertEqual(self.nav.indicator_request, "none")
 
     self.state(kind="fork", distance=110)
     c.leftBlinker = False
+    self.assertEqual(self.nav.update(c, NS(latActive=True), True, now=2.05,
+                                     physical_direction=0), "keepLeft")
+    self.assertEqual(self.nav.indicator_request, "left")
+
+  def test_steering_before_exit_pauses_without_poisoning_maneuver(self):
+    self.state(kind="fork", distance=200)
+    c = cs()
+    c.vEgo = 20
+    c.steeringPressed = True
+    self.assertEqual(self.nav.update(c, NS(latActive=True), True, now=2,
+                                     physical_direction=0), "none")
+    self.assertFalse(self.nav.blocked)
+
+    c.steeringPressed = False
+    self.assertEqual(self.nav.update(c, NS(latActive=True), True, now=2.05,
+                                     physical_direction=0), "keepLeft")
+    self.assertTrue(self.nav.confirmed)
+
+  def test_exit_control_gate_is_a_pause_not_permanent_cancel(self):
+    self.state(kind="fork", distance=70)
+    c = cs()
+    c.vEgo = 20
+    self.assertEqual(self.nav.update(c, NS(latActive=True), True, now=2,
+                                     physical_direction=0), "keepLeft")
+    self.assertEqual(self.nav.indicator_request, "left")
+
+    self.assertEqual(self.nav.update(c, NS(latActive=False), True, now=2.05,
+                                     physical_direction=0), "none")
+    self.assertFalse(self.nav.blocked)
+    self.assertTrue(self.nav.confirmed)
+
+    self.assertEqual(self.nav.update(c, NS(latActive=True), True, now=2.1,
+                                     physical_direction=0), "keepLeft")
+    self.assertEqual(self.nav.indicator_request, "left")
+
+  def test_opposite_blinker_is_temporary_priority_not_route_cancellation(self):
+    self.state(kind="fork", distance=70)
+    c = cs()
+    c.vEgo = 20
+    self.assertEqual(self.nav.update(c, NS(latActive=True), True, now=2,
+                                     physical_direction=2), "none")
+    self.assertFalse(self.nav.blocked)
+    self.assertEqual(self.nav.indicator_request, "none")
+
     self.assertEqual(self.nav.update(c, NS(latActive=True), True, now=2.05,
                                      physical_direction=0), "keepLeft")
     self.assertEqual(self.nav.indicator_request, "left")

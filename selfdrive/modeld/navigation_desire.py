@@ -10,8 +10,6 @@ DIAGNOSTICS = '/dev/shm/nap_navigation_decision.json'
 SIGNAL_REQUEST = '/dev/shm/nap_navigation_signal_request.json'
 TURN_SPEED_MAX = 25 * 0.44704
 TURN_CONFIRM_DISTANCE = 80.0
-TURN_TIMEOUT = 12.0
-EXIT_TIMEOUT = 12.0
 EXIT_SIGNAL_SECONDS = 4.0
 EXIT_SIGNAL_DISTANCE_MIN = 60.0
 EXIT_SIGNAL_DISTANCE_MAX = 120.0
@@ -100,7 +98,6 @@ class NavigationDesire:
       signal = {0: None, 1: 'left', 2: 'right'}[physical_direction]
     else:
       signal = ('left' if cs.leftBlinker else 'right') if cs.leftBlinker != cs.rightBlinker else None
-    edge = signal is not None and signal != self.previous_signal
     self.previous_signal = signal
     if self.prepared_navigation is not None:
       state, reason = self.prepared_navigation
@@ -133,8 +130,6 @@ class NavigationDesire:
       return desire
 
     if state is None:
-      if self.started is not None:
-        self.blocked = True
       self.confirmed = False
       self.started = None
       return result('none', reason)
@@ -157,16 +152,15 @@ class NavigationDesire:
     if signal_owned_by_tap:
       return result('none', 'Active synthetic tap lane change owns the signal')
     if not inputs_valid:
-      if self.started is not None:
-        self.blocked = True
       self.confirmed = False
       self.started = None
       return result('none', 'Vehicle state is stale or invalid; confirm again')
     if cs.steeringPressed or getattr(cs, 'steeringDisengage', False):
-      # Takeover cancels the current maneuver even before a request starts.
-      self.blocked = True
-      self.confirmed = False
-      return result('none', 'Driver steering override')
+      # Steering takeover pauses navigation output and synthetic signaling. It
+      # must not permanently poison an upcoming maneuver merely because the
+      # driver corrected the car before reaching it.
+      self.started = None
+      return result('none', 'Driver steering override; navigation paused')
     if not driver_desire_none and not self.owns_blinker:
       if self.started is not None:
         self.blocked = True
@@ -181,79 +175,58 @@ class NavigationDesire:
     side = {'left': 'left', 'slight left': 'left', 'right': 'right', 'slight right': 'right'}.get(modifier)
     if side is None:
       return result('none', 'Unsupported direction; no U-turn or sharp-turn automation')
-    if signal is not None and signal != side:
-      self.blocked = True
-      self.confirmed = False
-      return result('none', 'Opposite blinker cancelled this maneuver')
     if kind in ('fork', 'off ramp'):
       if not isinstance(maneuver_id, str) or not maneuver_id:
         return result('none', 'Exit identifier missing')
-      if self.blocked:
-        return result('none', 'This exit was cancelled; no automatic retry')
       if not 10 <= distance <= 300:
-        if self.started is not None:
-          self.blocked = True
         self.confirmed = False
         self.started = None
         return result('none', 'Fork/exit outside 10–300 m window')
-      # A real stalk input authorizes the exit once. Synthetic signaling then
-      # announces that decision without feeding back as authorization.
-      if signal == side:
-        self.confirmed = True
-      if not self.confirmed:
-        return result('none', 'Matching physical blinker required to confirm exit guidance')
+      # The fresh route maneuver authorizes navigation. A physical stalk owns
+      # the signal while held, but cannot poison this maneuver before or after
+      # the action window.
+      self.confirmed = True
+      if signal is not None and signal != side:
+        self.started = None
+        return result('none', 'Opposite physical blinker has temporary priority')
       if cs.brakePressed or not cc.latActive:
-        if self.started is not None:
-          self.blocked = True
-        return result('none', 'Exit guidance inactive; brake or lateral control gate')
+        self.started = None
+        return result('none', 'Exit guidance paused; brake or lateral control gate')
       signal_window = min(EXIT_SIGNAL_DISTANCE_MAX,
                           max(EXIT_SIGNAL_DISTANCE_MIN, speed * EXIT_SIGNAL_SECONDS))
       indicator = 0
-      if distance <= signal_window:
+      if distance <= signal_window and signal is None:
         if self.started is None:
           self.started = now
-        if now-self.started >= EXIT_TIMEOUT:
-          self.blocked = True
-          return result('none', 'Exit request timed out; no automatic retry')
         indicator = 1 if side == 'left' else 2
       return result('keepLeft' if side == 'left' else 'keepRight',
-                    'Driver-confirmed bounded exit preference', indicator)
+                    'Navigation-authorized bounded exit preference', indicator)
     if kind not in ('turn', 'end of road'):
       return result('none', 'Maneuver type is display-only: ' + kind)
     if not isinstance(maneuver_id, str) or not maneuver_id:
       return result('none', 'Intersection identifier missing; reload navigation server')
-    if self.blocked:
-      return result('none', 'This intersection was cancelled by driver takeover')
     if not -8 <= distance <= TURN_CONFIRM_DISTANCE:
       self.confirmed = False
       self.started = None
       return result('none', 'Intersection outside confirmation window (80 m ahead to 8 m past)')
-    if not self.confirmed and edge and signal == side and speed < TURN_SPEED_MAX:
-      self.confirmed = True
+    self.confirmed = True
+    if signal is not None and signal != side:
       self.started = None
-    if not self.confirmed:
-      return result('none', 'Below 25 mph, use the matching physical blinker within 80 m to confirm')
+      return result('none', 'Opposite physical blinker has temporary priority')
     if speed >= TURN_SPEED_MAX:
-      self.confirmed = False
       self.started = None
-      return result('none', 'Intersection guidance requires speed below 25 mph; confirm again')
-    if self.started is not None and now-self.started >= TURN_TIMEOUT:
-      self.confirmed = False
-      self.blocked = True
-      return result('none', 'Intersection request timed out; manual turn required')
+      return result('none', 'Intersection guidance requires speed below 25 mph')
     if cs.brakePressed or not cc.latActive:
-      if self.started is not None:
-        self.confirmed = False
-        self.started = None
-      return result('none', 'Release brake and engage lateral control; a previously started turn needs a new blinker confirmation')
+      self.started = None
+      return result('none', 'Intersection guidance paused; brake or lateral control gate')
     window = min(30.0, max(12.0, speed*2.0))
     if distance > window:
       return result('none', 'Turn confirmed; waiting until close to intersection')
     if self.started is None:
       self.started = now
     return result('turnLeft' if side == 'left' else 'turnRight',
-                  'Driver-confirmed low-speed intersection turn',
-                  1 if side == 'left' else 2)
+                  'Navigation-authorized low-speed intersection turn',
+                  0 if signal is not None else 1 if side == 'left' else 2)
 
   def _publish_signal(self, direction, maneuver_id, desire, reason, now):
     name = None
