@@ -166,8 +166,9 @@ class LongitudinalPlanner:
     if force_slow_decel:
       v_cruise = 0.0
 
-    # Pre-AP follow cap: always enforce follow_limit when lead is present to prevent surging
-    if self.CP.carFingerprint == "TESLA_MODEL_S_PREAP" and sm['radarState'].leadOne.status:
+    # Optional Pre-AP follow cap. The NAPAdaptiveAccel toggle is the master
+    # gate; when disabled, personality and the normal MPC limits apply.
+    if self._is_preap and self.nap_adaptive_accel and sm['radarState'].leadOne.status:
       follow_limit = _get_preap_follow_limit(v_ego)
       if follow_limit is not None:
         accel_clip[1] = min(accel_clip[1], follow_limit)
@@ -221,13 +222,9 @@ class LongitudinalPlanner:
       output_a_target = output_a_target_mpc
       self.output_should_stop = output_should_stop_mpc
 
-    # --- TURN ANTICIPATION BRAKING ---
-    # 11.1 m/s = 25 mph, 4.5 m/s = 10 mph
-    if self.corner_assist.config['blinker_braking'] and (sm['carState'].leftBlinker or sm['carState'].rightBlinker) and 4.5 < v_ego < 11.1:
-      # Optional legacy blinker-only override: -2.5 m/s^2 target.
-      output_a_target = min(output_a_target, -2.5)
-    # ---------------------------------
-    
+    # CornerAssist is the sole gate for NAP turn-related longitudinal
+    # behavior. Do not apply the old blinker-only -2.5 m/s^2 override: it
+    # ignored path geometry and remained active when Corner Assist was off.
     if self._is_preap:
       output_a_target = self.corner_assist.apply(output_a_target, sm, self.CP, reset_state, accel_coast)
 
