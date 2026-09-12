@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import math
-import numpy as np
 from numbers import Number
 
 from cereal import car, log
@@ -47,21 +46,7 @@ LOW_SPEED_TURN_RATE_MAX = 0.060      # Entry steering rate
 LOW_SPEED_TURN_RATE_CATCHUP = 0.090  # Restore model curvature after entry
 LOW_SPEED_TURN_RATE_OUT = 0.060
 
-# PREAP_RELEASE_WIDE_TURN_ON_UNWIND_V1
-# Release custom entrance shaping after the raw model request has moved
-# meaningfully back from its peak. Stock clip_curvature then controls exit.
-LOW_SPEED_TURN_UNWIND_DELTA = 0.003
-LOW_SPEED_TURN_UNWIND_CONFIRM_FRAMES = 8
 LOW_SPEED_TURN_RAMP_SECONDS = 0.70
-
-# PREAP_SPEED_DEPENDENT_TURN_ENTRY_V1
-# Preserve gentle walking-speed turns but acquire curvature sooner in motion.
-LOW_SPEED_TURN_ENTRY_SPEED_BP = [5.0, 10.0, 15.0, 20.0]
-LOW_SPEED_TURN_ENTRY_RATE_START_V = [0.020, 0.035, 0.055, 0.075]
-LOW_SPEED_TURN_ENTRY_RATE_MAX_V = [0.060, 0.070, 0.080, 0.090]
-LOW_SPEED_TURN_ENTRY_RAMP_SECONDS_V = [0.70, 0.55, 0.40, 0.25]
-LOW_SPEED_TURN_ENTRY_MIN_SECONDS_V = [0.35, 0.28, 0.20, 0.12]
-LOW_SPEED_TURN_ENTRY_MAX_SECONDS_V = [0.75, 0.60, 0.45, 0.30]
 
 # Widen only the entrance. Restore full model curvature at the apex so the
 # vehicle can complete its rotation into the destination lane.
@@ -119,8 +104,6 @@ class Controls:
     self.low_speed_turn_smoothing_active = False
     self.low_speed_turn_entry_active = False
     self.low_speed_turn_ramp_time = 0.0
-    self.low_speed_turn_peak_raw_curvature = 0.0
-    self.low_speed_turn_unwind_frames = 0
 
     self.pose_calibrator = PoseCalibrator()
     self.calibrated_pose: Pose | None = None
@@ -200,47 +183,17 @@ class Controls:
     if self.sm.frame % 100 == 0:
       self.wide_low_speed_turns_enabled = self.params.get_bool("NAPWideLowSpeedTurns")
 
-    if not getattr(self, 'wide_low_speed_turns_enabled', True):
-      turn_scale = 1.0
-      self.low_speed_turn_smoothing_active = False
-      self.low_speed_turn_entry_active = False
-      self.low_speed_turn_ramp_time = 0.0
-      self.low_speed_turn_curvature = new_desired_curvature
-    else:
+    wide_turns_enabled = getattr(self, 'wide_low_speed_turns_enabled', True)
+    if wide_turns_enabled:
       turn_scale = low_speed_turn_scale(
         CS.vEgo,
         new_desired_curvature,
         one_blinker,
       )
+    else:
+      turn_scale = 1.0
 
     speed_mph = max(CS.vEgo, 0.0) * CV.MS_TO_MPH
-
-    # PREAP_SPEED_DEPENDENT_TURN_ENTRY_V1
-    turn_entry_rate_start = float(np.interp(
-      speed_mph,
-      LOW_SPEED_TURN_ENTRY_SPEED_BP,
-      LOW_SPEED_TURN_ENTRY_RATE_START_V,
-    ))
-    turn_entry_rate_max = float(np.interp(
-      speed_mph,
-      LOW_SPEED_TURN_ENTRY_SPEED_BP,
-      LOW_SPEED_TURN_ENTRY_RATE_MAX_V,
-    ))
-    turn_entry_ramp_seconds = float(np.interp(
-      speed_mph,
-      LOW_SPEED_TURN_ENTRY_SPEED_BP,
-      LOW_SPEED_TURN_ENTRY_RAMP_SECONDS_V,
-    ))
-    turn_entry_min_seconds = float(np.interp(
-      speed_mph,
-      LOW_SPEED_TURN_ENTRY_SPEED_BP,
-      LOW_SPEED_TURN_ENTRY_MIN_SECONDS_V,
-    ))
-    turn_entry_max_seconds = float(np.interp(
-      speed_mph,
-      LOW_SPEED_TURN_ENTRY_SPEED_BP,
-      LOW_SPEED_TURN_ENTRY_MAX_SECONDS_V,
-    ))
 
     # Never carry low-speed turn smoothing into highway control.
     # Wide-turn behavior below 20 mph remains unchanged.
@@ -250,7 +203,8 @@ class Controls:
       self.low_speed_turn_ramp_time = 0.0
 
     early_turn_request = (
-      CC.latActive
+      wide_turns_enabled
+      and CC.latActive
       and one_blinker
       and speed_mph < LOW_SPEED_TURN_SMOOTH_END_MPH
       and abs(new_desired_curvature)
@@ -264,12 +218,8 @@ class Controls:
       self.low_speed_turn_smoothing_active = True
       self.low_speed_turn_entry_active = True
       self.low_speed_turn_ramp_time = 0.0
-      self.low_speed_turn_peak_raw_curvature = abs(
-        new_desired_curvature
-      )
-      self.low_speed_turn_unwind_frames = 0
 
-    if CC.latActive and self.low_speed_turn_smoothing_active:
+    if wide_turns_enabled and CC.latActive and self.low_speed_turn_smoothing_active:
       # Smooth and widen only the entrance. At the apex, restore the
       # complete model target and permit a controlled catch-up rate.
       if self.low_speed_turn_entry_active:
@@ -277,14 +227,14 @@ class Controls:
 
         entry_shape_complete = (
           self.low_speed_turn_ramp_time
-          >= turn_entry_min_seconds
+          >= LOW_SPEED_TURN_ENTRY_MIN_SECONDS
           and abs(new_desired_curvature)
               >= LOW_SPEED_TURN_ENTRY_RELEASE_CURVATURE
         )
 
         entry_time_complete = (
           self.low_speed_turn_ramp_time
-          >= turn_entry_max_seconds
+          >= LOW_SPEED_TURN_ENTRY_MAX_SECONDS
         )
 
         if (
@@ -300,116 +250,62 @@ class Controls:
         else 1.0
       )
 
-      raw_turn_target = new_desired_curvature
-      turn_target = raw_turn_target * entry_scale
+      turn_target = new_desired_curvature * entry_scale
 
-      self.low_speed_turn_peak_raw_curvature = max(
-        self.low_speed_turn_peak_raw_curvature,
-        abs(raw_turn_target),
+      winding_up = (
+        self.low_speed_turn_curvature * turn_target >= 0.0
+        and abs(turn_target)
+            > abs(self.low_speed_turn_curvature)
       )
 
-      opposite_request = (
-        self.low_speed_turn_curvature != 0.0
-        and raw_turn_target != 0.0
-        and (
-          self.low_speed_turn_curvature
-          * raw_turn_target
-        ) < 0.0
-      )
+      if winding_up:
+        if self.low_speed_turn_entry_active:
+          ramp = min(
+            self.low_speed_turn_ramp_time
+            / LOW_SPEED_TURN_RAMP_SECONDS,
+            1.0,
+          )
 
-      raw_request_unwinding = (
-        self.low_speed_turn_peak_raw_curvature
-            >= LOW_SPEED_TURN_CURVATURE_START
-        and abs(raw_turn_target)
-            <= (
-              self.low_speed_turn_peak_raw_curvature
-              - LOW_SPEED_TURN_UNWIND_DELTA
+          curvature_rate = (
+            LOW_SPEED_TURN_RATE_START
+            + ramp
+            * (
+              LOW_SPEED_TURN_RATE_MAX
+              - LOW_SPEED_TURN_RATE_START
             )
-      )
-
-      if opposite_request:
-        # A sign reversal is an unambiguous request to steer out.
-        self.low_speed_turn_unwind_frames = (
-          LOW_SPEED_TURN_UNWIND_CONFIRM_FRAMES
-        )
-      elif raw_request_unwinding:
-        self.low_speed_turn_unwind_frames += 1
+          )
+        else:
+          curvature_rate = LOW_SPEED_TURN_RATE_CATCHUP
       else:
-        self.low_speed_turn_unwind_frames = 0
+        curvature_rate = LOW_SPEED_TURN_RATE_OUT
 
-      release_to_stock = (
-        self.low_speed_turn_unwind_frames
-        >= LOW_SPEED_TURN_UNWIND_CONFIRM_FRAMES
+      max_turn_delta = curvature_rate * DT_CTRL
+
+      self.low_speed_turn_curvature = max(
+        self.low_speed_turn_curvature - max_turn_delta,
+        min(
+          self.low_speed_turn_curvature + max_turn_delta,
+          turn_target,
+        ),
       )
 
-      if release_to_stock:
-        # Entrance widening is finished. Do not rate-limit the exit with the
-        # custom LOW_SPEED_TURN_RATE_OUT value. The normal clip_curvature()
-        # call below still supplies the standard lateral jerk limitation.
-        self.low_speed_turn_curvature = raw_turn_target
+      new_desired_curvature = (
+        self.low_speed_turn_curvature
+      )
+
+      # Remain active through signal cancellation and the complete unwind.
+      turn_finished = (
+        abs(turn_target)
+        < LOW_SPEED_TURN_EARLY_CURVATURE
+        and abs(
+          self.low_speed_turn_curvature - turn_target
+        ) < 1e-4
+      )
+
+      if turn_finished:
         self.low_speed_turn_smoothing_active = False
         self.low_speed_turn_entry_active = False
         self.low_speed_turn_ramp_time = 0.0
-        self.low_speed_turn_peak_raw_curvature = 0.0
-        self.low_speed_turn_unwind_frames = 0
-        new_desired_curvature = raw_turn_target
-
-      else:
-        winding_up = (
-          self.low_speed_turn_curvature * turn_target >= 0.0
-          and abs(turn_target)
-              > abs(self.low_speed_turn_curvature)
-        )
-
-        if winding_up:
-          if self.low_speed_turn_entry_active:
-            ramp = min(
-              self.low_speed_turn_ramp_time
-              / turn_entry_ramp_seconds,
-              1.0,
-            )
-
-            curvature_rate = (
-              turn_entry_rate_start
-              + ramp
-              * (
-                turn_entry_rate_max
-                - turn_entry_rate_start
-              )
-            )
-          else:
-            curvature_rate = LOW_SPEED_TURN_RATE_CATCHUP
-        else:
-          curvature_rate = LOW_SPEED_TURN_RATE_OUT
-
-        max_turn_delta = curvature_rate * DT_CTRL
-
-        self.low_speed_turn_curvature = max(
-          self.low_speed_turn_curvature - max_turn_delta,
-          min(
-            self.low_speed_turn_curvature + max_turn_delta,
-            turn_target,
-          ),
-        )
-
-        new_desired_curvature = (
-          self.low_speed_turn_curvature
-        )
-
-        turn_finished = (
-          abs(turn_target)
-          < LOW_SPEED_TURN_EARLY_CURVATURE
-          and abs(
-            self.low_speed_turn_curvature - turn_target
-          ) < 1e-4
-        )
-
-        if turn_finished:
-          self.low_speed_turn_smoothing_active = False
-          self.low_speed_turn_entry_active = False
-          self.low_speed_turn_ramp_time = 0.0
-          self.low_speed_turn_peak_raw_curvature = 0.0
-          self.low_speed_turn_unwind_frames = 0
     else:
       self.low_speed_turn_curvature = (
         new_desired_curvature
