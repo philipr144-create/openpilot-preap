@@ -435,6 +435,31 @@ class NavigationTests(unittest.TestCase):
     self.assertTrue(self.nav.confirmed)
     self.assertEqual(self.nav.indicator_request, "left")
 
+  def test_turn_signal_starts_on_approach_before_low_speed_desire(self):
+    self.state(kind="turn", distance=45)
+    c = cs()
+    c.vEgo = 12.0  # Above the 25 mph model-turn limit.
+    self.assertEqual(self.nav.update(c, NS(latActive=True), True, now=2,
+                                     physical_direction=0), "none")
+    self.assertEqual(self.nav.indicator_request, "left")
+
+  def test_turn_never_begins_signaling_at_zero_distance(self):
+    self.state(kind="turn", distance=0)
+    c = cs()
+    c.vEgo = 5
+    self.assertEqual(self.nav.update(c, NS(latActive=True), True, now=2,
+                                     physical_direction=0), "none")
+    self.assertEqual(self.nav.indicator_request, "none")
+
+  def test_steering_override_pauses_turn_desire_not_announcement(self):
+    self.state(kind="turn", distance=25)
+    c = cs()
+    c.vEgo = 5
+    c.steeringPressed = True
+    self.assertEqual(self.nav.update(c, NS(latActive=True), True, now=2,
+                                     physical_direction=0), "none")
+    self.assertEqual(self.nav.indicator_request, "left")
+
   def test_city_confirmation_latches_but_signals_near_turn(self):
     self.state(kind="turn", distance=70)
     c = cs()
@@ -476,11 +501,30 @@ class NavigationTests(unittest.TestCase):
     self.assertEqual(self.nav.update(c, NS(latActive=True), True, now=2,
                                      physical_direction=0), "none")
     self.assertFalse(self.nav.blocked)
+    self.assertEqual(self.nav.indicator_request, "none")
 
     c.steeringPressed = False
     self.assertEqual(self.nav.update(c, NS(latActive=True), True, now=2.05,
                                      physical_direction=0), "keepLeft")
     self.assertTrue(self.nav.confirmed)
+
+  def test_steering_override_does_not_delay_exit_signal(self):
+    self.state(kind="off ramp", distance=80)
+    c = cs()
+    c.vEgo = 20
+    c.steeringPressed = True
+    self.assertEqual(self.nav.update(c, NS(latActive=True), True, now=2,
+                                     physical_direction=0), "none")
+    self.assertEqual(self.nav.indicator_request, "left")
+
+  def test_braking_does_not_delay_exit_signal(self):
+    self.state(kind="off ramp", distance=80)
+    c = cs()
+    c.vEgo = 20
+    c.brakePressed = True
+    self.assertEqual(self.nav.update(c, NS(latActive=True), True, now=2,
+                                     physical_direction=0), "none")
+    self.assertEqual(self.nav.indicator_request, "left")
 
   def test_exit_control_gate_is_a_pause_not_permanent_cancel(self):
     self.state(kind="fork", distance=70)
@@ -553,6 +597,14 @@ class NavigationSignalTests(unittest.TestCase):
     self.assertEqual(sends, [])
     self.assertEqual(self.ctrl.direction, 0)
     self.assertFalse(self.ctrl.cleanup)
+
+  def test_hands_on_steering_does_not_delay_navigation_signal(self):
+    self.now += .02
+    self.feed(0)
+    self.publish(active=True, direction=2)
+    sends = self.ctrl.update(self.stalk, self.cs, lateral_active=True,
+                             overriding=True, now=self.now)
+    self.assertEqual([msg[1][2] & 3 for msg in sends], [2])
 
   def test_navigation_release_uses_bounded_cleanup(self):
     self.tick(request_direction=1)

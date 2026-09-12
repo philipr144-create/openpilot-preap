@@ -13,6 +13,9 @@ TURN_CONFIRM_DISTANCE = 80.0
 EXIT_SIGNAL_SECONDS = 4.0
 EXIT_SIGNAL_DISTANCE_MIN = 60.0
 EXIT_SIGNAL_DISTANCE_MAX = 120.0
+TURN_SIGNAL_SECONDS = 4.0
+TURN_SIGNAL_DISTANCE_MIN = 30.0
+TURN_SIGNAL_DISTANCE_MAX = 60.0
 
 
 def read_navigation(path, now, ownership=None):
@@ -163,12 +166,7 @@ class NavigationDesire:
       self.confirmed = False
       self.started = None
       return result('none', 'Vehicle state is stale or invalid; confirm again')
-    if cs.steeringPressed or getattr(cs, 'steeringDisengage', False):
-      # Steering takeover pauses navigation output and synthetic signaling. It
-      # must not permanently poison an upcoming maneuver merely because the
-      # driver corrected the car before reaching it.
-      self.started = None
-      return result('none', 'Driver steering override; navigation paused')
+    steering_override = cs.steeringPressed or getattr(cs, 'steeringDisengage', False)
     if not driver_desire_none and not self.owns_blinker:
       if self.started is not None:
         self.blocked = True
@@ -197,44 +195,58 @@ class NavigationDesire:
       if signal is not None and signal != side:
         self.started = None
         return result('none', 'Opposite physical blinker has temporary priority')
-      if cs.brakePressed or not cc.latActive:
-        self.started = None
-        return result('none', 'Exit guidance paused; brake or lateral control gate')
       signal_window = min(EXIT_SIGNAL_DISTANCE_MAX,
                           max(EXIT_SIGNAL_DISTANCE_MIN, speed * EXIT_SIGNAL_SECONDS))
-      indicator = 0
-      if distance <= signal_window and signal is None:
+      indicator = 1 if side == 'left' else 2
+      if distance > signal_window or signal is not None or not cc.latActive:
+        indicator = 0
+      else:
         if self.started is None:
           self.started = now
-        indicator = 1 if side == 'left' else 2
+      if steering_override:
+        return result('none', 'Driver steering override; exit signal remains active', indicator)
+      if cs.brakePressed or not cc.latActive:
+        return result('none', 'Exit guidance paused; brake or lateral control gate', indicator)
       return result('keepLeft' if side == 'left' else 'keepRight',
                     'Navigation-authorized bounded exit preference', indicator)
     if kind not in ('turn', 'end of road'):
       return result('none', 'Maneuver type is display-only: ' + kind)
     if not isinstance(maneuver_id, str) or not maneuver_id:
       return result('none', 'Intersection identifier missing; reload navigation server')
-    if not -8 <= distance <= TURN_CONFIRM_DISTANCE:
+    # The phone/server clamps maneuver distance at zero. Never let a request
+    # begin at zero: that is normally a maneuver which has already been
+    # reached but has not yet advanced to the next route step.
+    if not 0 < distance <= TURN_CONFIRM_DISTANCE:
       self.confirmed = False
       self.started = None
-      return result('none', 'Intersection outside confirmation window (80 m ahead to 8 m past)')
+      return result('none', 'Intersection outside active approach window (0–80 m ahead)')
     self.confirmed = True
     if signal is not None and signal != side:
       self.started = None
       return result('none', 'Opposite physical blinker has temporary priority')
-    if speed >= TURN_SPEED_MAX:
-      self.started = None
-      return result('none', 'Intersection guidance requires speed below 25 mph')
-    if cs.brakePressed or not cc.latActive:
-      self.started = None
-      return result('none', 'Intersection guidance paused; brake or lateral control gate')
-    window = min(30.0, max(12.0, speed*2.0))
-    if distance > window:
-      return result('none', 'Turn confirmed; waiting until close to intersection')
-    if self.started is None:
+    signal_window = min(TURN_SIGNAL_DISTANCE_MAX,
+                        max(TURN_SIGNAL_DISTANCE_MIN, speed * TURN_SIGNAL_SECONDS))
+    indicator = 1 if side == 'left' else 2
+    if distance > signal_window or signal is not None or not cc.latActive:
+      indicator = 0
+    elif self.started is None:
       self.started = now
+
+    # Signaling announces the already-authorized route step and therefore
+    # starts on approach. The model turn desire remains conservatively gated
+    # by speed and vehicle control state.
+    if steering_override:
+      return result('none', 'Driver steering override; turn signal remains active', indicator)
+    if speed >= TURN_SPEED_MAX:
+      return result('none', 'Turn signal active; model guidance waits below 25 mph', indicator)
+    if cs.brakePressed or not cc.latActive:
+      return result('none', 'Intersection guidance paused; brake or lateral control gate', indicator)
+    desire_window = min(30.0, max(12.0, speed*2.0))
+    if distance > desire_window:
+      return result('none', 'Turn signal active; waiting until model guidance window', indicator)
     return result('turnLeft' if side == 'left' else 'turnRight',
                   'Navigation-authorized low-speed intersection turn',
-                  0 if signal is not None else 1 if side == 'left' else 2)
+                  indicator)
 
   def _publish_signal(self, direction, maneuver_id, desire, reason, now):
     name = None
