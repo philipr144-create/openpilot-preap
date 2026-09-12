@@ -74,6 +74,8 @@ class NavigationDesire:
     self.decision = {}
     self.indicator_request = 'none'
     self.prepared_navigation = None
+    self.signal_cancelled_key = None
+    self.previous_lat_active = False
 
   def maneuvers_enabled(self):
     if not hasattr(self, 'params'):
@@ -106,6 +108,9 @@ class NavigationDesire:
   def update(self, cs, cc, inputs_valid, driver_desire_none=True, now=None,
              signal_owned_by_tap=False, physical_direction=None):
     now = time.monotonic() if now is None else now
+    lat_active = bool(cc.latActive)
+    lat_disengaged = self.previous_lat_active and not lat_active
+    self.previous_lat_active = lat_active
     if physical_direction in (0, 1, 2):
       # Pre-AP passes the filtered physical STW_ACTN_RQ state. Synthetic frames
       # and their RX reflections can therefore never authorize navigation.
@@ -154,6 +159,7 @@ class NavigationDesire:
       self.confirmed = False
       self.blocked = False
       self.started = None
+      self.signal_cancelled_key = None
     self.decision.update(route_id=state['route_id'], maneuver_id=maneuver_id,
                          maneuver_type=kind, modifier=modifier, distance_m=distance)
     if not self.owns_blinker:
@@ -181,6 +187,8 @@ class NavigationDesire:
     side = {'left': 'left', 'slight left': 'left', 'right': 'right', 'slight right': 'right'}.get(modifier)
     if side is None:
       return result('none', 'Unsupported direction; no U-turn or sharp-turn automation')
+    if lat_disengaged and self.indicator_request != 'none':
+      self.signal_cancelled_key = key
     if kind in ('fork', 'off ramp'):
       if not isinstance(maneuver_id, str) or not maneuver_id:
         return result('none', 'Exit identifier missing')
@@ -193,12 +201,15 @@ class NavigationDesire:
       # the action window.
       self.confirmed = True
       if signal is not None and signal != side:
+        if self.indicator_request != 'none':
+          self.signal_cancelled_key = key
         self.started = None
-        return result('none', 'Opposite physical blinker has temporary priority')
+        return result('none', 'Opposite physical blinker cancelled navigation signal')
       signal_window = min(EXIT_SIGNAL_DISTANCE_MAX,
                           max(EXIT_SIGNAL_DISTANCE_MIN, speed * EXIT_SIGNAL_SECONDS))
       indicator = 1 if side == 'left' else 2
-      if distance > signal_window or signal is not None or not cc.latActive:
+      if (distance > signal_window or signal is not None or not cc.latActive
+          or self.signal_cancelled_key == key):
         indicator = 0
       else:
         if self.started is None:
@@ -222,12 +233,15 @@ class NavigationDesire:
       return result('none', 'Intersection outside active approach window (0–80 m ahead)')
     self.confirmed = True
     if signal is not None and signal != side:
+      if self.indicator_request != 'none':
+        self.signal_cancelled_key = key
       self.started = None
-      return result('none', 'Opposite physical blinker has temporary priority')
+      return result('none', 'Opposite physical blinker cancelled navigation signal')
     signal_window = min(TURN_SIGNAL_DISTANCE_MAX,
                         max(TURN_SIGNAL_DISTANCE_MIN, speed * TURN_SIGNAL_SECONDS))
     indicator = 1 if side == 'left' else 2
-    if distance > signal_window or signal is not None or not cc.latActive:
+    if (distance > signal_window or signal is not None or not cc.latActive
+        or self.signal_cancelled_key == key):
       indicator = 0
     elif self.started is None:
       self.started = now
