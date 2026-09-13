@@ -511,3 +511,29 @@ README.
   rejection conditions but forces temporary-fault and steering-disengage flags false.
   This checkpoint does not resolve that reporting concern or certify vehicle behavior.
 - No road validation of these speed changes was performed during this update.
+
+## September 13 longitudinal correction
+
+Pre-AP's additional rapid integral unwind now requires the requested acceleration
+to oppose the stored correction, as well as the measured acceleration error.
+Ordinary PID integration still responds to error; brief measurement fluctuations
+no longer invoke the rapid reset of otherwise useful cruise correction. No gains,
+pedal calibration, model acceleration limits, or jerk limits were changed.
+
+The motivation was a recorded 60-second cruise interval with a 70.03 mph target
+and 68.73 mph average speed, despite a positive planner acceleration request.
+The prior rapid-unwind condition appeared in 196 high-rate samples during that
+interval. This supports the identified underspeed mechanism but does not establish
+a fix for all pulsing or the separately reported sustained overspeed.
+
+Validation: nine offline comparisons passed, including fast model-command changes
+and braking sequences with equal initial integral state. After installation,
+29 tests and 40 subtests passed across the saved Pre-AP longitudinal, existing
+longitudinal-state, city-turn, and tap-lane-change checks. Strong-braking unwind,
+stopping ramp, disengagement reset, immediate feedforward response, and the
+existing acceleration-command jerk limiter were exercised.
+
+This change can retain a different integral state than the old controller, so
+equal-starting-state braking comparisons do not establish identical on-road
+braking response. No closed-loop vehicle or road validation was performed.
+The prior broader-suite failures and steering-fault reporting concern remain open.

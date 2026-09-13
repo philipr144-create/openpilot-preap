@@ -82,18 +82,17 @@ class LongControl:
     else:  # LongCtrlState.pid
       error = a_target - CS.aEgo
 
-      # PREAP_OUTER_PID_ANTI_WINDUP_V1
-      # The Pre-AP pedal has substantial drivetrain delay. Do not allow an
-      # integral correction learned in one direction to fight a measured
-      # acceleration error in the opposite direction for several seconds.
-      #
-      # Ordinary reversals unwind smoothly. Strong braking requests unwind
-      # faster. The stopping state remains separate and retains its complete
-      # configured braking authority.
+      # PREAP_OUTER_PID_ANTI_WINDUP_V2
+      # Rapidly unwind only when the requested acceleration also opposes
+      # the stored correction. Brief aEgo fluctuations during a steady
+      # request must not repeatedly erase the trim needed to track it.
+      # Normal PID integration still corrects all acceleration errors.
+      # Strong braking retains faster unwind; stopping retains its own ramp.
       if (
           self.CP.carFingerprint == "TESLA_MODEL_S_PREAP"
           and abs(error) >= 0.04
           and self.pid.i * error < 0.0
+          and self.pid.i * a_target < 0.0
       ):
         unwind_rate = 0.60
 
