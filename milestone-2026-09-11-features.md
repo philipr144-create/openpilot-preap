@@ -2,7 +2,7 @@
 
 This document describes the custom NotAutopilot (NAP) build developed and tested on the
 `milestone/2026-09-11` line, including the navigation/signal-arbitration repairs through
-openpilot commit `d5c7845b0` and opendbc commit `75884597`.
+openpilot commit `2ac2d549a` and opendbc commit `97bc86ef`, plus the September 13 speed-limit changes saved with this guide.
 
 > **Development status:** This is experimental driver-assistance software, not autonomous
 > driving. The milestone has primarily been road-tested on one 2013 Tesla Model S P85
@@ -64,10 +64,10 @@ original comma 3 (`tici`).
 
 | User-facing setting | Params key | Default | Status | What it does |
 |---|---|---:|---|---|
-| City Turns | `NAPCityTurns` | On | Experimental | Below lane-change speed, one physical blinker can request `turnLeft` or `turnRight` instead of a highway lane change. Steering takeover cancels the active manual turn until the signal is released. |
+| City Turns | `NAPCityTurns` | On | Experimental | Below 25 mph, one physical blinker can request `turnLeft` or `turnRight` instead of a highway lane change. Steering takeover cancels the active manual turn until the signal is released. |
 | Wider Low-Speed Turns | `NAPWideLowSpeedTurns` | On | Experimental | On a sharp, signaled turn below 25 mph, reduces curvature during the entrance to avoid cutting the curb, then restores full model curvature near the apex so the car can finish the turn. |
 | Low-Speed Steering Assist | `NAPLowSpeedSteeringRate` | On | Experimental | Uses a higher, speed-dependent steering-angle rate during signaled turns below 25 mph while retaining the vehicle model and panda limits. |
-| Tap Lane Change | `NapTapLaneChange` | Off | Experimental | A brief half-stalk tap above 40 mph requests one lane change, holds the Tesla indicator through the maneuver, and cancels it when complete. A held/full stalk retains normal driver behavior. |
+| Tap Lane Change | `NapTapLaneChange` | Off | Experimental | A brief half-stalk tap above 30 mph requests one lane change, holds the Tesla indicator through the maneuver, and cancels it when complete. A held/full stalk retains normal driver behavior. |
 | Navigation Maneuvers | `NAPNavigationManeuvers` | On | Prototype | Allows fresh phone/web navigation instructions to select supported model desires and request synthetic turn signaling. Navigation is fully gated off when this toggle is off. |
 | Corner Assist | `NAPCornerAssist` | On | Experimental | Applies a mild, curvature-based acceleration cap when approaching a supported corner. It does not yet use route distance or guarantee a safe turn speed. |
 | Adaptive Accel Limits | `NAPAdaptiveAccel` | On | Experimental | When a radar lead is present, caps positive acceleration independently of personality to reduce surge/regen oscillation while closing a gap. |
@@ -105,15 +105,16 @@ requested. It cannot create a second lane change or feed back through the tap de
 | Maneuver | Desire window | Synthetic signal window | Other gates |
 |---|---|---|---|
 | `fork` / `off ramp` | 10–300 m | Speed-based, clamped to approximately 60–120 m | Direction must be left/right or slight left/right. |
-| `turn` / `end of road` | 80 m ahead to 8 m past | Approximately 12–30 m, based on speed | Vehicle must be below 25 mph. |
+| `turn` / `end of road` | Positive remaining distance within max(12 m, 2 seconds of travel), capped at 30 m | Speed-based, clamped to approximately 60–80 m | Vehicle must be below 25 mph; approach must be within 80 m. |
 
 Unsupported U-turns, sharp-turn modifiers, missing maneuver IDs, stale navigation, invalid
 vehicle state, or unsupported directions produce no model desire and no synthetic signal.
 
 A real stalk input temporarily takes priority without permanently poisoning the route.
-Steering, braking, or a lateral-control interruption pauses navigation output and synthetic
-signaling; it may resume when the gate clears. The old permanent “driver cancelled; no
-automatic retry” behavior has been removed.
+Steering override and braking pause model turn guidance while an eligible navigation
+indicator may remain active. Lateral-control disengagement or an opposite physical
+blinker can cancel synthetic signaling for the current maneuver. Guidance and signal
+ownership have separate gates; see the live decision reason for the selected behavior.
 
 ### What navigation does not do yet
 
@@ -490,3 +491,23 @@ Do not merge this milestone directly into a general release yet. A reasonable pa
 This work builds on comma.ai openpilot, NotAutopilot, the Tinkla/Boggyver Pre-AP work,
 xnor-tech's Tesla support, and the testers and contributors already listed in the main NAP
 README.
+
+## September 13 speed-limit checkpoint
+
+- Manual city-turn requests now require speed below 25 mph, using a separate
+  `CITY_TURN_SPEED_MAX` constant. With City Turns enabled this branch takes priority
+  below 25 mph. Ordinary lane-change minimum remains 20 mph when city turns do not
+  own the helper; tap lane changes require speed above 30 mph.
+- This permits turn requests at a higher speed; it is not a model-confidence adjustment
+  or a separate preview mode. Steering takeover and blind-spot gates remain in place.
+- All 19 focused city-turn/tap integration tests passed against the installed code.
+  The tests are saved in `selfdrive/controls/tests/test_city_turn_gates.py` and
+  `selfdrive/controls/tests/test_tap_integration.py`; they use synthetic vehicle states
+  and temporary signal files, and do not transmit CAN.
+- The broader pre-existing Tesla Pre-AP and lateral-control test run had 73 passes
+  and 16 failures before these edits: 14 acceleration/PID/feedforward test failures
+  and two car-state tests reporting unclosed settings-file warnings.
+- A separate unresolved review finding is that Pre-AP carstate calculates EPAS
+  rejection conditions but forces temporary-fault and steering-disengage flags false.
+  This checkpoint does not resolve that reporting concern or certify vehicle behavior.
+- No road validation of these speed changes was performed during this update.

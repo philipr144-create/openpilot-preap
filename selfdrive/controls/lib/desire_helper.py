@@ -9,6 +9,7 @@ LaneChangeState = log.LaneChangeState
 LaneChangeDirection = log.LaneChangeDirection
 
 LANE_CHANGE_SPEED_MIN = 20 * CV.MPH_TO_MS
+CITY_TURN_SPEED_MAX = 25 * CV.MPH_TO_MS
 LANE_CHANGE_TIME_MAX = 10.
 
 DESIRES = {
@@ -121,7 +122,7 @@ class DesireHelper:
         self.desire = log.Desire.none
       self.manual_turn_command_active = False
       self.manual_turn_cancelled = False
-    elif 0 <= v_ego < LANE_CHANGE_SPEED_MIN:
+    elif 0 <= v_ego < CITY_TURN_SPEED_MAX:
       # Do not carry an in-progress lane-change state into a low-speed turn.
       self.lane_change_state = LaneChangeState.off
       self.lane_change_direction = LaneChangeDirection.none
