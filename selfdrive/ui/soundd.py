@@ -107,7 +107,11 @@ class Soundd:
         written_frames += frames_to_write
         self.current_sound_frame += frames_to_write
 
-    return ret * self.current_volume
+    volume = self.current_volume
+    if self.current_alert in (AudibleAlert.engage, AudibleAlert.disengage):
+      volume = max(volume, 0.85)
+
+    return ret * volume
 
   def callback(self, data_out: np.ndarray, frames: int, time, status) -> None:
     if status:
