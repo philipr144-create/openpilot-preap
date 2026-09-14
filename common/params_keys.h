@@ -145,6 +145,8 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"NAPAdaptiveAccel", {PERSISTENT, BOOL, "1"}},
     {"NAPCityTurns", {PERSISTENT, BOOL, "1"}},
     {"NAPWideLowSpeedTurns", {PERSISTENT, BOOL, "1"}},
+    {"NAPLaneCentering", {PERSISTENT, BOOL, "0"}},
+    {"NAPLaneCenteringStrength", {PERSISTENT, INT, "1"}},
     {"NAPLowSpeedSteeringRate", {PERSISTENT, BOOL, "1"}},
     {"NAPNavigationManeuvers", {PERSISTENT, BOOL, "1"}},
     {"NAPCornerAssist", {PERSISTENT, BOOL, "1"}},

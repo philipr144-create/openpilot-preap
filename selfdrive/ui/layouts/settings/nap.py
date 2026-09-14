@@ -113,6 +113,25 @@ class NAPLayout(Widget):
         toggle["description"],
       )
 
+    self._add_toggle(
+      NAPParamKeys.LANE_CENTERING,
+      "Lane Centering Assist (Experimental)",
+      "Gently correct toward the detected lane center on clearly marked roads above 20 mph. "
+      "Yields during signaling and driver steering. Off restores normal model steering. "
+      "The green path still shows the original model prediction. Change settings while parked.",
+    )
+    strength = self._params.get(NAPParamKeys.LANE_CENTERING_STRENGTH, return_default=True)
+    self._centering_buttons = multiple_button_item(
+      "Centering Strength",
+      "Start with Low. Higher settings apply more correction, up to a bounded limit. "
+      "Experimental: not road-validated and cannot guarantee lane centering.",
+      buttons=["Low", "Medium", "High"], button_width=180,
+      selected_index=max(0, min(2, int(strength) - 1)),
+      callback=self._on_centering_strength,
+    )
+    self._centering_buttons.action_item.set_enabled(ui_state.is_offroad)
+    self._all_items.append(self._centering_buttons)
+
     # ── Section 2: Longitudinal Control ──
     self._all_items.append(section_header_item("Longitudinal Control"))
 
@@ -338,6 +357,9 @@ class NAPLayout(Widget):
 
   # ── Multiple-button callbacks ──
 
+  def _on_centering_strength(self, index: int):
+    self._params.put(NAPParamKeys.LANE_CENTERING_STRENGTH, index + 1)
+
   def _on_follow_distance(self, index: int):
     self._params.put(NAPParamKeys.FOLLOW_DISTANCE, index + 1)
 
@@ -509,6 +531,10 @@ class NAPLayout(Widget):
     """Sync all toggle states from params (handles external changes)."""
     for key, item in self._toggle_map.items():
       item.action_item.set_state(self._params.get_bool(key))
+
+    self._centering_buttons.action_item.set_selected_button(max(0, min(2,
+      int(self._params.get(NAPParamKeys.LANE_CENTERING_STRENGTH, return_default=True)) - 1)))
+    self._centering_buttons.action_item.set_enabled(ui_state.is_offroad)
 
     # Refresh multiple-button selections
     follow_dist = self._params.get(NAPParamKeys.FOLLOW_DISTANCE, return_default=True)

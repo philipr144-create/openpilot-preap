@@ -12,6 +12,7 @@ from openpilot.common.swaglog import cloudlog
 from opendbc.car.car_helpers import interfaces
 from opendbc.car.vehicle_model import VehicleModel
 from openpilot.selfdrive.controls.lib.drive_helpers import clip_curvature
+from openpilot.selfdrive.controls.lib.lane_centering import LaneCenteringAssist
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
 from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, STEER_ANGLE_SATURATION_THRESHOLD
@@ -100,6 +101,9 @@ class Controls:
     self.steer_limited_by_safety = False
     self.curvature = 0.0
     self.desired_curvature = 0.0
+    self.lane_centering = LaneCenteringAssist()
+    self.lane_centering_enabled = False
+    self.lane_centering_strength = 1
     self.low_speed_turn_curvature = 0.0
     self.low_speed_turn_smoothing_active = False
     self.low_speed_turn_entry_active = False
@@ -182,6 +186,8 @@ class Controls:
 
     if self.sm.frame % 100 == 0:
       self.wide_low_speed_turns_enabled = self.params.get_bool("NAPWideLowSpeedTurns")
+      self.lane_centering_enabled = self.params.get_bool("NAPLaneCentering")
+      self.lane_centering_strength = self.params.get("NAPLaneCenteringStrength", return_default=True)
 
     wide_turns_enabled = getattr(self, 'wide_low_speed_turns_enabled', True)
     if wide_turns_enabled:
@@ -313,6 +319,19 @@ class Controls:
       self.low_speed_turn_smoothing_active = False
       self.low_speed_turn_entry_active = False
       self.low_speed_turn_ramp_time = 0.0
+
+    # Correct the model trajectory before the existing curvature/actuator limits.
+    # The UI continues to display the original model path, not this adjustment.
+    new_desired_curvature += self.lane_centering.update(
+      model_v2, CS.vEgo, new_desired_curvature,
+      enabled=self.lane_centering_enabled and self.CP.carFingerprint == "TESLA_MODEL_S_PREAP",
+      active=CC.latActive,
+      healthy=self.sm.all_checks(['modelV2', 'liveCalibration', 'carState'])
+              and self.sm['liveCalibration'].calStatus == log.LiveCalibrationData.Status.calibrated,
+      overriding=CS.steeringPressed or CS.leftBlinker or CS.rightBlinker
+                 or CC.leftBlinker or CC.rightBlinker or self.low_speed_turn_smoothing_active,
+      strength=self.lane_centering_strength, dt=DT_CTRL,
+    )
 
     self.desired_curvature, curvature_limited = clip_curvature(
       CS.vEgo,
