@@ -132,6 +132,20 @@ class NAPLayout(Widget):
     self._centering_buttons.action_item.set_enabled(ui_state.is_offroad)
     self._all_items.append(self._centering_buttons)
 
+    lane_offset = int(self._params.get("NAPLaneCenterOffset", return_default=True))
+    self._lane_position_buttons = multiple_button_item(
+      "Lane Position",
+      "Shifts the lane-centering target left or right without changing steering strength. "
+      "Center uses the geometric midpoint between the detected lane lines. "
+      "Change settings while parked.",
+      buttons=['Left 12"', 'Left 9"', 'Left 6"', "Center", 'Right 6"', 'Right 9"', 'Right 12"'],
+      button_width=115,
+      selected_index=max(0, min(6, lane_offset + 3)),
+      callback=self._on_lane_position,
+    )
+    self._lane_position_buttons.action_item.set_enabled(ui_state.is_offroad)
+    self._all_items.append(self._lane_position_buttons)
+
     # ── Section 2: Longitudinal Control ──
     self._all_items.append(section_header_item("Longitudinal Control"))
 
@@ -360,6 +374,10 @@ class NAPLayout(Widget):
   def _on_centering_strength(self, index: int):
     self._params.put(NAPParamKeys.LANE_CENTERING_STRENGTH, index + 1)
 
+  def _on_lane_position(self, index: int):
+    # UI indexes 0..6 map to signed settings -3..+3.
+    self._params.put("NAPLaneCenterOffset", index - 3)
+
   def _on_follow_distance(self, index: int):
     self._params.put(NAPParamKeys.FOLLOW_DISTANCE, index + 1)
 
@@ -535,6 +553,12 @@ class NAPLayout(Widget):
     self._centering_buttons.action_item.set_selected_button(max(0, min(2,
       int(self._params.get(NAPParamKeys.LANE_CENTERING_STRENGTH, return_default=True)) - 1)))
     self._centering_buttons.action_item.set_enabled(ui_state.is_offroad)
+
+    lane_offset = int(self._params.get("NAPLaneCenterOffset", return_default=True))
+    self._lane_position_buttons.action_item.set_selected_button(
+      max(0, min(6, lane_offset + 3))
+    )
+    self._lane_position_buttons.action_item.set_enabled(ui_state.is_offroad)
 
     # Refresh multiple-button selections
     follow_dist = self._params.get(NAPParamKeys.FOLLOW_DISTANCE, return_default=True)

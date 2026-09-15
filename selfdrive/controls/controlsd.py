@@ -104,6 +104,7 @@ class Controls:
     self.lane_centering = LaneCenteringAssist()
     self.lane_centering_enabled = False
     self.lane_centering_strength = 1
+    self.lane_centering_offset = 0
     self.low_speed_turn_curvature = 0.0
     self.low_speed_turn_smoothing_active = False
     self.low_speed_turn_entry_active = False
@@ -188,6 +189,7 @@ class Controls:
       self.wide_low_speed_turns_enabled = self.params.get_bool("NAPWideLowSpeedTurns")
       self.lane_centering_enabled = self.params.get_bool("NAPLaneCentering")
       self.lane_centering_strength = self.params.get("NAPLaneCenteringStrength", return_default=True)
+      self.lane_centering_offset = self.params.get("NAPLaneCenterOffset", return_default=True)
 
     wide_turns_enabled = getattr(self, 'wide_low_speed_turns_enabled', True)
     if wide_turns_enabled:
@@ -330,7 +332,9 @@ class Controls:
               and self.sm['liveCalibration'].calStatus == log.LiveCalibrationData.Status.calibrated,
       overriding=CS.steeringPressed or CS.leftBlinker or CS.rightBlinker
                  or CC.leftBlinker or CC.rightBlinker or self.low_speed_turn_smoothing_active,
-      strength=self.lane_centering_strength, dt=DT_CTRL,
+      strength=self.lane_centering_strength,
+      offset_setting=self.lane_centering_offset,
+      dt=DT_CTRL,
     )
 
     self.desired_curvature, curvature_limited = clip_curvature(
