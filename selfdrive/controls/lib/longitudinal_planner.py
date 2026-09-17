@@ -41,6 +41,7 @@ ALLOW_THROTTLE_THRESHOLD = 0.4
 MIN_ALLOW_THROTTLE_SPEED = 2.5
 NAV_SNAPSHOT = '/dev/shm/nap_navigation_desire.json'
 STOP_SETTINGS = '/data/nap_turn_settings.json'
+ROAD_STOP_SNAPSHOT = '/dev/shm/nap_road_stop.json'
 
 
 def mapped_stop_setting_enabled(path=STOP_SETTINGS):
@@ -50,6 +51,43 @@ def mapped_stop_setting_enabled(path=STOP_SETTINGS):
     return len(raw) <= 2048 and json.loads(raw).get('mapped_stop_slowdown') is True
   except (OSError, ValueError, TypeError, AttributeError):
     return False
+
+
+def road_stop_speed_cap(path=ROAD_STOP_SNAPSHOT, settings=STOP_SETTINGS, now=None, v_ego=None):
+  """Experimental road-only hint. Reject stale, ambiguous or inaccurate map matches."""
+  now = time.monotonic() if now is None else now
+  try:
+    with open(settings) as stream:
+      raw_setting = stream.read(2049)
+    if len(raw_setting) > 2048 or json.loads(raw_setting).get('road_stop_slowdown') is not True:
+      return None
+    with open(path) as stream:
+      raw = stream.read(2049)
+    if len(raw) > 2048:
+      return None
+    state = json.loads(raw)
+    received, expires = state['received_mono'], state['expires_mono']
+    if (type(received) not in (int, float) or type(expires) not in (int, float)
+        or not math.isfinite(received+expires) or not received <= now < expires
+        or expires-received > 3):
+      return None
+    quality = state['position_quality']
+    for name, limit in (('match_error_m', 8), ('gps_accuracy_m', 8),
+                        ('gps_age_s', 1.5), ('heading_error_deg', 20)):
+      value = quality[name]
+      if (type(value) not in (int, float) or not math.isfinite(value)
+          or not 0 <= value <= limit or name == 'gps_accuracy_m' and value == 0):
+        return None
+    stop = state['mapped_stop_sign']
+    distance = stop['distance_m']
+    if (not isinstance(stop.get('id'), str) or not stop['id']
+        or type(distance) not in (int, float) or not math.isfinite(distance)
+        or not -8 <= distance <= 200 or type(v_ego) not in (int, float)
+        or not math.isfinite(v_ego) or not 0 <= v_ego <= 25):
+      return None
+    return math.sqrt(4.0**2 + 2*.8*max(0.0, distance-15))
+  except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
+    return None
 
 
 def navigation_speed_cap(path=NAV_SNAPSHOT, now=None, v_ego=None):
@@ -234,6 +272,10 @@ class LongitudinalPlanner:
       nav_cap = navigation_speed_cap(v_ego=v_ego)
       if nav_cap is not None:
         v_cruise = min(v_cruise, nav_cap)
+      if sm['selfdriveState'].experimentalMode:
+        road_cap = road_stop_speed_cap(v_ego=v_ego)
+        if road_cap is not None:
+          v_cruise = min(v_cruise, road_cap)
 
     # Optional Pre-AP follow cap. The NAPAdaptiveAccel toggle is the master
     # gate; when disabled, personality and the normal MPC limits apply.
