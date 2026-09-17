@@ -74,12 +74,11 @@ def get_T_FOLLOW(personality=log.LongitudinalPersonality.standard, nap_follow_di
   # PREAP_PERSONALITY_INDEPENDENT_FOLLOW_V1
   # NAP follow-distance buttons directly select the time gap. Personality
   # continues to control acceleration and jerk, but no longer changes distance.
-  # This preserves the existing Aggressive mapping across all personalities.
+  # Wider spacing makes the seven buttons distinct. At 70 mph, setting 7
+  # targets about 80 m including the standstill gap; distance varies with speed.
+  # Setting 2 retains its previous 0.95 s gap.
   if nap_follow_dist is not None and 1 <= nap_follow_dist <= 7:
-    return round(
-      0.80 + (nap_follow_dist - 1) * 0.15,
-      2,
-    )
+    return (0.70, 0.95, 1.20, 1.50, 1.80, 2.10, 2.40)[nap_follow_dist - 1]
 
   # Preserve normal personality behavior when no NAP distance is supplied.
   if personality == log.LongitudinalPersonality.relaxed:
@@ -92,20 +91,29 @@ def get_T_FOLLOW(personality=log.LongitudinalPersonality.standard, nap_follow_di
 def get_cruise_accel_limits(
     personality=log.LongitudinalPersonality.standard,
     v_ego=0.0):
+
+  # Shared speed breakpoints (m/s) for positive accel: 0, 20, 25, 30, 40, 50, 60, 70 mph
+  v_bp = [0.0, 8.9408, 11.1760, 13.4112, 17.8816, 22.3520, 26.8224, 31.2928]
+
   if personality == log.LongitudinalPersonality.relaxed:
-    # PREAP_RELAXED_HIGH_SPEED_TAPER_V1
-    # Preserve useful city acceleration, then reduce the 30-50 mph punch.
-    relaxed_max_accel = float(np.interp(
-      max(v_ego, 0.0),
-      [0.0, 8.9408, 13.4112, 22.3520, 31.2928],
-      [0.8, 0.8, 0.68, 0.62, 0.58],
-    ))
+    relaxed_max_accel = float(np.interp(max(v_ego, 0.0), v_bp, [0.8, 0.8, 0.62, 0.52, 0.48, 0.48, 0.52, 0.58]))
     return -0.8, relaxed_max_accel
+
   elif personality == log.LongitudinalPersonality.standard:
-    return -1.2, 1.2
+    # Punchier than relaxed, but still tapers at cruise to avoid pedal micro-surges
+    standard_max_accel = float(np.interp(max(v_ego, 0.0), v_bp, [1.2, 1.2, 1.0, 0.85, 0.7, 0.7, 0.85, 1.0]))
+    return -1.2, standard_max_accel
+
   elif personality == log.LongitudinalPersonality.aggressive:
-    return -1.5, 2.0
-  return -1.2, 1.6
+    # Cloned from Standard profile for safe acceleration testing
+    aggressive_max_accel = float(np.interp(max(v_ego, 0.0), v_bp, [1.2, 1.2, 1.0, 0.85, 0.7, 0.7, 0.85, 1.0]))
+
+    # TEST: Negative braking breakpoints for Aggressive profile
+    # Speeds (0, 10, 20, 30 mph). Tapers regen off at low speeds to mimic human stopping.
+    aggressive_min_accel = float(np.interp(max(v_ego, 0.0), [0.0, 4.4704, 8.9408, 13.4112], [-0.4, -0.8, -1.2, -1.5]))
+    return aggressive_min_accel, aggressive_max_accel
+
+  return -1.2, 1.2
 
 
 def get_stopped_equivalence_factor(v_lead):

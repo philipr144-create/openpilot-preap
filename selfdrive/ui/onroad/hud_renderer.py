@@ -1,4 +1,7 @@
 import pyray as rl
+import json
+import os
+import time
 from dataclasses import dataclass
 from openpilot.common.constants import CV
 from openpilot.selfdrive.ui.onroad.exp_button import ExpButton
@@ -84,6 +87,90 @@ class HudRenderer(Widget):
     self._dist_plus_rect = rl.Rectangle(0, 0, 0, 0)
     self._pers_minus_rect = rl.Rectangle(0, 0, 0, 0)
     self._pers_plus_rect = rl.Rectangle(0, 0, 0, 0)
+    self._nav_checked = 0.0
+    self._nav_view = None
+    self._nav_map = ''
+    self._nav_debug_written = 0.0
+
+  def _read_nav_file(self, path, now, stamp, max_age=3.0):
+    try:
+      with open(path) as stream:
+        raw = stream.read(2049)
+      data = json.loads(raw) if len(raw) <= 2048 else None
+      age = now - data[stamp]
+      return data if 0 <= age <= max_age else None
+    except (OSError, ValueError, TypeError, KeyError):
+      return None
+
+  def _update_nav_view(self):
+    now = time.monotonic()
+    if now - self._nav_checked < .25:
+      return
+    self._nav_checked = now
+    nav = self._read_nav_file('/dev/shm/nap_navigation_desire.json', now, 'received_mono')
+    if not nav or not nav.get('route_active'):
+      self._nav_view = ('NAVIGATION', 'No active route', 'Set a destination on the phone')
+      self._nav_map = ''
+      return
+    if nav.get('route_state') != 'active' or now >= nav.get('expires_mono', 0):
+      self._nav_view = ('NAV PAUSED', str(nav.get('pause_reason') or 'Waiting for comma GPS')[:65], '')
+      self._nav_map = ''
+      return
+    maneuver = nav.get('maneuver') or {}
+    distance = maneuver.get('distance_m')
+    if type(distance) not in (int, float):
+      self._nav_view = ('NAV PAUSED', 'Invalid maneuver', 'Waiting for route update')
+      self._nav_map = ''
+      return
+    feet = max(0, distance * 3.28084)
+    away = f'{round(feet / 50) * 50:.0f} ft' if feet < 1000 else f'{feet / 5280:.1f} mi'
+    title = str(maneuver.get('primary_text') or 'Route guidance')[:42]
+    decision = self._read_nav_file('/dev/shm/nap_navigation_decision.json', now, 'received_mono', 2)
+    signal = self._read_nav_file('/dev/shm/nap_navigation_signal_status.json', now, 'time', 1)
+    if nav.get('enabled') is not True:
+      detail = 'CACHED ROUTE  ·  NAV ONLY'
+    elif signal and signal.get('active') and signal.get('sent_recent'):
+      detail = 'CACHED ROUTE  ·  SIGNAL SENT'
+    elif decision and decision.get('synthetic_indicator_request') in ('left', 'right'):
+      reason = signal.get('block_reason', 'signal pending') if signal else 'signal status unavailable'
+      detail = 'SIGNAL WAITING  ·  ' + reason[:37]
+    else:
+      detail = 'CACHED ROUTE  ·  ' + str((decision or {}).get('reason') or 'signal not requested')[:38]
+    stop = nav.get('mapped_stop_sign')
+    if isinstance(stop, dict) and type(stop.get('distance_m')) in (int, float):
+      self._nav_map = f"Mapped stop {max(0, round(stop['distance_m'] * 3.28084 / 50) * 50):.0f} ft ahead"
+    else:
+      lookup = nav.get('map_lookup') or {}
+      state = lookup.get('map_lookup_state')
+      count = lookup.get('map_loaded_ahead', 0)
+      self._nav_map = ('Mapped stops off' if state == 'off' else
+                       'Map lookup unavailable' if state in ('unavailable', 'partial') else
+                       f'{count} mapped stops ahead' if state == 'ready' else 'Mapped stops: waiting for lookup')
+    self._nav_view = (title[:27], away, detail[:52])
+
+  def _draw_nav_view(self, rect):
+    self._update_nav_view()
+    if self._nav_view is None:
+      return
+    title, away, detail = self._nav_view
+    width = min(670, rect.width - 60)
+    box = rl.Rectangle(rect.x + rect.width - width - 30, rect.y + 35, width, 185)
+    rl.draw_rectangle_rounded(box, .16, 8, COLORS.BLACK_TRANSLUCENT)
+    rl.draw_rectangle_rounded_lines_ex(box, .16, 8, 3, COLORS.BORDER_TRANSLUCENT)
+    rl.draw_text_ex(self._font_semi_bold, title, rl.Vector2(box.x + 20, box.y + 12), 35, 0, COLORS.WHITE)
+    rl.draw_text_ex(self._font_bold, away[:35], rl.Vector2(box.x + 20, box.y + 55), 34, 0, COLORS.BTN_ACTIVE)
+    rl.draw_text_ex(self._font_medium, detail[:48], rl.Vector2(box.x + 20, box.y + 103), 22, 0, COLORS.GREY)
+    rl.draw_text_ex(self._font_medium, self._nav_map[:48], rl.Vector2(box.x + 20, box.y + 143), 22, 0, COLORS.GREY)
+    now = time.monotonic()
+    if now-self._nav_debug_written >= 2:
+      self._nav_debug_written = now
+      try:
+        path = '/dev/shm/nap_nav_ui_status.json'
+        with open(path+'.tmp', 'w') as stream:
+          json.dump({'time': now, 'state': title, 'route_visible': title not in ('NAVIGATION', 'NAV PAUSED')}, stream)
+        os.replace(path+'.tmp', path)
+      except OSError:
+        pass
 
   def _safe_write_param(self, key: str, val: int) -> None:
     if _params is None: return
@@ -146,13 +233,17 @@ class HudRenderer(Widget):
 
   def _render(self, rect: rl.Rectangle) -> None:
     self._handle_touch_input()
-    rl.draw_rectangle_gradient_v(int(rect.x), int(rect.y), int(rect.width), UI_CONFIG.header_height, COLORS.HEADER_GRADIENT_START, COLORS.HEADER_GRADIENT_END)
+    footer_y = rect.y + rect.height - UI_CONFIG.header_height
+    rl.draw_rectangle_gradient_v(int(rect.x), int(footer_y), int(rect.width), UI_CONFIG.header_height,
+                                 COLORS.HEADER_GRADIENT_END, COLORS.HEADER_GRADIENT_START)
     if self.is_cruise_available: self._draw_set_speed(rect)
     self._draw_current_speed(rect)
-    button_x = rect.x + rect.width - UI_CONFIG.border_size - UI_CONFIG.button_size
-    button_y = rect.y + UI_CONFIG.border_size
+    # Leave the outer bottom corner free for the driver-monitoring icon.
+    button_x = rect.x + rect.width - UI_CONFIG.border_size - 2 * UI_CONFIG.button_size - 40
+    button_y = rect.y + rect.height - UI_CONFIG.border_size - UI_CONFIG.button_size
     self._exp_button.render(rl.Rectangle(button_x, button_y, UI_CONFIG.button_size, UI_CONFIG.button_size))
     self._draw_onscreen_controls(rect)
+    self._draw_nav_view(rect)
 
   def _handle_touch_input(self) -> None:
     mouse_pos = rl.get_mouse_position()
@@ -213,8 +304,8 @@ class HudRenderer(Widget):
   def user_interacting(self) -> bool: return self._exp_button.is_pressed or (self._btn_pressed is not None)
   def _draw_set_speed(self, rect: rl.Rectangle) -> None:
     set_speed_width = UI_CONFIG.set_speed_width_metric if ui_state.is_metric else UI_CONFIG.set_speed_width_imperial
-    x = rect.x + 60 + (UI_CONFIG.set_speed_width_imperial - set_speed_width) // 2
-    y = rect.y + 45
+    x = rect.x + UI_CONFIG.border_size + UI_CONFIG.button_size + 40
+    y = rect.y + rect.height - UI_CONFIG.border_size - UI_CONFIG.set_speed_height
     set_speed_rect = rl.Rectangle(x, y, set_speed_width, UI_CONFIG.set_speed_height)
     rl.draw_rectangle_rounded(set_speed_rect, 0.35, 10, COLORS.BLACK_TRANSLUCENT)
     rl.draw_rectangle_rounded_lines_ex(set_speed_rect, 0.35, 10, 6, COLORS.BORDER_TRANSLUCENT)
@@ -234,9 +325,11 @@ class HudRenderer(Widget):
   def _draw_current_speed(self, rect: rl.Rectangle) -> None:
     speed_text = str(round(self.speed))
     speed_text_size = measure_text_cached(self._font_bold, speed_text, FONT_SIZES.current_speed)
-    speed_pos = rl.Vector2(rect.x + rect.width / 2 - speed_text_size.x / 2, 180 - speed_text_size.y / 2)
+    speed_y = rect.y + rect.height - 190
+    speed_pos = rl.Vector2(rect.x + rect.width / 2 - speed_text_size.x / 2, speed_y - speed_text_size.y / 2)
     rl.draw_text_ex(self._font_bold, speed_text, speed_pos, FONT_SIZES.current_speed, 0, COLORS.WHITE)
     unit_text = tr("km/h") if ui_state.is_metric else tr("mph")
     unit_text_size = measure_text_cached(self._font_medium, unit_text, FONT_SIZES.speed_unit)
-    unit_pos = rl.Vector2(rect.x + rect.width / 2 - unit_text_size.x / 2, 290 - unit_text_size.y / 2)
+    unit_y = rect.y + rect.height - 80
+    unit_pos = rl.Vector2(rect.x + rect.width / 2 - unit_text_size.x / 2, unit_y - unit_text_size.y / 2)
     rl.draw_text_ex(self._font_medium, unit_text, unit_pos, FONT_SIZES.speed_unit, 0, COLORS.WHITE_TRANSLUCENT)

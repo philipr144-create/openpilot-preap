@@ -355,7 +355,11 @@ def main(demo=False):
     nav_inputs_valid = (sm.all_checks(['carState', 'carControl'])
                         and all(0 <= time.monotonic() - sm.logMonoTime[s] / 1e9 <= .5
                                 for s in ('carState', 'carControl')))
-    tap_claimed_by_nav = nav_desire.claims_tap(prepare=True) if tap_model is not None else True
+    nav_window = nav_desire.claims_tap(prepare=True) if tap_model is not None else True
+    # A tap already accepted by the model keeps ownership through its finish.
+    tap_in_progress = (tap_model is not None and
+                       (tap_model.phase in ('pending', 'active') or tap_model.signal_active))
+    tap_claimed_by_nav = nav_window and not tap_in_progress
     tap_handled = tap_model.update(sm['carState'], sm['carControl'], nav_inputs_valid,
                                    tap_claimed_by_nav, tap_lane_change_prob) if tap_model is not None else False
     tap_signal_active = tap_model.signal_active if tap_model is not None else False
@@ -364,7 +368,7 @@ def main(demo=False):
     desire = driver_desire
     nav_request = nav_desire.update(sm['carState'], sm['carControl'], nav_inputs_valid,
                                     driver_desire_none=(desire == log.Desire.none),
-                                    signal_owned_by_tap=(tap_signal_active and not tap_claimed_by_nav),
+                                    signal_owned_by_tap=tap_signal_active,
                                     physical_direction=physical_direction)
     nav_owned = nav_desire.owns_blinker
     if previous_nav_owner and not nav_owned:

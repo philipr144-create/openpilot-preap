@@ -10,12 +10,23 @@ DIAGNOSTICS = '/dev/shm/nap_navigation_decision.json'
 SIGNAL_REQUEST = '/dev/shm/nap_navigation_signal_request.json'
 TURN_SPEED_MAX = 25 * 0.44704
 TURN_CONFIRM_DISTANCE = 80.0
-EXIT_SIGNAL_SECONDS = 4.0
+EXIT_SIGNAL_SECONDS = 7.0
 EXIT_SIGNAL_DISTANCE_MIN = 60.0
-EXIT_SIGNAL_DISTANCE_MAX = 120.0
+EXIT_SIGNAL_DISTANCE_MAX = 250.0
 TURN_SIGNAL_SECONDS = 5.0
 TURN_SIGNAL_DISTANCE_MIN = 60.0
 TURN_SIGNAL_DISTANCE_MAX = 80.0
+
+
+def reliable_position(state):
+  quality = state.get('position_quality')
+  if not isinstance(quality, dict):
+    return False
+  limits = (('match_error_m', 15.0), ('gps_accuracy_m', 20.0), ('gps_age_s', 1.5))
+  return all(type(quality.get(name)) in (int, float) and
+             math.isfinite(quality[name]) and 0 <= quality[name] <= limit
+             and (name != 'gps_accuracy_m' or quality[name] > 0)
+             for name, limit in limits)
 
 
 def read_navigation(path, now, ownership=None):
@@ -110,6 +121,7 @@ class NavigationDesire:
     now = time.monotonic() if now is None else now
     lat_active = bool(cc.latActive)
     lat_disengaged = self.previous_lat_active and not lat_active
+    steering_override = bool(cs.steeringPressed or getattr(cs, 'steeringDisengage', False))
     self.previous_lat_active = lat_active
     if physical_direction in (0, 1, 2):
       # Pre-AP passes the filtered physical STW_ACTN_RQ state. Synthetic frames
@@ -146,6 +158,11 @@ class NavigationDesire:
       return desire
 
     if state is None:
+      if ((lat_disengaged or steering_override or signal is not None or signal_owned_by_tap)
+          and self.key is not None and
+          (self.confirmed or self.started is not None or self.indicator_request != 'none')):
+        self.blocked = True
+        self.signal_cancelled_key = self.key
       self.confirmed = False
       self.started = None
       return result('none', reason)
@@ -162,6 +179,14 @@ class NavigationDesire:
       self.signal_cancelled_key = None
     self.decision.update(route_id=state['route_id'], maneuver_id=maneuver_id,
                          maneuver_type=kind, modifier=modifier, distance_m=distance)
+    if ((lat_disengaged or steering_override or signal is not None or signal_owned_by_tap or not self.owns_blinker)
+        and (self.confirmed or self.started is not None or self.indicator_request != 'none')):
+      self.blocked = True
+      self.signal_cancelled_key = key
+    if self.blocked:
+      self.confirmed = False
+      self.started = None
+      return result('none', 'Driver takeover cancelled this maneuver; waiting for next route step')
     if not self.owns_blinker:
       self.confirmed = False
       self.started = None
@@ -172,7 +197,6 @@ class NavigationDesire:
       self.confirmed = False
       self.started = None
       return result('none', 'Vehicle state is stale or invalid; confirm again')
-    steering_override = cs.steeringPressed or getattr(cs, 'steeringDisengage', False)
     if not driver_desire_none and not self.owns_blinker:
       if self.started is not None:
         self.blocked = True
@@ -187,8 +211,6 @@ class NavigationDesire:
     side = {'left': 'left', 'slight left': 'left', 'right': 'right', 'slight right': 'right'}.get(modifier)
     if side is None:
       return result('none', 'Unsupported direction; no U-turn or sharp-turn automation')
-    if lat_disengaged and self.indicator_request != 'none':
-      self.signal_cancelled_key = key
     if kind in ('fork', 'off ramp'):
       if not isinstance(maneuver_id, str) or not maneuver_id:
         return result('none', 'Exit identifier missing')
@@ -208,7 +230,8 @@ class NavigationDesire:
       signal_window = min(EXIT_SIGNAL_DISTANCE_MAX,
                           max(EXIT_SIGNAL_DISTANCE_MIN, speed * EXIT_SIGNAL_SECONDS))
       indicator = 1 if side == 'left' else 2
-      if (distance > signal_window or signal is not None or not cc.latActive
+      if (distance < 20 or distance > signal_window or signal is not None or not cc.latActive
+          or not reliable_position(state)
           or self.signal_cancelled_key == key):
         indicator = 0
       else:
@@ -241,6 +264,7 @@ class NavigationDesire:
                         max(TURN_SIGNAL_DISTANCE_MIN, speed * TURN_SIGNAL_SECONDS))
     indicator = 1 if side == 'left' else 2
     if (distance > signal_window or signal is not None or not cc.latActive
+        or not reliable_position(state)
         or self.signal_cancelled_key == key):
       indicator = 0
     elif self.started is None:

@@ -166,7 +166,7 @@ class NAPLayout(Widget):
     follow_dist = self._params.get(NAPParamKeys.FOLLOW_DISTANCE, return_default=True)
     self._follow_buttons = multiple_button_item(
       "Follow Distance",
-      "Follow distance (1=closest, 7=farthest). Overridden by cruise stalk if present.",
+      "Follow gap varies with speed. At 70 mph, 1 targets about 26 m and 7 about 80 m. Overridden by cruise stalk if present.",
       buttons=["1", "2", "3", "4", "5", "6", "7"],
       button_width=80,
       selected_index=max(0, min(6, follow_dist - 1)),

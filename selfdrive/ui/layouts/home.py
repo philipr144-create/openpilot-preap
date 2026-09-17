@@ -1,4 +1,8 @@
 import time
+import json
+import threading
+from pathlib import Path
+from urllib.request import Request, urlopen
 import pyray as rl
 from collections.abc import Callable
 from enum import IntEnum
@@ -19,12 +23,15 @@ CONTENT_MARGIN = 40
 SPACING = 25
 RIGHT_COLUMN_WIDTH = 750
 REFRESH_INTERVAL = 10.0
+PRESETS_PATH = Path('/data/nap_destination_presets.json')
+PAIRING_KEY_PATH = Path('/data/openpilot/server/phone_navigation/.pairing-key')
 
 
 class HomeLayoutState(IntEnum):
   HOME = 0
   UPDATE = 1
   ALERTS = 2
+  ROUTES = 3
 
 
 class HomeLayout(Widget):
@@ -54,6 +61,11 @@ class HomeLayout(Widget):
 
     self.update_notif_rect = rl.Rectangle(0, 0, 200, HEADER_HEIGHT - 10)
     self.alert_notif_rect = rl.Rectangle(0, 0, 220, HEADER_HEIGHT - 10)
+    self.routes_rect = rl.Rectangle(0, 0, 220, HEADER_HEIGHT - 10)
+    self.route_rows = []
+    self.route_presets = []
+    self.route_message = ''
+    self.route_busy = False
 
     self._prime_widget = PrimeWidget()
     self._setup_widget = SetupWidget()
@@ -66,6 +78,36 @@ class HomeLayout(Widget):
     self._exp_mode_button.show_event()
     self.last_refresh = time.monotonic()
     self._refresh()
+    self._load_routes()
+
+  def _load_routes(self):
+    try:
+      data = json.loads(PRESETS_PATH.read_text())
+      self.route_presets = data.get('presets', [])[:6] if isinstance(data, dict) else []
+    except (OSError, ValueError):
+      self.route_presets = []
+
+  def _start_route(self, preset):
+    if self.route_busy:
+      return
+    self.route_busy = True
+    self.route_message = 'Sending destination…'
+
+    def work():
+      try:
+        key = PAIRING_KEY_PATH.read_text().strip()
+        body = json.dumps({'destination': {'label': preset['label'], 'location': preset['location']}}).encode()
+        request = Request('http://127.0.0.1:7070/phone-nav/api/start', data=body,
+                          headers={'Content-Type': 'application/json', 'X-NAP-Phone-Key': key})
+        with urlopen(request, timeout=4) as response:
+          result = json.load(response)
+        self.route_message = 'Destination set. Route will calculate when GPS and internet are ready.' if result.get('active') else 'Route service did not start.'
+      except Exception:
+        self.route_message = 'Could not reach navigation service. Check the comma connection.'
+      finally:
+        self.route_busy = False
+
+    threading.Thread(target=work, name='nap-preset-route', daemon=True).start()
 
   def _setup_callbacks(self):
     self.update_alert.set_dismiss_callback(lambda: self._set_state(HomeLayoutState.HOME))
@@ -103,6 +145,8 @@ class HomeLayout(Widget):
       self._render_update_view()
     elif self.current_state == HomeLayoutState.ALERTS:
       self._render_alerts_view()
+    elif self.current_state == HomeLayoutState.ROUTES:
+      self._render_routes_view()
 
   def _update_state(self):
     self.header_rect = rl.Rectangle(
@@ -130,6 +174,8 @@ class HomeLayout(Widget):
     notif_x = self.header_rect.x + (220 if self.update_available else 0)
     self.alert_notif_rect.x = notif_x
     self.alert_notif_rect.y = self.header_rect.y + (self.header_rect.height - 60) // 2
+    self.routes_rect.x = self.header_rect.x + self.header_rect.width - self.routes_rect.width - 420
+    self.routes_rect.y = self.header_rect.y + (self.header_rect.height - 60) // 2
 
   def _handle_mouse_release(self, mouse_pos: MousePos):
     super()._handle_mouse_release(mouse_pos)
@@ -138,11 +184,21 @@ class HomeLayout(Widget):
       self._set_state(HomeLayoutState.UPDATE)
     elif self.alert_count > 0 and rl.check_collision_point_rec(mouse_pos, self.alert_notif_rect):
       self._set_state(HomeLayoutState.ALERTS)
+    elif rl.check_collision_point_rec(mouse_pos, self.routes_rect):
+      self._load_routes()
+      self._set_state(HomeLayoutState.HOME if self.current_state == HomeLayoutState.ROUTES else HomeLayoutState.ROUTES)
+    elif self.current_state == HomeLayoutState.ROUTES and not self.route_busy:
+      for index, row in enumerate(self.route_rows):
+        if rl.check_collision_point_rec(mouse_pos, row) and index < len(self.route_presets):
+          self._start_route(self.route_presets[index])
+          break
 
   def _render_header(self):
     font = gui_app.font(FontWeight.MEDIUM)
+    rl.draw_rectangle_rounded(self.routes_rect, 0.3, 10, rl.Color(75, 95, 255, 255) if self.current_state == HomeLayoutState.ROUTES else rl.Color(54, 77, 239, 255))
+    gui_label(self.routes_rect, 'ROUTES', 34, rl.WHITE)
 
-    version_text_width = self.header_rect.width
+    version_text_width = 400
 
     # Update notification button
     if self.update_available:
@@ -190,6 +246,21 @@ class HomeLayout(Widget):
   def _render_alerts_view(self):
     self.offroad_alert.render(self.content_rect)
 
+  def _render_routes_view(self):
+    self.route_rows = []
+    title = rl.Rectangle(self.content_rect.x, self.content_rect.y, self.content_rect.width, 74)
+    gui_label(title, 'Saved destinations', 48, rl.WHITE)
+    if not self.route_presets:
+      hint = rl.Rectangle(self.content_rect.x, self.content_rect.y + 110, self.content_rect.width, 100)
+      gui_label(hint, 'No presets yet. Save a destination from the navigation page.', 32, rl.WHITE)
+    for index, preset in enumerate(self.route_presets):
+      row = rl.Rectangle(self.content_rect.x, self.content_rect.y + 110 + index * 105, self.content_rect.width, 88)
+      self.route_rows.append(row)
+      rl.draw_rectangle_rounded(row, 0.12, 10, rl.Color(40, 47, 59, 255))
+      gui_label(row, str(preset.get('name', 'Destination'))[:48], 38, rl.WHITE)
+    note = rl.Rectangle(self.content_rect.x, self.content_rect.y + self.content_rect.height - 88, self.content_rect.width, 80)
+    gui_label(note, self.route_message or 'Tap a destination. New routes need internet; GPS tracks a loaded route locally.', 27, rl.WHITE)
+
   def _render_left_column(self):
     self._prime_widget.render(self.left_column_rect)
 
@@ -215,7 +286,7 @@ class HomeLayout(Widget):
     alerts_present = alert_count > 0
 
     # Show panels on transition from no alert/update to any alerts/update
-    if not update_available and not alerts_present:
+    if not update_available and not alerts_present and self.current_state != HomeLayoutState.ROUTES:
       self._set_state(HomeLayoutState.HOME)
     elif update_available and ((not self._prev_update_available) or (not alerts_present and self.current_state == HomeLayoutState.ALERTS)):
       self._set_state(HomeLayoutState.UPDATE)

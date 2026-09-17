@@ -43,6 +43,21 @@ LOG_TYPES = [
 ]
 
 
+def horizontal_accuracy_from_report(report):
+  """Use the modem's reported error ellipse, never its unset HDOP as meters."""
+  try:
+    major = float(report['q_FltEllipseSemimajorAxis'])
+    minor = float(report['q_FltEllipseSemiminorAxis'])
+    confidence = int(report['u_EllipseConfidence'])
+    reliability = int(report['u_HorizontalReliability'])
+    if (math.isfinite(major + minor) and 0 < minor <= major < 1000
+        and confidence >= 68 and reliability >= 3):
+      return major
+  except (KeyError, TypeError, ValueError, OverflowError):
+    pass
+  return 0.0
+
+
 miscStatusFields = {
   "multipathEstimateIsValid": 0,
   "directionIsValid": 1,
@@ -368,6 +383,8 @@ def main() -> NoReturn:
       gps.latitude = report["t_DblFinalPosLatLon[0]"] * 180/math.pi
       gps.longitude = report["t_DblFinalPosLatLon[1]"] * 180/math.pi
       gps.altitude = report["q_FltFinalPosAlt"]
+      gps.horizontalAccuracy = horizontal_accuracy_from_report(report)
+      gps.satelliteCount = min(127, max(0, int(report['u_NumGpsSvsUsed'])))
       gps.speed = math.sqrt(sum([x**2 for x in vNED]))
       gps.bearingDeg = report["q_FltHeadingRad"] * 180/math.pi
 

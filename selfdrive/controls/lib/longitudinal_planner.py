@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
+import json
 import math
+import time
 import numpy as np
 
 import cereal.messaging as messaging
@@ -37,6 +39,68 @@ def _get_preap_follow_limit(v_ego):
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 ALLOW_THROTTLE_THRESHOLD = 0.4
 MIN_ALLOW_THROTTLE_SPEED = 2.5
+NAV_SNAPSHOT = '/dev/shm/nap_navigation_desire.json'
+STOP_SETTINGS = '/data/nap_turn_settings.json'
+
+
+def mapped_stop_setting_enabled(path=STOP_SETTINGS):
+  try:
+    with open(path) as stream:
+      raw = stream.read(2049)
+    return len(raw) <= 2048 and json.loads(raw).get('mapped_stop_slowdown') is True
+  except (OSError, ValueError, TypeError, AttributeError):
+    return False
+
+
+def navigation_speed_cap(path=NAV_SNAPSHOT, now=None, v_ego=None):
+  """Conservative cruise cap from fresh, well-matched route geometry."""
+  now = time.monotonic() if now is None else now
+  try:
+    with open(path) as stream:
+      raw = stream.read(2049)
+    if len(raw) > 2048:
+      return None
+    state = json.loads(raw)
+    if state.get('enabled') is not True or state.get('route_state') not in ('active', 'arrived'):
+      return None
+    received, expires = state['received_mono'], state['expires_mono']
+    if (type(received) not in (int, float) or type(expires) not in (int, float)
+        or not math.isfinite(received + expires) or not received <= now < expires
+        or expires-received > 3):
+      return None
+    quality = state['position_quality']
+    for name, limit in (('match_error_m', 15), ('gps_accuracy_m', 20), ('gps_age_s', 1.5)):
+      value = quality[name]
+      if (type(value) not in (int, float) or not math.isfinite(value)
+          or not 0 <= value <= limit or name == 'gps_accuracy_m' and value == 0):
+        return None
+    caps = []
+    stop = state.get('mapped_stop_sign')
+    if isinstance(stop, dict) and mapped_stop_setting_enabled():
+      stop_distance = stop.get('distance_m')
+      if (isinstance(stop.get('id'), str) and stop['id'] and
+          type(stop_distance) in (int, float) and math.isfinite(stop_distance) and
+          -8 <= stop_distance <= 250 and
+          type(v_ego) in (int, float) and math.isfinite(v_ego) and 0 <= v_ego <= 25):
+        # Advance hint only: roll toward the mapped point, never command a
+        # stop or set shouldStop from map data alone.
+        caps.append(math.sqrt(4.0**2 + 2 * .8 * max(0.0, stop_distance-15)))
+    maneuver = state['maneuver']
+    kind, distance = maneuver['type'], maneuver['distance_m']
+    if type(distance) not in (int, float) or not math.isfinite(distance) or distance < -8 or distance > 300:
+      return min(caps) if caps else None
+    # Map guidance does not identify stop signs. Only turn, end-of-road and
+    # destination geometry contribute; the model still handles actual stops.
+    target = {'turn': 7.0, 'end of road': 5.0, 'arrive': 3.0}.get(kind)
+    if target is None:
+      return min(caps) if caps else None
+    if kind != 'arrive' and maneuver.get('modifier') not in ('left', 'right', 'slight left', 'slight right'):
+      return min(caps) if caps else None
+    buffer = 20.0 if kind != 'arrive' else 10.0
+    caps.append(math.sqrt(target * target + 2 * 1.0 * max(0.0, distance - buffer)))
+    return min(caps)
+  except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
+    return None
 
 # Lookup table for turns
 _A_TOTAL_MAX_V = [2.0, 2.5]
@@ -165,6 +229,11 @@ class LongitudinalPlanner:
 
     if force_slow_decel:
       v_cruise = 0.0
+
+    if self._is_preap and not reset_state:
+      nav_cap = navigation_speed_cap(v_ego=v_ego)
+      if nav_cap is not None:
+        v_cruise = min(v_cruise, nav_cap)
 
     # Optional Pre-AP follow cap. The NAPAdaptiveAccel toggle is the master
     # gate; when disabled, personality and the normal MPC limits apply.
