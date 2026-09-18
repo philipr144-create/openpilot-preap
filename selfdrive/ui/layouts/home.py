@@ -63,6 +63,7 @@ class HomeLayout(Widget):
     self.alert_notif_rect = rl.Rectangle(0, 0, 220, HEADER_HEIGHT - 10)
     self.routes_rect = rl.Rectangle(0, 0, 220, HEADER_HEIGHT - 10)
     self.route_rows = []
+    self.home_route_rows = []
     self.route_presets = []
     self.route_message = ''
     self.route_busy = False
@@ -187,6 +188,11 @@ class HomeLayout(Widget):
     elif rl.check_collision_point_rec(mouse_pos, self.routes_rect):
       self._load_routes()
       self._set_state(HomeLayoutState.HOME if self.current_state == HomeLayoutState.ROUTES else HomeLayoutState.ROUTES)
+    elif self.current_state == HomeLayoutState.HOME and not self.route_busy:
+      for index, row in enumerate(self.home_route_rows):
+        if rl.check_collision_point_rec(mouse_pos, row) and index < len(self.route_presets):
+          self._start_route(self.route_presets[index])
+          break
     elif self.current_state == HomeLayoutState.ROUTES and not self.route_busy:
       for index, row in enumerate(self.route_rows):
         if rl.check_collision_point_rec(mouse_pos, row) and index < len(self.route_presets):
@@ -262,7 +268,26 @@ class HomeLayout(Widget):
     gui_label(note, self.route_message or 'Tap a destination. New routes need internet; GPS tracks a loaded route locally.', 27, rl.WHITE)
 
   def _render_left_column(self):
-    self._prime_widget.render(self.left_column_rect)
+    rect = self.left_column_rect
+    rl.draw_rectangle_rounded(rect, .035, 12, rl.Color(35, 43, 56, 255))
+    title = rl.Rectangle(rect.x + 44, rect.y + 30, rect.width - 88, 75)
+    gui_label(title, 'Saved destinations', 55, rl.WHITE, font_weight=FontWeight.BOLD)
+    subtitle = rl.Rectangle(rect.x + 44, rect.y + 105, rect.width - 88, 55)
+    gui_label(subtitle, 'Tap a place to start navigation', 32, rl.Color(190, 207, 222, 255))
+    self.home_route_rows = []
+    if not self.route_presets:
+      empty = rl.Rectangle(rect.x + 44, rect.y + 195, rect.width - 88, 100)
+      gui_label(empty, 'No places saved yet. Add them from the navigation page.', 34, rl.WHITE)
+    for index, preset in enumerate(self.route_presets[:4]):
+      row = rl.Rectangle(rect.x + 40, rect.y + 180 + index * 124, rect.width - 80, 108)
+      self.home_route_rows.append(row)
+      rl.draw_rectangle_rounded(row, .1, 10, rl.Color(67, 88, 126, 255))
+      name = rl.Rectangle(row.x + 32, row.y + 6, row.width - 64, 55)
+      label = rl.Rectangle(row.x + 32, row.y + 56, row.width - 64, 42)
+      gui_label(name, str(preset.get('name', 'Destination'))[:35], 42, rl.WHITE, font_weight=FontWeight.BOLD)
+      gui_label(label, str(preset.get('label', ''))[:68], 27, rl.Color(215, 223, 234, 255))
+    note = rl.Rectangle(rect.x + 44, rect.y + rect.height - 108, rect.width - 88, 80)
+    gui_label(note, self.route_message or 'Routes calculate online; a loaded route tracks with comma GPS.', 27, rl.WHITE)
 
   def _render_right_column(self):
     exp_height = 125
@@ -280,6 +305,7 @@ class HomeLayout(Widget):
     self._setup_widget.render(setup_rect)
 
   def _refresh(self):
+    self._load_routes()
     self._version_text = self._get_version_text()
     update_available = self.update_alert.refresh()
     alert_count = self.offroad_alert.refresh()
