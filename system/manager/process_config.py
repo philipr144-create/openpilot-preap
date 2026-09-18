@@ -107,7 +107,7 @@ procs = [
   PythonProcess("uploader", "system.loggerd.uploader", always_run),
   PythonProcess("statsd", "system.statsd", always_run),
   PythonProcess("feedbackd", "selfdrive.ui.feedback.feedbackd", only_onroad),
-  PythonProcess("server_v21", "server.server_v21", always_run),
+  PythonProcess("server_v21", "server.server_v21", always_run, restart_if_crash=True),
   PythonProcess("nap_tailscaled", "server.tailscaled_daemon", always_run),
   # debug procs
   NativeProcess("bridge", "cereal/messaging", ["./bridge"], notcar),
