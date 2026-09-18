@@ -45,15 +45,20 @@ LOG_TYPES = [
 
 
 def horizontal_accuracy_from_report(report):
-  """Use the modem's reported error ellipse, never its unset HDOP as meters."""
+  """Conservatively scale the modem's confidence ellipse to 95% coverage."""
   try:
     major = float(report['q_FltEllipseSemimajorAxis'])
     minor = float(report['q_FltEllipseSemiminorAxis'])
     confidence = int(report['u_EllipseConfidence'])
     reliability = int(report['u_HorizontalReliability'])
     if (math.isfinite(major + minor) and 0 < minor <= major < 1000
-        and confidence >= 68 and reliability >= 3):
-      return major
+        and 35 <= confidence <= 99 and reliability >= 3):
+      # The modem often reports a 39% ellipse (one standard deviation in two
+      # dimensions). Requiring >=68% discarded real fixes. Under the standard
+      # bivariate Gaussian ellipse model, axis^2 scales with -ln(1-p).
+      scale = math.sqrt(math.log(0.05) / math.log1p(-confidence / 100.0))
+      accuracy = major * max(1.0, scale)
+      return accuracy if math.isfinite(accuracy) and accuracy < 1000 else 0.0
   except (KeyError, TypeError, ValueError, OverflowError):
     pass
   return 0.0
