@@ -314,6 +314,7 @@ def main(demo=False):
   manual_rearm = False
   previous_nav_indicator = False
   nav_cleanup_guard = 0
+  last_nav_decision = None
 
   while True:
     # Keep receiving frames until we are at least 1 frame ahead of previous extra frame
@@ -381,6 +382,9 @@ def main(demo=False):
     if previous_nav_indicator and not nav_indicator_active:
       # Keep reflected cancellation pulses out of DesireHelper for one second.
       nav_cleanup_guard = 20
+      # This route turn consumed the blinker gesture.  Never hand its still-on
+      # indicator to the separate manual city-turn path as a second turn.
+      manual_rearm = True
     if physical_direction in (1, 2):
       nav_cleanup_guard = 0  # A new real stalk action always wins immediately.
     elif nav_cleanup_guard:
@@ -408,6 +412,13 @@ def main(demo=False):
       desire = getattr(log.Desire, nav_request)
     else:
       selection_source = 'driver_desire_helper'
+    # Keep a location-free trace of intent arbitration for drive diagnosis.
+    nav_decision = (selection_source, nav_request, nav_desire.decision.get('reason', ''),
+                    nav_indicator_active, nav_inputs_valid)
+    if nav_decision != last_nav_decision:
+      cloudlog.info("NAV intent source=%s request=%s reason=%s signal=%s inputs_valid=%s",
+                    *nav_decision)
+      last_nav_decision = nav_decision
     is_rhd = sm["driverMonitoringState"].isRHD
     frame_id = sm["roadCameraState"].frameId
     v_ego = max(sm["carState"].vEgo, 0.)
