@@ -201,6 +201,12 @@ def find_preset_index(presets: list, value, default: int = 0) -> int:
 
 PREAP_TOGGLES = [
     {
+        "param": "NAPBrakeThrottleResume",
+        "title": "Brake + Throttle Resume",
+        "description": "After braking out of pedal speed control, release the brake and briefly tap then release the accelerator below 7 mph to resume. Brake release alone never resumes.",
+        "type": "bool"
+    },
+    {
         "param": "NAPCityTurns",
         "title": "City Turns",
         "description": "Use the turn signal to help guide city turns below 20 mph.",
