@@ -95,6 +95,7 @@ class CityTurnGates(unittest.TestCase):
       nav.params=N(get_bool=lambda _: True)
       state=dict(enabled=True, route_active=True, received_mono=100., expires_mono=103.,
                  route_state='active', route_id='test', maneuver_id='turn1',
+                 position_quality=dict(match_error_m=2., gps_accuracy_m=3., gps_age_s=.1),
                  maneuver=dict(type='turn', modifier='left', distance_m=10.))
       cc=N(latActive=True)
       def tick():
@@ -111,7 +112,8 @@ class CityTurnGates(unittest.TestCase):
       self.cs.steeringPressed=True
       self.assertEqual(tick(), 'none')
       self.cs.steeringPressed=False
-      self.assertEqual(tick(), 'turnLeft')
+      self.assertEqual(tick(), 'none')
+      self.assertTrue(nav.blocked)
       state['maneuver']['distance_m']=0.
       self.assertEqual(tick(), 'none')
 

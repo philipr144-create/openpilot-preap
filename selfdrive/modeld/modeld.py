@@ -30,7 +30,7 @@ from openpilot.selfdrive.modeld.parse_model_outputs import Parser
 from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_pose_msg, PublishState
 from openpilot.common.file_chunker import read_file_chunked
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
-from openpilot.selfdrive.modeld.navigation_desire import NavigationDesire
+from openpilot.selfdrive.modeld.navigation_desire import NavigationDesire, NavigationTurnLatch
 
 
 PROCESS_NAME = "selfdrive.modeld.modeld"
@@ -315,6 +315,7 @@ def main(demo=False):
   previous_nav_indicator = False
   nav_cleanup_guard = 0
   last_nav_decision = None
+  nav_turn_latch = NavigationTurnLatch()
 
   while True:
     # Keep receiving frames until we are at least 1 frame ahead of previous extra frame
@@ -382,17 +383,17 @@ def main(demo=False):
     if previous_nav_indicator and not nav_indicator_active:
       # Keep reflected cancellation pulses out of DesireHelper for one second.
       nav_cleanup_guard = 20
-      # This route turn consumed the blinker gesture.  Never hand its still-on
-      # indicator to the separate manual city-turn path as a second turn.
-      manual_rearm = True
     if physical_direction in (1, 2):
       nav_cleanup_guard = 0  # A new real stalk action always wins immediately.
     elif nav_cleanup_guard:
       nav_cleanup_guard -= 1
     previous_nav_indicator = nav_indicator_active
+    nav_turn_blocked = nav_turn_latch.update(
+      nav_indicator_active, bool(sm['carState'].leftBlinker or sm['carState'].rightBlinker),
+      time.monotonic())
     # Route presence is not active signal ownership. Reserve DesireHelper only
     # in a nav maneuver window, for an active nav request, or during rearm.
-    suppress_manual = tap_claimed_by_nav or nav_active or manual_rearm or nav_cleanup_guard > 0
+    suppress_manual = tap_claimed_by_nav or nav_active or manual_rearm or nav_turn_blocked or nav_cleanup_guard > 0
     selection_source = 'none'
     if nav_active:
       DH.suspend_for_navigation(sm['carState'])
@@ -406,7 +407,8 @@ def main(demo=False):
       DH.suspend_for_navigation(sm['carState'])
       driver_desire = log.Desire.none
       desire = log.Desire.none
-      selection_source = ('manual_rearm' if manual_rearm else 'navigation_signal_cleanup'
+      selection_source = ('manual_rearm' if manual_rearm else 'navigation_turn_latch'
+                          if nav_turn_blocked else 'navigation_signal_cleanup'
                           if nav_cleanup_guard > 0 else 'navigation_wait')
     elif desire == log.Desire.none:
       desire = getattr(log.Desire, nav_request)

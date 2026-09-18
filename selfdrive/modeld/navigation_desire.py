@@ -18,6 +18,29 @@ TURN_SIGNAL_DISTANCE_MIN = 60.0
 TURN_SIGNAL_DISTANCE_MAX = 80.0
 
 
+class NavigationTurnLatch:
+  """Do not reuse a navigation blinker as a second manual turn request."""
+
+  def __init__(self):
+    self.previous_request = False
+    self.blocked = False
+    self.quiet_since = None
+
+  def update(self, request_active, vehicle_blinker_active, now):
+    if self.previous_request and not request_active:
+      self.blocked = True
+    self.previous_request = request_active
+    if request_active or vehicle_blinker_active:
+      self.quiet_since = None
+    elif self.blocked:
+      if self.quiet_since is None:
+        self.quiet_since = now
+      elif now - self.quiet_since >= .5:
+        self.blocked = False
+        self.quiet_since = None
+    return self.blocked
+
+
 def reliable_position(state):
   quality = state.get('position_quality')
   if not isinstance(quality, dict):

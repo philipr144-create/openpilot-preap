@@ -371,12 +371,22 @@ class NavigationTests(unittest.TestCase):
           "received_mono": 1.0,
           "expires_mono": 3.0,
           "route_state": "active",
+          "position_quality": {"match_error_m": 2.0, "gps_accuracy_m": 3.0, "gps_age_s": 0.1},
           "route_id": "r",
           "maneuver_id": "m",
           "maneuver": {"type": kind, "modifier": "left", "distance_m": distance},
         }
       )
     )
+
+  def test_navigation_blinker_cannot_restart_manual_turn(self):
+    latch = nav.NavigationTurnLatch()
+    self.assertFalse(latch.update(True, True, 1.0))
+    self.assertTrue(latch.update(False, True, 2.0))
+    self.assertTrue(latch.update(False, True, 3.0))
+    self.assertTrue(latch.update(False, False, 3.1))
+    self.assertTrue(latch.update(False, False, 3.4))
+    self.assertFalse(latch.update(False, False, 3.7))
 
   def test_windows(self):
     for kind, distance, claim in [
@@ -479,7 +489,7 @@ class NavigationTests(unittest.TestCase):
     self.assertEqual(signal["direction"], 1)
 
   def test_exit_guidance_starts_early_but_signal_is_just_in_time(self):
-    self.state(kind="fork", distance=200)
+    self.state(kind="fork", distance=230)
     c = cs()
     c.vEgo = 30
     self.assertEqual(self.nav.update(c, NS(latActive=True), True, now=2,
@@ -526,7 +536,7 @@ class NavigationTests(unittest.TestCase):
                                      physical_direction=0), "none")
     self.assertEqual(self.nav.indicator_request, "left")
 
-  def test_exit_control_gate_is_a_pause_not_permanent_cancel(self):
+  def test_exit_control_takeover_cancels_current_maneuver(self):
     self.state(kind="fork", distance=70)
     c = cs()
     c.vEgo = 20
@@ -536,12 +546,11 @@ class NavigationTests(unittest.TestCase):
 
     self.assertEqual(self.nav.update(c, NS(latActive=False), True, now=2.05,
                                      physical_direction=0), "none")
-    self.assertFalse(self.nav.blocked)
-    self.assertTrue(self.nav.confirmed)
+    self.assertTrue(self.nav.blocked)
+    self.assertFalse(self.nav.confirmed)
 
     self.assertEqual(self.nav.update(c, NS(latActive=True), True, now=2.1,
-                                     physical_direction=0), "keepLeft")
-    self.assertEqual(self.nav.indicator_request, "left")
+                                     physical_direction=0), "none")
 
   def test_opposite_blinker_is_temporary_priority_not_route_cancellation(self):
     self.state(kind="fork", distance=70)
