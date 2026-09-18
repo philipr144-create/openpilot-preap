@@ -4,6 +4,7 @@ import sys
 import signal
 import itertools
 import math
+import json
 import time
 import requests
 import shutil
@@ -56,6 +57,39 @@ def horizontal_accuracy_from_report(report):
   except (KeyError, TypeError, ValueError, OverflowError):
     pass
   return 0.0
+
+
+_last_accuracy_diagnostic = -1e9
+
+
+def write_accuracy_diagnostic(report, published_accuracy):
+  """Persist only modem uncertainty fields; never record position or route."""
+  global _last_accuracy_diagnostic
+  now = time.monotonic()
+  if now - _last_accuracy_diagnostic < 30:
+    return
+  _last_accuracy_diagnostic = now
+
+  def finite(name):
+    try:
+      value = float(report[name])
+      return round(value, 3) if math.isfinite(value) else None
+    except (KeyError, TypeError, ValueError, OverflowError):
+      return None
+
+  data = {'time': time.time(), 'published_accuracy_m': published_accuracy,
+          'ellipse_major_m': finite('q_FltEllipseSemimajorAxis'),
+          'ellipse_minor_m': finite('q_FltEllipseSemiminorAxis'),
+          'ellipse_confidence_pct': finite('u_EllipseConfidence'),
+          'horizontal_reliability': finite('u_HorizontalReliability'),
+          'satellites_used': finite('u_NumGpsSvsUsed')}
+  path = '/data/nap_gps_accuracy_diagnostic.json'
+  try:
+    with open(path + '.tmp', 'w') as stream:
+      json.dump(data, stream, allow_nan=False)
+    os.replace(path + '.tmp', path)
+  except (OSError, ValueError, TypeError):
+    pass
 
 
 miscStatusFields = {
@@ -384,6 +418,7 @@ def main() -> NoReturn:
       gps.longitude = report["t_DblFinalPosLatLon[1]"] * 180/math.pi
       gps.altitude = report["q_FltFinalPosAlt"]
       gps.horizontalAccuracy = horizontal_accuracy_from_report(report)
+      write_accuracy_diagnostic(report, gps.horizontalAccuracy)
       gps.satelliteCount = min(127, max(0, int(report['u_NumGpsSvsUsed'])))
       gps.speed = math.sqrt(sum([x**2 for x in vNED]))
       gps.bearingDeg = report["q_FltHeadingRad"] * 180/math.pi

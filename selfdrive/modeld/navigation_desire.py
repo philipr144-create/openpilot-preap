@@ -211,6 +211,10 @@ class NavigationDesire:
     side = {'left': 'left', 'slight left': 'left', 'right': 'right', 'slight right': 'right'}.get(modifier)
     if side is None:
       return result('none', 'Unsupported direction; no U-turn or sharp-turn automation')
+    if not reliable_position(state):
+      self.confirmed = False
+      self.started = None
+      return result('none', 'Navigation position uncertain: GPS accuracy or route match unavailable')
     if kind in ('fork', 'off ramp'):
       if not isinstance(maneuver_id, str) or not maneuver_id:
         return result('none', 'Exit identifier missing')
