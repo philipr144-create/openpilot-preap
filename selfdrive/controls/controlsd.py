@@ -13,6 +13,7 @@ from opendbc.car.car_helpers import interfaces
 from opendbc.car.vehicle_model import VehicleModel
 from openpilot.selfdrive.controls.lib.drive_helpers import clip_curvature
 from openpilot.selfdrive.controls.lib.lane_centering import LaneCenteringAssist
+from openpilot.selfdrive.controls.lib.navigation_turn_commit import NavigationTurnCommit
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
 from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, STEER_ANGLE_SATURATION_THRESHOLD
@@ -102,6 +103,8 @@ class Controls:
     self.curvature = 0.0
     self.desired_curvature = 0.0
     self.lane_centering = LaneCenteringAssist()
+    # NAP_NAVIGATION_TURN_COMMIT_V1
+    self.navigation_turn_commit = NavigationTurnCommit()
     self.lane_centering_enabled = False
     self.lane_centering_strength = 1
     self.lane_centering_offset = 0
@@ -321,6 +324,17 @@ class Controls:
       self.low_speed_turn_smoothing_active = False
       self.low_speed_turn_entry_active = False
       self.low_speed_turn_ramp_time = 0.0
+
+    # NAP_NAVIGATION_TURN_COMMIT_V1
+    # NavigationDesire has already authorized this intersection turn.
+    # If the model remains straight or chooses the opposite direction,
+    # establish a bounded minimum curvature in the route direction.
+    # clip_curvature() and the normal lateral controller remain downstream.
+    new_desired_curvature = self.navigation_turn_commit.update(
+      new_desired_curvature,
+      CS,
+      CC.latActive,
+    )
 
     # Correct the model trajectory before the existing curvature/actuator limits.
     # The UI continues to display the original model path, not this adjustment.

@@ -45,6 +45,11 @@ def reliable_position(state):
   quality = state.get('position_quality')
   if not isinstance(quality, dict):
     return False
+  if state.get('version') == 4 and (quality.get('projection_valid') is not True
+      or quality.get('path_ambiguous') is not False
+      or type(quality.get('heading_error_deg')) not in (int, float)
+      or not 0 <= quality['heading_error_deg'] <= 20):
+    return False
   limits = (('match_error_m', 15.0), ('gps_accuracy_m', 20.0), ('gps_age_s', 1.5))
   return all(type(quality.get(name)) in (int, float) and
              math.isfinite(quality[name]) and 0 <= quality[name] <= limit
@@ -82,6 +87,11 @@ def read_navigation(path, now, ownership=None):
       return None, 'Navigation or GPS is stale'
     if state.get('route_state') != 'active' or not isinstance(state.get('route_id'), str) or not state['route_id']:
       return None, 'No active route instruction'
+    if state.get('version') == 4:
+      quality = state.get('position_quality', {})
+      age = quality.get('gps_age_s')
+      if type(age) not in (int, float) or not 0 <= age + now-received <= 1.5:
+        return None, 'Projected GPS position expired'
     maneuver = state['maneuver']
     distance = maneuver['distance_m']
     if type(distance) not in (int, float) or not math.isfinite(distance):
@@ -202,14 +212,42 @@ class NavigationDesire:
       self.signal_cancelled_key = None
     self.decision.update(route_id=state['route_id'], maneuver_id=maneuver_id,
                          maneuver_type=kind, modifier=modifier, distance_m=distance)
-    if ((lat_disengaged or steering_override or signal is not None or signal_owned_by_tap or not self.owns_blinker)
-        and (self.confirmed or self.started is not None or self.indicator_request != 'none')):
+    # FINAL_NAV_ARBITRATION_V1
+    #
+    # Permanent cancellation is reserved for an actual navigation-control
+    # ownership loss:
+    #   * lateral control disengages during an active maneuver
+    #   * tap lane change takes signal ownership
+    #   * the route no longer owns navigation signaling
+    #
+    # Do NOT permanently cancel merely because the driver touches the wheel.
+    # NavigationTurnCommit handles that as a temporary driver-assist handoff
+    # and smoothly reacquires after release.
+    #
+    # Do NOT cancel merely because a physical blinker exists either. The
+    # maneuver-specific code below distinguishes same-side driver signaling
+    # from an opposite-side cancellation request.
+    hard_takeover = (
+      lat_disengaged
+      or signal_owned_by_tap
+      or not self.owns_blinker
+    )
+
+    if (
+      hard_takeover
+      and (
+        self.confirmed
+        or self.started is not None
+        or self.indicator_request != 'none'
+      )
+    ):
       self.blocked = True
       self.signal_cancelled_key = key
     if self.blocked:
       self.confirmed = False
       self.started = None
       return result('none', 'Driver takeover cancelled this maneuver; waiting for next route step')
+
     if not self.owns_blinker:
       self.confirmed = False
       self.started = None
@@ -304,8 +342,11 @@ class NavigationDesire:
       return result('none', 'Driver steering override; turn signal remains active', indicator)
     if speed >= TURN_SPEED_MAX:
       return result('none', 'Turn signal active; model guidance waits below 25 mph', indicator)
-    if cs.brakePressed or not cc.latActive:
-      return result('none', 'Intersection guidance paused; brake or lateral control gate', indicator)
+    # Longitudinal pedal intervention is independent of navigation lateral
+    # guidance. The driver may control speed through the intersection while
+    # openpilot remains laterally active.
+    if not cc.latActive:
+      return result('none', 'Intersection guidance paused; lateral control inactive', indicator)
     desire_window = min(30.0, max(12.0, speed*2.0))
     if distance > desire_window:
       waiting_reason = ('Turn signal active; waiting until model guidance window' if indicator

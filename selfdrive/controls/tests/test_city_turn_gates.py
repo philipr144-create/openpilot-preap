@@ -109,11 +109,19 @@ class CityTurnGates(unittest.TestCase):
       state['maneuver']['distance_m']=25.
       self.assertEqual(tick(), 'none')
       state['maneuver']['distance_m']=10.
+      # Driver steering temporarily pauses navigation lateral guidance,
+      # but does not poison the still-valid route maneuver.
       self.cs.steeringPressed=True
       self.assertEqual(tick(), 'none')
+      self.assertFalse(nav.blocked)
+      self.assertEqual(nav.indicator_request, 'left')
+
+      # Releasing steering allows the same valid maneuver to resume.
       self.cs.steeringPressed=False
-      self.assertEqual(tick(), 'none')
-      self.assertTrue(nav.blocked)
+      self.assertEqual(tick(), 'turnLeft')
+      self.assertFalse(nav.blocked)
+
+      # A maneuver clamped at zero must never start/restart guidance.
       state['maneuver']['distance_m']=0.
       self.assertEqual(tick(), 'none')
 

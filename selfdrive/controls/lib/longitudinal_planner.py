@@ -18,6 +18,7 @@ from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.corner_assist import CornerAssist
+from openpilot.selfdrive.controls.lib.map_stop import MapStop, read_snapshot
 
 A_CRUISE_MAX_VALS = [1.2, 1.0, 1.0, 0.8]
 A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]
@@ -42,6 +43,7 @@ MIN_ALLOW_THROTTLE_SPEED = 2.5
 NAV_SNAPSHOT = '/dev/shm/nap_navigation_desire.json'
 STOP_SETTINGS = '/data/nap_turn_settings.json'
 ROAD_STOP_SNAPSHOT = '/dev/shm/nap_road_stop.json'
+MAP_CONTEXT_SNAPSHOT = '/dev/shm/nap_map_context.json'
 
 
 def mapped_stop_setting_enabled(path=STOP_SETTINGS):
@@ -90,6 +92,259 @@ def road_stop_speed_cap(path=ROAD_STOP_SNAPSHOT, settings=STOP_SETTINGS, now=Non
     return None
 
 
+
+def map_curve_speed_cap(path=MAP_CONTEXT_SNAPSHOT, now=None, v_ego=None):
+  """Fail-open map-context cruise ceiling.
+
+  Uses the complete mapped curve corridor rather than one curve.
+  Map information can only lower cruise. It never raises cruise,
+  commands steering, or authorizes proceeding through an intersection.
+  """
+  now = time.monotonic() if now is None else now
+
+  try:
+    with open(path) as stream:
+      raw = stream.read(65537)
+
+    if len(raw) > 65536:
+      return None
+
+    state = json.loads(raw)
+
+    if (
+      state.get('version') not in (2, 3)
+      or state.get('enabled') is not True
+      or state.get('valid') is not True
+      or state.get('control_valid') is not True
+      or state.get('status') != 'ok'
+    ):
+      return None
+
+    received = state['mono_time']
+    expires = state['expires_mono']
+
+    if (
+      type(received) not in (int, float)
+      or type(expires) not in (int, float)
+      or not math.isfinite(received + expires)
+      or not received <= now < expires
+      or expires - received > 3.0
+    ):
+      return None
+
+    if (
+      type(v_ego) not in (int, float)
+      or not math.isfinite(v_ego)
+      or v_ego < 0.0
+      or v_ego > 45.0
+    ):
+      return None
+
+    match = state['match']
+
+    match_error = match['distance_m']
+    heading_error = match['heading_error_deg']
+    confidence = match['confidence']
+
+    for value in (
+      match_error,
+      heading_error,
+      confidence,
+    ):
+      if (
+        type(value) not in (int, float)
+        or not math.isfinite(value)
+      ):
+        return None
+
+    if (
+      match_error < 0.0
+      or match_error > 20.0
+      or heading_error < 0.0
+      or heading_error > 35.0
+      or confidence < 0.55
+      or confidence > 1.0
+    ):
+      return None
+
+    lookahead = state['lookahead_m']
+
+    if (
+      type(lookahead) not in (int, float)
+      or not math.isfinite(lookahead)
+      or lookahead < 80.0
+      or lookahead > 550.0
+    ):
+      return None
+
+    # V3 publishes every relevant curve.
+    # Fall back to the V2 single curve during transition.
+    curves = state.get(
+      'control_curves'
+    )
+
+    if not isinstance(curves, list):
+      curve = state.get(
+        'control_curve'
+      )
+
+      curves = (
+        [curve]
+        if isinstance(curve, dict)
+        else []
+      )
+
+    caps = []
+
+    # ------------------------------------------------------------
+    # CURVE CORRIDOR
+    #
+    # Work backwards from every mapped curve target.
+    # The minimum envelope naturally chains consecutive bends and
+    # avoids accelerating between closely spaced curves.
+    # ------------------------------------------------------------
+
+    for curve in curves[:12]:
+      if not isinstance(curve, dict):
+        continue
+
+      start = curve.get(
+        'start_distance_m'
+      )
+
+      end = curve.get(
+        'end_distance_m'
+      )
+
+      length = curve.get(
+        'length_m'
+      )
+
+      target = curve.get(
+        'target_speed_mps'
+      )
+
+      curvature = curve.get(
+        'curvature'
+      )
+
+      values = (
+        start,
+        end,
+        length,
+        target,
+        curvature,
+      )
+
+      if any(
+        type(v) not in (int, float)
+        or not math.isfinite(v)
+        for v in values
+      ):
+        continue
+
+      if (
+        start < 10.0
+        or start > 450.0
+        or end <= start
+        or end > 500.0
+        or length < 20.0
+        or curvature < 0.0018
+        or curvature > 0.12
+        or target < 6.7
+        or target > 31.0
+      ):
+        continue
+
+      # Keep a small entry buffer so the vehicle is already at the
+      # target when meaningful curvature begins.
+      distance = max(
+        0.0,
+        start - 12.0,
+      )
+
+      comfort_decel = 1.2
+
+      cap = math.sqrt(
+        target * target
+        + 2.0
+        * comfort_decel
+        * distance
+      )
+
+      caps.append(cap)
+
+    # ------------------------------------------------------------
+    # SUPERVISED CITY PREPARATION
+    #
+    # A mapped stop sign may prepare speed only when the user's
+    # existing mapped-stop setting is enabled.
+    #
+    # It deliberately does NOT command a complete stop and does
+    # NOT set shouldStop. Live perception / driver supervision
+    # remains responsible for the actual intersection.
+    # ------------------------------------------------------------
+
+    if mapped_stop_setting_enabled():
+      events = state.get(
+        'events',
+        [],
+      )
+
+      if isinstance(events, list):
+        for event in events[:16]:
+          if not isinstance(event, dict):
+            continue
+
+          if event.get('type') != 'stop_sign':
+            continue
+
+          distance = event.get(
+            'distance_m'
+          )
+
+          if (
+            type(distance) not in (int, float)
+            or not math.isfinite(distance)
+            or distance < 0.0
+            or distance > 220.0
+          ):
+            continue
+
+          approach_target = 4.0
+
+          cap = math.sqrt(
+            approach_target ** 2
+            + 2.0
+            * 0.8
+            * max(
+              0.0,
+              distance - 15.0,
+            )
+          )
+
+          caps.append(cap)
+
+    if not caps:
+      return None
+
+    # IMPORTANT:
+    # Do NOT compare this to current v_ego here.
+    #
+    # The map ceiling must constrain the future cruise target even
+    # if the vehicle is presently slower and accelerating toward it.
+    return min(caps)
+
+  except (
+    OSError,
+    ValueError,
+    TypeError,
+    KeyError,
+    AttributeError,
+    RecursionError,
+  ):
+    return None
+
 def navigation_speed_cap(path=NAV_SNAPSHOT, now=None, v_ego=None):
   """Conservative cruise cap from fresh, well-matched route geometry."""
   now = time.monotonic() if now is None else now
@@ -107,6 +362,12 @@ def navigation_speed_cap(path=NAV_SNAPSHOT, now=None, v_ego=None):
         or expires-received > 3):
       return None
     quality = state['position_quality']
+    if state.get('version') == 4 and (quality.get('projection_valid') is not True
+        or quality.get('path_ambiguous') is not False
+        or type(quality.get('heading_error_deg')) not in (int, float)
+        or not 0 <= quality['heading_error_deg'] <= 20
+        or quality.get('gps_age_s', 99) + now-received > 1.5):
+      return None
     for name, limit in (('match_error_m', 15), ('gps_accuracy_m', 20), ('gps_age_s', 1.5)):
       value = quality[name]
       if (type(value) not in (int, float) or not math.isfinite(value)
@@ -172,12 +433,15 @@ class LongitudinalPlanner:
     self.dt = dt
     self.allow_throttle = True
     self.corner_assist = CornerAssist()
+    self.map_stop = MapStop()
 
     self._is_preap = (CP.brand == "tesla" and CP.carFingerprint == "TESLA_MODEL_S_PREAP"
                        and CP.openpilotLongitudinalControl and not CP.pcmCruise)
     self._params = Params()
     self.nap_follow_dist = self._params.get("NAPFollowDistance", return_default=True) if self._is_preap else None
     self.nap_adaptive_accel = self._params.get_bool("NAPAdaptiveAccel") if self._is_preap else False
+    self.nap_navigation_maneuvers = self._params.get_bool("NAPNavigationManeuvers") if self._is_preap else False
+    self.nap_map_driving_assist = self._params.get_bool("NAPMapDrivingAssist") if self._is_preap else False
     self._frame = 0
 
     self.a_desired = init_a
@@ -217,6 +481,8 @@ class LongitudinalPlanner:
     if self._is_preap and self._frame % 20 == 0:
       self.nap_follow_dist = self._params.get("NAPFollowDistance", return_default=True)
       self.nap_adaptive_accel = self._params.get_bool("NAPAdaptiveAccel")
+      self.nap_navigation_maneuvers = self._params.get_bool("NAPNavigationManeuvers")
+      self.nap_map_driving_assist = self._params.get_bool("NAPMapDrivingAssist")
 
     if len(sm['carControl'].orientationNED) == 3:
       accel_coast = get_coast_accel(sm['carControl'].orientationNED[1])
@@ -268,14 +534,42 @@ class LongitudinalPlanner:
     if force_slow_decel:
       v_cruise = 0.0
 
+    map_cap, map_should_stop = None, False
+    if self._is_preap:
+      map_cap, map_should_stop = self.map_stop.update(
+        read_snapshot(NAV_SNAPSHOT), read_snapshot("/dev/shm/nap_brake_resume.json"),
+        enabled=self.nap_map_driving_assist, active=not reset_state,
+        inputs_valid=sm.all_checks(service_list=["carState", "controlsState", "selfdriveState"]),
+        v_ego=v_ego, gas=sm["carState"].gasPressed, now=time.monotonic())
+      if map_cap is not None:
+        v_cruise = min(v_cruise, map_cap)
+      personality = sm["selfdriveState"].personality
+      personality_raw = getattr(personality, "raw", personality)
+      if personality_raw == 2 and v_ego < 8.9408:
+        accel_clip[1] = min(accel_clip[1], float(np.interp(v_ego, [0., 4.4704, 8.9408], [.6, .6, .8])))
+
     if self._is_preap and not reset_state:
-      nav_cap = navigation_speed_cap(v_ego=v_ego)
-      if nav_cap is not None:
-        v_cruise = min(v_cruise, nav_cap)
-      if sm['selfdriveState'].experimentalMode:
-        road_cap = road_stop_speed_cap(v_ego=v_ego)
-        if road_cap is not None:
-          v_cruise = min(v_cruise, road_cap)
+      # Route navigation and generic map assistance are intentionally separate.
+      #
+      # Navigation Maneuvers:
+      #   Uses the active route snapshot for maneuver-aware speed preparation.
+      #
+      # Map Driving Assist:
+      #   Uses independent mapped-road context even when no route is active.
+      #
+      # Both are speed CEILINGS only. Neither path may raise the driver's
+      # cruise target or override a more restrictive planner/radar/model limit.
+      if self.nap_navigation_maneuvers:
+        nav_cap = navigation_speed_cap(v_ego=v_ego)
+        if nav_cap is not None:
+          v_cruise = min(v_cruise, nav_cap)
+
+      if self.nap_map_driving_assist:
+        # Curves retain their existing ceiling. Direction-matched route stops
+        # use the separate driver-brake / acknowledged-resume lifecycle.
+        map_cap = map_curve_speed_cap(v_ego=v_ego)
+        if map_cap is not None:
+          v_cruise = min(v_cruise, map_cap)
 
     # Optional Pre-AP follow cap. The NAPAdaptiveAccel toggle is the master
     # gate; when disabled, personality and the normal MPC limits apply.
@@ -332,6 +626,9 @@ class LongitudinalPlanner:
     else:
       output_a_target = output_a_target_mpc
       self.output_should_stop = output_should_stop_mpc
+
+    # Release removes only map authority; model/MPC stop requests remain intact.
+    self.output_should_stop = self.output_should_stop or map_should_stop
 
     # CornerAssist is the sole gate for NAP turn-related longitudinal
     # behavior. Do not apply the old blinker-only -2.5 m/s^2 override: it

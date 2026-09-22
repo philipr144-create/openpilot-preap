@@ -237,6 +237,12 @@ PREAP_TOGGLES = [
         "type": "bool"
     },
     {
+        "param": "NAPMapDrivingAssist",
+        "title": "Map Driving Assist",
+        "description": "Use fresh map context to reduce cruise speed for mapped road features even when route navigation is not active. Map data may only lower the speed target; vision, radar, and the driver remain authoritative.",
+        "type": "bool"
+    },
+    {
         "param": "NAPCornerAssist",
         "title": "Corner Assist",
         "description": "Adjust supported controls when approaching detected corners.",
