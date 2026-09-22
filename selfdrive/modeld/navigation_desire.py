@@ -115,6 +115,7 @@ class NavigationDesire:
     self.blocked = False
     self.started = None
     self.last_write = -1e9
+    self.manual_diagnostics_active = False
     self.decision = {}
     self.indicator_request = 'none'
     self.prepared_navigation = None
@@ -200,9 +201,26 @@ class NavigationDesire:
       self.started = None
       return result('none', reason)
     maneuver = state['maneuver']
-    kind, modifier, distance = maneuver['type'], maneuver['modifier'], maneuver['distance_m']
+    kind, modifier, raw_distance = maneuver['type'], maneuver['modifier'], maneuver['distance_m']
     maneuver_id = state.get('maneuver_id', '')
     current_maneuver_id = maneuver_id if isinstance(maneuver_id, str) else ''
+
+    # --- ODOMETRY COUNTDOWN INJECTION ---
+    # Sync with new maneuver ID or a fresh 1Hz GPS update from the JSON
+    if getattr(self, '_last_raw_dist', None) != raw_distance or getattr(self, '_last_maneuver_id', None) != maneuver_id:
+      self._last_raw_dist = raw_distance
+      self._last_maneuver_id = maneuver_id
+      self._smooth_dist = raw_distance
+      self._last_time = now
+    else:
+      # Mathematically deduct traveled distance using wheel speed and delta time
+      dt = now - getattr(self, '_last_time', now)
+      self._last_time = now
+      self._smooth_dist -= max(cs.vEgo, 0.0) * dt
+
+    # Overwrite the frozen JSON distance with our millisecond-accurate countdown
+    distance = self._smooth_dist
+    # ------------------------------------
     key = (state['route_id'], maneuver_id)
     if key != self.key:
       self.key = key
@@ -378,19 +396,29 @@ class NavigationDesire:
 
   def record_model_selection(self, selected, source, evaluated, frame_id, *,
                              signal_owner='none', tap_enabled=False,
-                             tap_status='unavailable', tap_signal_active=False):
+                             tap_status='unavailable', tap_signal_active=False,
+                             manual_turn_direction=0, city_turns_enabled=False):
     # Captured after model.run, before DesireHelper updates for the next frame.
     self.decision.update(selected_desire=selected, final_desire=selected if evaluated else None,
                          source=source, model_evaluated=bool(evaluated), frame_id=int(frame_id),
                          signal_owner=signal_owner, blinker_owner=signal_owner,
                          tap_enabled=bool(tap_enabled),
-                         tap_status=tap_status, tap_signal_active=bool(tap_signal_active))
+                         tap_status=tap_status, tap_signal_active=bool(tap_signal_active),
+                         manual_turn_direction=manual_turn_direction,
+                         city_turns_enabled=bool(city_turns_enabled))
 
   def publish_diagnostics(self, now=None):
     now = time.monotonic() if now is None else now
-    if now-self.last_write < .5:
+    # Manual commitment needs fresh model ownership and an immediate revocation.
+    # Keep the existing navigation-only diagnostic cadence unchanged.
+    manual = (self.decision.get('source') == 'driver_desire_helper'
+              and self.decision.get('city_turns_enabled') is True
+              and self.decision.get('manual_turn_direction') in (1, 2))
+    interval = .05 if manual or self.manual_diagnostics_active else .5
+    if now-self.last_write < interval:
       return
     self.last_write = now
+    self.manual_diagnostics_active = manual
     name = None
     try:
       with tempfile.NamedTemporaryFile(mode='w', dir=os.path.dirname(self.diagnostics_path),
