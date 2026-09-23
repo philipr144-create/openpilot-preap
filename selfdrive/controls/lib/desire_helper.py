@@ -94,9 +94,9 @@ class DesireHelper:
         self.desire = log.Desire.turnRight
     elif v_ego < 11.1:
       if carstate.leftBlinker:
-        self.desire = log.Desire.keepLeft
+        self.desire = log.Desire.laneChangeLeft
       elif carstate.rightBlinker:
-        self.desire = log.Desire.keepRight
+        self.desire = log.Desire.laneChangeRight
     # -------------------------------------
     return {LaneChangeState.preLaneChange: 'waiting', LaneChangeState.laneChangeStarting: 'starting',
             LaneChangeState.laneChangeFinishing: 'finishing'}[self.lane_change_state]
@@ -159,10 +159,10 @@ class DesireHelper:
           and not self.manual_turn_cancelled
       ):
         if carstate.leftBlinker and not carstate.leftBlindspot:
-          self.desire = log.Desire.turnLeft if carstate.vEgo < 6.7 else log.Desire.keepLeft
+          self.desire = log.Desire.turnLeft if carstate.vEgo < 6.7 else log.Desire.laneChangeLeft
           self.manual_turn_command_active = True
         elif carstate.rightBlinker and not carstate.rightBlindspot:
-          self.desire = log.Desire.turnRight if carstate.vEgo < 6.7 else log.Desire.keepRight
+          self.desire = log.Desire.turnRight if carstate.vEgo < 6.7 else log.Desire.laneChangeRight
           self.manual_turn_command_active = True
       return
 
@@ -233,9 +233,9 @@ class DesireHelper:
         self.desire = log.Desire.turnRight
     elif v_ego < 11.1:
       if carstate.leftBlinker:
-        self.desire = log.Desire.keepLeft
+        self.desire = log.Desire.laneChangeLeft
       elif carstate.rightBlinker:
-        self.desire = log.Desire.keepRight
+        self.desire = log.Desire.laneChangeRight
     # -------------------------------------
 
     # Send keep pulse once per second during LaneChangeStart.preLaneChange
@@ -245,5 +245,5 @@ class DesireHelper:
       self.keep_pulse_timer += DT_MDL
       if self.keep_pulse_timer > 1.0:
         self.keep_pulse_timer = 0.0
-      elif self.desire in (log.Desire.keepLeft, log.Desire.keepRight):
+      elif self.desire in (log.Desire.laneChangeLeft, log.Desire.laneChangeRight):
         self.desire = log.Desire.none
