@@ -159,10 +159,10 @@ class DesireHelper:
           and not self.manual_turn_cancelled
       ):
         if carstate.leftBlinker and not carstate.leftBlindspot:
-          self.desire = log.Desire.turnLeft
+          self.desire = log.Desire.turnLeft if carstate.vEgo < 6.7 else log.Desire.keepLeft
           self.manual_turn_command_active = True
         elif carstate.rightBlinker and not carstate.rightBlindspot:
-          self.desire = log.Desire.turnRight
+          self.desire = log.Desire.turnRight if carstate.vEgo < 6.7 else log.Desire.keepRight
           self.manual_turn_command_active = True
       return
 
