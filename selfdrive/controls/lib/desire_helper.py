@@ -157,6 +157,7 @@ class DesireHelper:
           and one_blinker
           and not carstate.steeringPressed
           and not self.manual_turn_cancelled
+          and carstate.vEgo < 11.1
       ):
         if carstate.leftBlinker and not carstate.leftBlindspot:
           self.desire = log.Desire.turnLeft if carstate.vEgo < 6.7 else log.Desire.laneChangeLeft
