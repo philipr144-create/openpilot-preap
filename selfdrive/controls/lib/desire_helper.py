@@ -85,6 +85,19 @@ class DesireHelper:
         return 'complete'
     self.lane_change_timer += DT_MDL
     self.desire = DESIRES[self.lane_change_direction][self.lane_change_state]
+    
+    # --- TWO-STAGE TURN / POCKET LOGIC ---
+    if v_ego < 6.7:
+      if carstate.leftBlinker:
+        self.desire = log.Desire.turnLeft
+      elif carstate.rightBlinker:
+        self.desire = log.Desire.turnRight
+    elif v_ego < 11.1:
+      if carstate.leftBlinker:
+        self.desire = log.Desire.keepLeft
+      elif carstate.rightBlinker:
+        self.desire = log.Desire.keepRight
+    # -------------------------------------
     return {LaneChangeState.preLaneChange: 'waiting', LaneChangeState.laneChangeStarting: 'starting',
             LaneChangeState.laneChangeFinishing: 'finishing'}[self.lane_change_state]
 
@@ -101,7 +114,7 @@ class DesireHelper:
     if self.manual_turn_poll % 100 == 0:
       raw_param = self.params.get("NAPCityTurns")
       if raw_param is not None:
-        self.manual_turns_enabled = (raw_param == b"1")
+        self.manual_turns_enabled = (raw_param is True)
       else:
         self.manual_turns_enabled = False
         try:
@@ -211,6 +224,19 @@ class DesireHelper:
     self.prev_one_blinker = one_blinker
 
     self.desire = DESIRES[self.lane_change_direction][self.lane_change_state]
+    
+    # --- TWO-STAGE TURN / POCKET LOGIC ---
+    if v_ego < 6.7:
+      if carstate.leftBlinker:
+        self.desire = log.Desire.turnLeft
+      elif carstate.rightBlinker:
+        self.desire = log.Desire.turnRight
+    elif v_ego < 11.1:
+      if carstate.leftBlinker:
+        self.desire = log.Desire.keepLeft
+      elif carstate.rightBlinker:
+        self.desire = log.Desire.keepRight
+    # -------------------------------------
 
     # Send keep pulse once per second during LaneChangeStart.preLaneChange
     if self.lane_change_state in (LaneChangeState.off, LaneChangeState.laneChangeStarting):
