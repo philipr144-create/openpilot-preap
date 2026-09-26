@@ -352,7 +352,7 @@ class LongitudinalMpc:
   def update(
       self, radarstate, v_cruise,
       personality=log.LongitudinalPersonality.standard,
-      nap_follow_dist=None, max_accel=ACCEL_MAX):
+      nap_follow_dist=None, max_accel=ACCEL_MAX, preap_accel_profile=False):
     t_follow = get_T_FOLLOW(personality, nap_follow_dist)
     max_accel = float(np.clip(max_accel, 0.0, ACCEL_MAX))
     v_ego = self.x0[1]
@@ -370,6 +370,10 @@ class LongitudinalMpc:
     cruise_min_accel, cruise_max_accel = (
       get_cruise_accel_limits(personality, v_ego)
     )
+    if preap_accel_profile:
+      # Planner and final pedal control use the same car-specific envelope.
+      from opendbc.car.tesla.preap.accel_policy import accel_ceiling
+      cruise_max_accel = accel_ceiling(v_ego, personality)
     cruise_max_accel = min(
       cruise_max_accel,
       max_accel,

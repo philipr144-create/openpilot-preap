@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import requests
 import cereal.messaging as messaging
 from openpilot.common.params import Params
+from openpilot.selfdrive.controls.lib.curve_comfort import read_curve_comfort
 
 
 SNAPSHOT = "/dev/shm/nap_map_context.json"
@@ -36,9 +37,6 @@ CURVE_START_K = 0.0025
 CURVE_KEEP_K = 0.0018
 MIN_CURVE_LENGTH_M = 20.0
 MERGE_GAP_M = 15.0
-
-# First active version is intentionally conservative.
-LAT_ACCEL_TARGET = 1.8
 
 PUBLISH_HZ = 2.0
 
@@ -907,7 +905,8 @@ def merge_curves(curves):
   return segments
 
 
-def curve_events(samples):
+def curve_events(samples, comfort=None):
+  comfort = read_curve_comfort() if comfort is None else comfort
   raw = curvature_samples(samples)
   merged = merge_curves(raw)
 
@@ -940,7 +939,7 @@ def curve_events(samples):
       continue
 
     target = math.sqrt(
-      LAT_ACCEL_TARGET / k
+      comfort.map_lateral_accel / k
     )
 
     apex_sample = max(
@@ -969,6 +968,7 @@ def curve_events(samples):
         target * 2.236936, 1
       ),
       "sample_count": len(seg["samples"]),
+      "comfort_profile": comfort.name,
     })
 
   return events

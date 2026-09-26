@@ -199,11 +199,10 @@ class Projection(unittest.TestCase):
       data['position_quality']['heading_error_deg']=84.1
       self.assertFalse(reliable_position(data))
 
-  def test_relaxed_high_speed_envelope_unchanged(self):
-    old=[.3,.6,.9,.8,.74,.68,.66,.64,.62,.61,.6,.58,.55]
-    new=ACCEL_PREAP_PROFILES[2]
-    self.assertLess(new[0],old[0]);self.assertLess(new[1],old[1])
-    self.assertEqual(new[2:],old[2:])
+  def test_relaxed_envelope_remains_below_standard(self):
+    for relaxed,standard in zip(ACCEL_PREAP_PROFILES[2],ACCEL_PREAP_PROFILES[1]):
+      self.assertLess(relaxed,standard)
+      self.assertLessEqual(relaxed,.45)
 
 
 class PlannerIntegration(unittest.TestCase):
@@ -250,6 +249,15 @@ class PlannerIntegration(unittest.TestCase):
       self.assertTrue(p.output_should_stop)
       self.assertLessEqual(p.output_a_target,-1.)
 
+  def test_mapped_stop_approach_target_is_five_mph(self):
+    from openpilot.selfdrive.controls.lib import longitudinal_planner as lp
+    with tempfile.TemporaryDirectory() as directory:
+      path = Path(directory) / 'nav'
+      path.write_text(json.dumps(nav(10., 15.)))
+      with patch.object(lp, 'mapped_stop_setting_enabled', return_value=True):
+        cap = lp.navigation_speed_cap(path, now=10.1, v_ego=10.)
+    self.assertAlmostEqual(cap, 5.0 * 0.44704)
+
   def test_actual_planner_adds_stop_only_with_map_gate(self):
     fsm=MapStop();fsm.update(nav(9.9),status(9.9),enabled=True,active=True,
                             inputs_valid=True,v_ego=5.,gas=False,now=9.9)
@@ -258,11 +266,11 @@ class PlannerIntegration(unittest.TestCase):
     p,cap,_=self.run_planner(map_enabled=False,distance=7.,speed=2.)
     self.assertFalse(p.output_should_stop)
 
-  def test_low_speed_softening_does_not_change_high_speed_limit(self):
-    _,_,low=self.run_planner(speed=3.)
-    _,_,high=self.run_planner(speed=20.)
-    self.assertAlmostEqual(low,.6)
-    self.assertAlmostEqual(high,1.)
+  def test_planner_uses_shared_profile_at_low_and_high_speed(self):
+    from opendbc.car.tesla.preap.accel_policy import accel_ceiling
+    for speed in (0.,3.,20.,30.):
+      _,_,cap=self.run_planner(speed=speed)
+      self.assertAlmostEqual(cap,accel_ceiling(speed,2))
 
 
 class TrackerIntegration(unittest.TestCase):

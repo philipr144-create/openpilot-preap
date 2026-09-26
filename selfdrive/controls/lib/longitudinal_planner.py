@@ -6,6 +6,7 @@ import numpy as np
 
 import cereal.messaging as messaging
 from opendbc.car.interfaces import ACCEL_MIN, ACCEL_MAX
+from opendbc.car.tesla.preap.accel_policy import accel_ceiling, limit_positive_accel
 from openpilot.common.constants import CV
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
@@ -40,6 +41,7 @@ def _get_preap_follow_limit(v_ego):
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 ALLOW_THROTTLE_THRESHOLD = 0.4
 MIN_ALLOW_THROTTLE_SPEED = 2.5
+MAPPED_STOP_APPROACH_SPEED = 5.0 * CV.MPH_TO_MS
 NAV_SNAPSHOT = '/dev/shm/nap_navigation_desire.json'
 STOP_SETTINGS = '/data/nap_turn_settings.json'
 ROAD_STOP_SNAPSHOT = '/dev/shm/nap_road_stop.json'
@@ -87,7 +89,7 @@ def road_stop_speed_cap(path=ROAD_STOP_SNAPSHOT, settings=STOP_SETTINGS, now=Non
         or not -8 <= distance <= 200 or type(v_ego) not in (int, float)
         or not math.isfinite(v_ego) or not 0 <= v_ego <= 25):
       return None
-    return math.sqrt(4.0**2 + 2*.8*max(0.0, distance-15))
+    return math.sqrt(MAPPED_STOP_APPROACH_SPEED**2 + 2*.8*max(0.0, distance-15))
   except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
     return None
 
@@ -256,11 +258,12 @@ def map_curve_speed_cap(path=MAP_CONTEXT_SNAPSHOT, now=None, v_ego=None):
       ):
         continue
 
-      # Keep a small entry buffer so the vehicle is already at the
-      # target when meaningful curvature begins.
+      # Keep only a modest entry buffer. The previous 12 m buffer
+      # completed the slowdown too early and made Map Driving Assist
+      # feel unnecessarily slow before ordinary road curves.
       distance = max(
         0.0,
-        start - 12.0,
+        start - 6.0,
       )
 
       comfort_decel = 1.2
@@ -311,7 +314,7 @@ def map_curve_speed_cap(path=MAP_CONTEXT_SNAPSHOT, now=None, v_ego=None):
           ):
             continue
 
-          approach_target = 4.0
+          approach_target = MAPPED_STOP_APPROACH_SPEED
 
           cap = math.sqrt(
             approach_target ** 2
@@ -383,7 +386,7 @@ def navigation_speed_cap(path=NAV_SNAPSHOT, now=None, v_ego=None):
           type(v_ego) in (int, float) and math.isfinite(v_ego) and 0 <= v_ego <= 25):
         # Advance hint only: roll toward the mapped point, never command a
         # stop or set shouldStop from map data alone.
-        caps.append(math.sqrt(4.0**2 + 2 * .8 * max(0.0, stop_distance-15)))
+        caps.append(math.sqrt(MAPPED_STOP_APPROACH_SPEED**2 + 2 * .8 * max(0.0, stop_distance-15)))
     maneuver = state['maneuver']
     kind, distance = maneuver['type'], maneuver['distance_m']
     if type(distance) not in (int, float) or not math.isfinite(distance) or distance < -8 or distance > 300:
@@ -491,7 +494,9 @@ class LongitudinalPlanner:
 
     v_ego = sm['carState'].vEgo
     v_cruise_kph = min(sm['carState'].vCruise, V_CRUISE_MAX)
-    v_cruise = v_cruise_kph * CV.KPH_TO_MS
+    # Always rebuild ceilings from the driver setting, never prior slowed speed.
+    driver_cruise_speed = v_cruise_kph * CV.KPH_TO_MS
+    v_cruise = driver_cruise_speed
     v_cruise_initialized = sm['carState'].vCruise != V_CRUISE_UNSET
 
     long_control_off = sm['controlsState'].longControlState == LongCtrlState.off
@@ -505,7 +510,9 @@ class LongitudinalPlanner:
     # No change cost when user is controlling the speed, or when standstill
     prev_accel_constraint = not (reset_state or sm['carState'].standstill)
 
-    accel_clip = [ACCEL_MIN, get_max_accel(v_ego)]
+    personality = sm["selfdriveState"].personality
+    accel_max = accel_ceiling(v_ego, personality) if self._is_preap else get_max_accel(v_ego)
+    accel_clip = [ACCEL_MIN, accel_max]
     steer_angle_without_offset = sm['carState'].steeringAngleDeg - sm['liveParameters'].angleOffsetDeg
     accel_clip = limit_accel_in_turns(v_ego, steer_angle_without_offset, accel_clip, self.CP)
 
@@ -543,10 +550,6 @@ class LongitudinalPlanner:
         v_ego=v_ego, gas=sm["carState"].gasPressed, now=time.monotonic())
       if map_cap is not None:
         v_cruise = min(v_cruise, map_cap)
-      personality = sm["selfdriveState"].personality
-      personality_raw = getattr(personality, "raw", personality)
-      if personality_raw == 2 and v_ego < 8.9408:
-        accel_clip[1] = min(accel_clip[1], float(np.interp(v_ego, [0., 4.4704, 8.9408], [.6, .6, .8])))
 
     if self._is_preap and not reset_state:
       # Route navigation and generic map assistance are intentionally separate.
@@ -580,7 +583,8 @@ class LongitudinalPlanner:
 
     self.mpc.set_weights(prev_accel_constraint, personality=sm['selfdriveState'].personality)
     self.mpc.set_cur_state(self.v_desired_filter.x, self.a_desired)
-    self.mpc.update(sm['radarState'], v_cruise, personality=sm['selfdriveState'].personality, nap_follow_dist=self.nap_follow_dist, max_accel=accel_clip[1])
+    self.mpc.update(sm['radarState'], v_cruise, personality=sm['selfdriveState'].personality, nap_follow_dist=self.nap_follow_dist, max_accel=accel_clip[1],
+                    preap_accel_profile=self._is_preap)
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
     self.a_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.a_solution)
@@ -600,26 +604,27 @@ class LongitudinalPlanner:
     output_a_target_mpc, output_should_stop_mpc = get_accel_from_plan(self.v_desired_trajectory, self.a_desired_trajectory, CONTROL_N_T_IDX,
                                                                         action_t=action_t, vEgoStopping=self.CP.vEgoStopping)
 
-    # Phantom braking buffer
-    if output_a_target_mpc < self.output_a_target - 0.5:
-      self.phantom_brake_counter += 1
-      if self.phantom_brake_counter < 5:
-        output_a_target_mpc = max(output_a_target_mpc, self.output_a_target - 0.5)
-    else:
-      self.phantom_brake_counter = 0
+    if not self._is_preap:
+      # Phantom braking buffer
+      if output_a_target_mpc < self.output_a_target - 0.5:
+        self.phantom_brake_counter += 1
+        if self.phantom_brake_counter < 5:
+          output_a_target_mpc = max(output_a_target_mpc, self.output_a_target - 0.5)
+      else:
+        self.phantom_brake_counter = 0
 
-    # Phantom braking buffer
-    if output_a_target_mpc < self.output_a_target - 0.5:
-      self.phantom_brake_counter += 1
-      if self.phantom_brake_counter < 5:
-        output_a_target_mpc = max(output_a_target_mpc, self.output_a_target - 0.5)
-    else:
-      self.phantom_brake_counter = 0
+      # Phantom braking buffer
+      if output_a_target_mpc < self.output_a_target - 0.5:
+        self.phantom_brake_counter += 1
+        if self.phantom_brake_counter < 5:
+          output_a_target_mpc = max(output_a_target_mpc, self.output_a_target - 0.5)
+      else:
+        self.phantom_brake_counter = 0
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
 
     if sm['selfdriveState'].experimentalMode:
-      output_a_target = min(output_a_target_e2e + 0.25, output_a_target_mpc)
+      output_a_target = min(output_a_target_e2e, output_a_target_mpc)
       self.output_should_stop = output_should_stop_e2e or output_should_stop_mpc
       if output_a_target < output_a_target_mpc:
         self.mpc.source = LongitudinalPlanSource.e2e
@@ -634,10 +639,15 @@ class LongitudinalPlanner:
     # behavior. Do not apply the old blinker-only -2.5 m/s^2 override: it
     # ignored path geometry and remained active when Corner Assist was off.
     if self._is_preap:
-      output_a_target = self.corner_assist.apply(output_a_target, sm, self.CP, reset_state, accel_coast)
+      output_a_target = self.corner_assist.apply(output_a_target, sm, self.CP, reset_state, accel_coast, driver_cruise_speed)
 
     for idx in range(2):
       accel_clip[idx] = np.clip(accel_clip[idx], self.prev_accel_clip[idx] - 0.05, self.prev_accel_clip[idx] + 0.05)
+    if self._is_preap:
+      previous = 0.0 if reset_state or sm["carState"].gasPressed else self.output_a_target
+      output_a_target = limit_positive_accel(output_a_target, previous, v_ego, personality, self.dt)
+      # A newly lowered profile/curve ceiling takes effect immediately.
+      accel_clip[1] = min(accel_clip[1], accel_ceiling(v_ego, personality))
     self.output_a_target = np.clip(output_a_target, accel_clip[0], accel_clip[1])
     self.prev_accel_clip = accel_clip
 

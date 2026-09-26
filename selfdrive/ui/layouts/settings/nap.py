@@ -2,6 +2,9 @@ import os
 import subprocess
 import pyray as rl
 from openpilot.common.params import Params
+from openpilot.selfdrive.controls.lib.curve_comfort import (
+  PROFILE_NAMES, DEFAULT_PROFILE, read_curve_comfort, write_curve_comfort,
+)
 from openpilot.common.basedir import BASEDIR
 from openpilot.system.ui.widgets import Widget, DialogResult
 from openpilot.system.ui.widgets.keyboard import Keyboard
@@ -145,6 +148,18 @@ class NAPLayout(Widget):
     )
     self._lane_position_buttons.action_item.set_enabled(ui_state.is_offroad)
     self._all_items.append(self._lane_position_buttons)
+
+    self._curve_comfort_buttons = multiple_button_item(
+      "Curve Slowdown",
+      "Adjust optional Corner Assist and mapped-curve slowing when those features are enabled. "
+      "Mild slows less; More favors lower curve speeds. Cruise speed, leads and stops still take priority. "
+      "Change while parked.",
+      buttons=["More", "Standard", "Mild"], button_width=180,
+      selected_index=PROFILE_NAMES.index(read_curve_comfort().name),
+      callback=self._on_curve_comfort,
+    )
+    self._curve_comfort_buttons.action_item.set_enabled(ui_state.is_offroad)
+    self._all_items.append(self._curve_comfort_buttons)
 
     # ── Section 2: Longitudinal Control ──
     self._all_items.append(section_header_item("Longitudinal Control"))
@@ -371,6 +386,16 @@ class NAPLayout(Widget):
 
   # ── Multiple-button callbacks ──
 
+  def _on_curve_comfort(self, index: int):
+    if not ui_state.is_offroad or not 0 <= index < len(PROFILE_NAMES):
+      return
+    try:
+      write_curve_comfort(PROFILE_NAMES[index])
+    except OSError:
+      gui_app.push_widget(ConfirmDialog("Could not save Curve Slowdown. Please try again.", "OK"))
+    self._curve_comfort_buttons.action_item.set_selected_button(
+      PROFILE_NAMES.index(read_curve_comfort().name))
+
   def _on_centering_strength(self, index: int):
     self._params.put(NAPParamKeys.LANE_CENTERING_STRENGTH, index + 1)
 
@@ -526,6 +551,7 @@ class NAPLayout(Widget):
 
   def _reset_all_to_defaults(self):
     """Write default value for each NAP param."""
+    write_curve_comfort(DEFAULT_PROFILE)
     for key, default in DEFAULTS.items():
       if isinstance(default, bool):
         self._params.put_bool(key, default)
@@ -559,6 +585,10 @@ class NAPLayout(Widget):
       max(0, min(6, lane_offset + 3))
     )
     self._lane_position_buttons.action_item.set_enabled(ui_state.is_offroad)
+
+    self._curve_comfort_buttons.action_item.set_selected_button(
+      PROFILE_NAMES.index(read_curve_comfort().name))
+    self._curve_comfort_buttons.action_item.set_enabled(ui_state.is_offroad)
 
     # Refresh multiple-button selections
     follow_dist = self._params.get(NAPParamKeys.FOLLOW_DISTANCE, return_default=True)
