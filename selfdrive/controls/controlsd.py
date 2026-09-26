@@ -57,6 +57,23 @@ LOW_SPEED_TURN_ENTRY_MAX_SECONDS = 0.75
 LOW_SPEED_TURN_ENTRY_RELEASE_CURVATURE = 0.060
 
 
+# NAP_LOW_SPEED_TURN_RATE_ASSIST
+#
+# Stock clip_curvature() is intentionally conservative, but a 90-degree
+# intersection can require curvature to arrive and disappear much faster.
+#
+# These rates apply only to a latched low-speed turn. Normal/highway
+# curvature limiting is untouched.
+NAP_TURN_RATE_ENABLE_MPH = 15.0
+NAP_TURN_RATE_RELEASE_MPH = 18.0
+NAP_TURN_RATE_TRIGGER_CURVATURE = 0.020
+NAP_TURN_RATE_RELEASE_CURVATURE = 0.008
+
+# curvature / second
+NAP_TURN_RATE_IN = 0.80
+NAP_TURN_RATE_OUT = 1.20
+
+
 def low_speed_turn_scale(v_ego: float, desired_curvature: float,
                          one_blinker: bool) -> float:
   if not one_blinker:
@@ -105,6 +122,7 @@ class Controls:
     self.lane_centering = LaneCenteringAssist()
     # NAP_NAVIGATION_TURN_COMMIT_V1
     self.navigation_turn_commit = NavigationTurnCommit()
+    self.nap_turn_rate_assist_active = False
     self.lane_centering_enabled = False
     self.lane_centering_strength = 1
     self.lane_centering_offset = 0
@@ -186,6 +204,19 @@ class Controls:
     # Reset desired curvature to current to avoid violating the limits on engage
     new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
 
+    # Resolve manual/navigation turn commitment before entrance shaping.
+    # Authorized city-turn paths bypass optional wide-entry shaping below.
+    new_desired_curvature = self.navigation_turn_commit.update(
+      new_desired_curvature,
+      CS,
+      CC.latActive,
+      model=model_v2,
+      healthy=(self.CP.carFingerprint == "TESLA_MODEL_S_PREAP"
+               and self.sm.all_checks(['modelV2', 'carState', 'liveCalibration'])
+               and self.sm['liveCalibration'].calStatus == log.LiveCalibrationData.Status.calibrated),
+      actual_curvature=self.curvature,
+    )
+
     one_blinker = CS.leftBlinker != CS.rightBlinker
 
     if self.sm.frame % 100 == 0:
@@ -194,7 +225,15 @@ class Controls:
       self.lane_centering_strength = self.params.get("NAPLaneCenteringStrength", return_default=True)
       self.lane_centering_offset = self.params.get("NAPLaneCenterOffset", return_default=True)
 
-    wide_turns_enabled = getattr(self, 'wide_low_speed_turns_enabled', True)
+    decision = getattr(self.navigation_turn_commit, 'decision', None)
+    manual_city_intent = (one_blinker and isinstance(decision, dict)
+                          and decision.get('city_turns_enabled') is True
+                          and decision.get('signal_owner') == 'driver'
+                          and decision.get('manual_turn_direction') == (1 if CS.leftBlinker else 2))
+    city_turn_path = manual_city_intent or getattr(self.navigation_turn_commit, 'active', False)
+    # City turns must follow their model/commit path through the normal safety
+    # limits, without an extra entrance-radius expansion or steering delay.
+    wide_turns_enabled = getattr(self, 'wide_low_speed_turns_enabled', False) and not city_turn_path
     if wide_turns_enabled:
       turn_scale = low_speed_turn_scale(
         CS.vEgo,
@@ -325,17 +364,6 @@ class Controls:
       self.low_speed_turn_entry_active = False
       self.low_speed_turn_ramp_time = 0.0
 
-    # NAP_NAVIGATION_TURN_COMMIT_V1
-    # NavigationDesire has already authorized this intersection turn.
-    # If the model remains straight or chooses the opposite direction,
-    # establish a bounded minimum curvature in the route direction.
-    # clip_curvature() and the normal lateral controller remain downstream.
-    new_desired_curvature = self.navigation_turn_commit.update(
-      new_desired_curvature,
-      CS,
-      CC.latActive,
-    )
-
     # Correct the model trajectory before the existing curvature/actuator limits.
     # The UI continues to display the original model path, not this adjustment.
     new_desired_curvature += self.lane_centering.update(
@@ -351,11 +379,76 @@ class Controls:
       dt=DT_CTRL,
     )
 
+    # ----------------------------------------------------------
+    # NAP LOW-SPEED TURN RATE ASSIST
+    #
+    # The stock ISO jerk-derived curvature-rate limit is too slow for
+    # some ~90-degree low-speed intersections. It can cause:
+    #
+    #   1. delayed steering on entry -> excessively wide turn
+    #   2. delayed straightening on exit -> nose continues toward curb
+    #
+    # Start only on a signaled/authorized low-speed sharp turn.
+    # Once started, latch through the unwind even if the blinker or
+    # navigation ownership disappears at the apex.
+    # ----------------------------------------------------------
+    nap_turn_rate_override = None
+
+    nap_turn_speed_mph = max(float(CS.vEgo), 0.0) * CV.MS_TO_MPH
+    nap_target_curvature = float(new_desired_curvature)
+    nap_prev_curvature = float(self.desired_curvature)
+
+    nap_turn_start_allowed = (
+      CC.latActive
+      and nap_turn_speed_mph <= NAP_TURN_RATE_ENABLE_MPH
+      and (one_blinker or city_turn_path)
+      and abs(nap_target_curvature) >= NAP_TURN_RATE_TRIGGER_CURVATURE
+    )
+
+    if nap_turn_start_allowed:
+      self.nap_turn_rate_assist_active = True
+
+    # Keep the faster rate alive through the entire steering unwind.
+    # Release only after both requested and delivered curvature are
+    # essentially straight again.
+    if self.nap_turn_rate_assist_active:
+      if (
+        not CC.latActive
+        or nap_turn_speed_mph >= NAP_TURN_RATE_RELEASE_MPH
+      ):
+        self.nap_turn_rate_assist_active = False
+
+      elif (
+        abs(nap_target_curvature) < NAP_TURN_RATE_RELEASE_CURVATURE
+        and abs(nap_prev_curvature) < NAP_TURN_RATE_RELEASE_CURVATURE
+      ):
+        self.nap_turn_rate_assist_active = False
+
+    if self.nap_turn_rate_assist_active:
+      same_direction = (
+        nap_prev_curvature == 0.0
+        or nap_target_curvature == 0.0
+        or nap_prev_curvature * nap_target_curvature > 0.0
+      )
+
+      winding_in = (
+        same_direction
+        and abs(nap_target_curvature) > abs(nap_prev_curvature)
+      )
+
+      # Enter decisively, but straighten even faster.
+      nap_turn_rate_override = (
+        NAP_TURN_RATE_IN
+        if winding_in
+        else NAP_TURN_RATE_OUT
+      )
+
     self.desired_curvature, curvature_limited = clip_curvature(
       CS.vEgo,
       self.desired_curvature,
       new_desired_curvature,
       lp.roll,
+      max_curvature_rate_override=nap_turn_rate_override,
     )
     lat_delay = self.sm["liveDelay"].lateralDelay + LAT_SMOOTH_SECONDS
 
@@ -365,6 +458,7 @@ class Controls:
                                                        curvature_limited, lat_delay)
     actuators.torque = float(steer)
     actuators.steeringAngleDeg = float(steeringAngleDeg)
+
     # Ensure no NaNs/Infs
     for p in ACTUATOR_FIELDS:
       attr = getattr(actuators, p)

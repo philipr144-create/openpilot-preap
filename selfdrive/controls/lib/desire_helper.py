@@ -1,4 +1,7 @@
 import json
+import time
+
+from openpilot.selfdrive.controls.lib.navigation_turn_commit import ManualTurnEntry
 
 from cereal import log
 from openpilot.common.constants import CV
@@ -9,7 +12,7 @@ LaneChangeState = log.LaneChangeState
 LaneChangeDirection = log.LaneChangeDirection
 
 LANE_CHANGE_SPEED_MIN = 20 * CV.MPH_TO_MS
-CITY_TURN_SPEED_MAX = 25 * CV.MPH_TO_MS
+CITY_TURN_SPEED_MAX = 25.0 * CV.MPH_TO_MS
 LANE_CHANGE_TIME_MAX = 10.
 
 DESIRES = {
@@ -52,8 +55,11 @@ class DesireHelper:
     # that turn again until the physical blinker has been canceled.
     self.manual_turn_command_active = False
     self.manual_turn_cancelled = False
+    self.manual_entry = ManualTurnEntry()
 
   def suspend_for_navigation(self, carstate):
+    self.manual_entry.reset()
+    self.manual_turn_command_active = False
     self.lane_change_state = LaneChangeState.off
     self.lane_change_direction = LaneChangeDirection.none
     self.lane_change_timer = 0.0
@@ -85,19 +91,6 @@ class DesireHelper:
         return 'complete'
     self.lane_change_timer += DT_MDL
     self.desire = DESIRES[self.lane_change_direction][self.lane_change_state]
-    
-    # --- TWO-STAGE TURN / POCKET LOGIC ---
-    if v_ego < 6.7:
-      if carstate.leftBlinker:
-        self.desire = log.Desire.turnLeft
-      elif carstate.rightBlinker:
-        self.desire = log.Desire.turnRight
-    elif v_ego < 11.1:
-      if carstate.leftBlinker:
-        self.desire = log.Desire.laneChangeLeft
-      elif carstate.rightBlinker:
-        self.desire = log.Desire.laneChangeRight
-    # -------------------------------------
     return {LaneChangeState.preLaneChange: 'waiting', LaneChangeState.laneChangeStarting: 'starting',
             LaneChangeState.laneChangeFinishing: 'finishing'}[self.lane_change_state]
 
@@ -105,7 +98,9 @@ class DesireHelper:
   def get_lane_change_direction(CS):
     return LaneChangeDirection.left if CS.leftBlinker else LaneChangeDirection.right
 
-  def update(self, carstate, lateral_active, lane_change_prob):
+  def update(self, carstate, lateral_active, lane_change_prob, *, manual_turn_direction=0,
+             model=None, inputs_valid=False, now=None):
+    now = time.monotonic() if now is None else now
     v_ego = carstate.vEgo
     one_blinker = carstate.leftBlinker != carstate.rightBlinker
     below_lane_change_speed = v_ego < LANE_CHANGE_SPEED_MIN
@@ -126,17 +121,12 @@ class DesireHelper:
     self.manual_turn_poll += 1
 
     if not one_blinker:
-      self.manual_turn_command_active = False
       self.manual_turn_cancelled = False
+      self.manual_entry.reset()
 
-    if not self.manual_turns_enabled:
-      # Clear out any active manual turn state if disabled mid-turn
-      if self.manual_turn_command_active:
-        self.desire = log.Desire.none
-      self.manual_turn_command_active = False
-      self.manual_turn_cancelled = False
-    elif 0 <= v_ego < CITY_TURN_SPEED_MAX:
-      # Do not carry an in-progress lane-change state into a low-speed turn.
+    if self.manual_turns_enabled and 0 <= v_ego < CITY_TURN_SPEED_MAX:
+      # A lamp is not authorization: only a fresh, classified physical hold can
+      # arm. TapModel owns half-stalk requests independently above SPEED_MIN.
       self.lane_change_state = LaneChangeState.off
       self.lane_change_direction = LaneChangeDirection.none
       self.lane_change_timer = 0.0
@@ -144,28 +134,23 @@ class DesireHelper:
       self.keep_pulse_timer = 0.0
       self.prev_one_blinker = one_blinker
       self.desire = log.Desire.none
-
-      # PREAP_MANUAL_TURN_CANCEL_LATCH_V1
-      # Only latch a cancellation after a turn command was actually active.
-      # Releasing the wheel cannot restart it while the same blinker remains on.
-      if carstate.steeringPressed and self.manual_turn_command_active:
-        self.manual_turn_cancelled = True
-        self.manual_turn_command_active = False
-
-      if (
-          lateral_active
-          and one_blinker
-          and not carstate.steeringPressed
-          and not self.manual_turn_cancelled
-          and carstate.vEgo < 11.1
-      ):
-        if carstate.leftBlinker and not carstate.leftBlindspot:
-          self.desire = log.Desire.turnLeft if carstate.vEgo < 6.7 else log.Desire.laneChangeLeft
-          self.manual_turn_command_active = True
-        elif carstate.rightBlinker and not carstate.rightBlindspot:
-          self.desire = log.Desire.turnRight if carstate.vEgo < 6.7 else log.Desire.laneChangeRight
-          self.manual_turn_command_active = True
+      direction = manual_turn_direction
+      authorized = (inputs_valid and lateral_active and one_blinker
+                    and type(direction) is int and direction in (1, 2)
+                    and (direction == 1) == bool(carstate.leftBlinker)
+                    and not carstate.steeringPressed
+                    and not getattr(carstate, 'steeringDisengage', False)
+                    and not carstate.brakePressed and carstate.canValid
+                    and str(carstate.gearShifter) in ('drive', 'low', 'sport', 'eco')
+                    and not (carstate.leftBlindspot if direction == 1 else carstate.rightBlindspot))
+      self.manual_turn_command_active = self.manual_entry.update(model, direction, v_ego, authorized, now)
+      self.manual_turn_cancelled = self.manual_entry.blocked
+      if self.manual_turn_command_active:
+        self.desire = log.Desire.turnLeft if direction == 1 else log.Desire.turnRight
       return
+
+    self.manual_entry.reset()
+    self.manual_turn_command_active = False
 
     if not lateral_active or self.lane_change_timer > LANE_CHANGE_TIME_MAX:
       self.lane_change_state = LaneChangeState.off
@@ -225,19 +210,6 @@ class DesireHelper:
     self.prev_one_blinker = one_blinker
 
     self.desire = DESIRES[self.lane_change_direction][self.lane_change_state]
-    
-    # --- TWO-STAGE TURN / POCKET LOGIC ---
-    if v_ego < 6.7:
-      if carstate.leftBlinker:
-        self.desire = log.Desire.turnLeft
-      elif carstate.rightBlinker:
-        self.desire = log.Desire.turnRight
-    elif v_ego < 11.1:
-      if carstate.leftBlinker:
-        self.desire = log.Desire.laneChangeLeft
-      elif carstate.rightBlinker:
-        self.desire = log.Desire.laneChangeRight
-    # -------------------------------------
 
     # Send keep pulse once per second during LaneChangeStart.preLaneChange
     if self.lane_change_state in (LaneChangeState.off, LaneChangeState.laneChangeStarting):

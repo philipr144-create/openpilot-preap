@@ -46,6 +46,7 @@ class Simulation(unittest.TestCase):
     req = Path(self.temp.name) / "request"
     ack = Path(self.temp.name) / "ack"
     self.ctrl = core.TapController(req, ack)
+    self.ctrl.params = NS(get_bool=lambda _: True)
     self.stalk = core.PhysicalStalk()
     self.dh = helper.DesireHelper()
     self.model = model.TapModel(self.dh, req, ack)
@@ -127,6 +128,24 @@ class Simulation(unittest.TestCase):
     for _ in range(20):
       self.tick()
     self.assertEqual(self.ctrl.request_id, 0)
+
+  def test_threshold_tap_keeps_lane_change_ownership_with_city_turns_enabled(self):
+    for speed in (core.SPEED_MIN, core.SPEED_MIN + .01, 25.):
+      self.setUp()
+      self.cs.vEgo = speed
+      self.dh.manual_turns_enabled = True
+      self.tap()
+      self.tick()
+      if speed == core.SPEED_MIN:
+        self.assertEqual(self.ctrl.request_id, 0)
+      else:
+        self.assertEqual(self.model.status, 'starting')
+        self.assertEqual(self.dh.desire, log.Desire.laneChangeLeft)
+        self.assertEqual(self.model.manual_turn_direction, 0)
+        self.assertTrue(self.model.signal_active)
+        for _ in range(90): self.tick(prob=0)
+        self.assertEqual(self.ctrl.phase, 'complete')
+        self.assertFalse(self.model.signal_active)
 
   def test_hold_unchanged(self):
     for _ in range(60):

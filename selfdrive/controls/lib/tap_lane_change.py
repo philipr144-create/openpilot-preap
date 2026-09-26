@@ -27,14 +27,24 @@ class TapModel:
     self.phase = "idle"
     self.signal_active = False
     self.physical_direction = 0
+    self.manual_turn_direction = 0
+
+    # Once a genuine full physical stalk hold has been classified,
+    # keep that direction alive while the same physical blinker remains
+    # held below 25 mph. This absorbs request/classifier flicker without
+    # weakening downstream brake/steering/CAN/blindspot safety gates.
+
     self.request_valid = False
     self.rearm_gesture = None
 
   def update(self, cs, cc, valid, nav_claim, lane_change_prob, now=None):
     now = time.monotonic() if now is None else now
     maneuver_was_active = self.status in ("waiting", "starting", "finishing")
+    self.manual_turn_direction = 0
     request = self.request.read(now)
     if request is None:
+      self.manual_turn_direction = 0
+
       if self.status in ("waiting", "starting", "finishing"):
         self.locked = True
       if self.locked:
@@ -51,6 +61,7 @@ class TapModel:
       or type(seq) is not int
       or seq < 0
     ):
+      self.manual_turn_direction = 0
       self.helper.suspend_for_navigation(cs)
       self.locked, self.status = True, "cancelled"
       self.enabled, self.signal_active = False, False
@@ -63,9 +74,13 @@ class TapModel:
     self.phase = request.get("phase") if isinstance(request.get("phase"), str) else "invalid"
     self.physical_direction = request.get("physical_direction") if request.get("physical_direction") in (0, 1, 2) else 0
     self.signal_active = request.get("signal_active") is True
+    held = request.get("manual_turn_direction")
+    if type(held) is int and held in (1, 2) and held == self.physical_direction:
+      self.manual_turn_direction = held
     active = self.phase in ("pending", "active")
     if controller != self.controller:
       # Baseline on attachment: never replay a request surviving a process restart.
+      self.manual_turn_direction = 0
       self.controller, self.seen = controller, seq
       self.status = "blocked" if active else "idle"
       if self.locked:
@@ -75,6 +90,7 @@ class TapModel:
         self.helper.suspend_for_navigation(cs)
       self._publish(now)
       return self.locked
+
     if seq != self.seen:
       self.seen = seq  # Consume even a blocked request; never defer authorization.
       self.status = "blocked"

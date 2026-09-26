@@ -22,13 +22,29 @@ def smooth_value(val, prev_val, tau, dt=DT_MDL):
   alpha = 1 - np.exp(-dt/tau) if tau > 0 else 1
   return alpha * val + (1 - alpha) * prev_val
 
-def clip_curvature(v_ego, prev_curvature, new_curvature, roll) -> tuple[float, bool]:
-  # This function respects ISO lateral jerk and acceleration limits + a max curvature
+def clip_curvature(v_ego, prev_curvature, new_curvature, roll,
+                   max_curvature_rate_override=None) -> tuple[float, bool]:
+  # This function respects ISO lateral jerk and acceleration limits + a max curvature.
+  #
+  # NAP: low-speed intersection turns may supply a bounded curvature-rate
+  # override. Acceleration and absolute-curvature limits below remain unchanged.
   v_ego = max(v_ego, MIN_SPEED)
-  max_curvature_rate = MAX_LATERAL_JERK / (v_ego ** 2)  # inexact calculation, check https://github.com/commaai/openpilot/pull/24755
-  new_curvature = np.clip(new_curvature,
-                          prev_curvature - max_curvature_rate * DT_CTRL,
-                          prev_curvature + max_curvature_rate * DT_CTRL)
+
+  stock_curvature_rate = MAX_LATERAL_JERK / (v_ego ** 2)
+
+  if max_curvature_rate_override is None:
+    max_curvature_rate = stock_curvature_rate
+  else:
+    max_curvature_rate = max(
+      stock_curvature_rate,
+      float(max_curvature_rate_override),
+    )
+
+  new_curvature = np.clip(
+    new_curvature,
+    prev_curvature - max_curvature_rate * DT_CTRL,
+    prev_curvature + max_curvature_rate * DT_CTRL,
+  )
 
   roll_compensation = roll * ACCELERATION_DUE_TO_GRAVITY
   max_lat_accel = MAX_LATERAL_ACCEL_NO_ROLL + roll_compensation

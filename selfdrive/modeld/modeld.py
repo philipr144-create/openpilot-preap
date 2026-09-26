@@ -309,6 +309,8 @@ def main(demo=False):
   DH = DesireHelper()
   tap_model = TapModel(DH) if CP.carFingerprint == "TESLA_MODEL_S_PREAP" else None
   tap_lane_change_prob = 1.0
+  last_manual_model = None
+  last_manual_model_time = -float("inf")
   nav_desire = NavigationDesire()
   previous_nav_owner = True
   manual_rearm = False
@@ -394,6 +396,17 @@ def main(demo=False):
     # Route presence is not active signal ownership. Reserve DesireHelper only
     # in a nav maneuver window, for an active nav request, or during rearm.
     suppress_manual = tap_claimed_by_nav or nav_active or manual_rearm or nav_turn_blocked or nav_cleanup_guard > 0
+    if not suppress_manual and not tap_handled:
+      now = time.monotonic()
+      DH.update(sm['carState'], sm['carControl'].latActive, tap_lane_change_prob,
+                manual_turn_direction=tap_model.manual_turn_direction if tap_model is not None else 0,
+                model=last_manual_model,
+                inputs_valid=(nav_inputs_valid and sm.all_checks(['liveCalibration'])
+                              and sm['liveCalibration'].calStatus == log.LiveCalibrationData.Status.calibrated
+                              and 0 <= now - last_manual_model_time <= .15),
+                now=now)
+      driver_desire = DH.desire
+      desire = driver_desire
     selection_source = 'none'
     if nav_active:
       DH.suspend_for_navigation(sm['carState'])
@@ -472,7 +485,9 @@ def main(demo=False):
                                       meta_main.frame_id, signal_owner=signal_owner,
                                       tap_enabled=tap_model.enabled if tap_model is not None else False,
                                       tap_status=tap_model.status if tap_model is not None else 'unavailable',
-                                      tap_signal_active=tap_signal_active)
+                                      tap_signal_active=tap_signal_active,
+                                      manual_turn_direction=tap_model.manual_turn_direction if tap_model is not None else 0,
+                                      city_turns_enabled=DH.manual_turns_enabled)
     nav_desire.publish_diagnostics()
     mt2 = time.perf_counter()
     model_execution_time = mt2 - mt1
@@ -493,8 +508,8 @@ def main(demo=False):
       r_lane_change_prob = desire_state[log.Desire.laneChangeRight]
       lane_change_prob = l_lane_change_prob + r_lane_change_prob
       tap_lane_change_prob = lane_change_prob
-      if not suppress_manual and not tap_handled:
-        DH.update(sm['carState'], sm['carControl'].latActive, lane_change_prob)
+      last_manual_model = modelv2_send.modelV2.as_reader()
+      last_manual_model_time = time.monotonic()
       modelv2_send.modelV2.meta.laneChangeState = DH.lane_change_state
       modelv2_send.modelV2.meta.laneChangeDirection = DH.lane_change_direction
       drivingdata_send.drivingModelData.meta.laneChangeState = DH.lane_change_state

@@ -16,43 +16,133 @@ class CityTurnGates(unittest.TestCase):
   def setUp(self):
     with patch('openpilot.selfdrive.controls.lib.desire_helper.Params'):
       self.helper = DesireHelper()
-    self.helper.params = N(get=lambda _: b'1')
+    self.helper.params = N(get=lambda _: True)
     self.cs = N(vEgo=10*.44704, leftBlinker=True, rightBlinker=False,
                 steeringPressed=False, steeringTorque=0., leftBlindspot=False,
                 rightBlindspot=False, brakePressed=False, gearShifter='drive')
 
-  def test_manual_turn_speed_gate(self):
-    self.assertEqual(CITY_TURN_SPEED_MAX, 25*CV.MPH_TO_MS)
-    self.assertEqual(LANE_CHANGE_SPEED_MIN, 20*CV.MPH_TO_MS)
-    for mph in (0, 10, 19.99, 20, 24, 24.99, 25, 25.01, 30):
-      with self.subTest(mph=mph):
-        self.setUp()
-        self.cs.vEgo=mph*CV.MPH_TO_MS
-        self.helper.update(self.cs, True, 1.)
-        self.assertEqual(self.helper.desire == log.Desire.turnLeft, mph < 25)
+  def tick(self, direction=1, valid=True):
+    self.now += .05
+    self.model.frameId += 1
+    self.helper.update(self.cs, True, 1., manual_turn_direction=direction,
+                       model=self.model, inputs_valid=valid, now=self.now)
+    return self.helper.desire
 
-  def test_right_turn_in_extended_range(self):
-    self.cs.vEgo=24*CV.MPH_TO_MS
-    self.cs.leftBlinker=False
-    self.cs.rightBlinker=True
-    self.helper.update(self.cs, True, 1.)
-    self.assertEqual(self.helper.desire, log.Desire.turnRight)
+  def prepare(self):
+    self.now = 100.
+    self.cs.canValid = True
+    self.model = N(frameId=0, position=N(t=[0., 1., 2., 3.], x=[0., 4., 8., 10.], y=[0., -.5, -2., -4.]),
+                   orientation=N(z=[0., -.1, -.3, -.6]), action=N(desiredCurvature=-.03))
 
-  def test_held_blinker_while_slowing_and_speed_exit(self):
-    self.cs.vEgo=26*CV.MPH_TO_MS
-    self.helper.update(self.cs, True, 1.)
-    self.assertEqual(self.helper.lane_change_state, LaneChangeState.preLaneChange)
-    self.cs.vEgo=24*CV.MPH_TO_MS
-    self.helper.update(self.cs, True, 1.)
+  def test_early_signal_straight_road_never_requests_turn(self):
+    self.prepare()
+    self.model.orientation.z = [0.] * 4
+    self.model.position.y = [0.] * 4
+    self.model.action.desiredCurvature = 0.
+    for _ in range(100):
+      self.assertEqual(self.tick(), log.Desire.none)
+
+  def test_obvious_future_corner_conditions_model_before_near_path(self):
+    self.prepare()
+    # The first second is still straight, but the three-second scene is an
+    # unmistakable intersection. Condition the model early enough to avoid a
+    # late, wide entry; the independent steering gate remains near-path based.
+    self.model.orientation.z = [0., 0., -.3, -.6]
+    self.model.position.y = [0., 0., -2., -4.]
+    self.model.action.desiredCurvature = 0.
+    for _ in range(6):
+      self.assertEqual(self.tick(), log.Desire.none)
+    for _ in range(4):
+      self.tick()
     self.assertEqual(self.helper.desire, log.Desire.turnLeft)
-    self.assertEqual(self.helper.lane_change_state, LaneChangeState.off)
-    self.cs.vEgo=25*CV.MPH_TO_MS
-    self.helper.update(self.cs, True, 1.)
+
+  def test_early_signal_can_wait_at_stop_and_reconfirm_after_interruption(self):
+    for case in ('stopped', 'brake', 'invalid', 'missing'):
+      self.setUp(); self.prepare()
+      for _ in range(3): self.assertEqual(self.tick(), log.Desire.none)
+      saved_speed, saved_yaw = self.cs.vEgo, self.model.orientation.z
+      if case == 'stopped': self.cs.vEgo = 0.
+      if case == 'brake': self.cs.brakePressed = True
+      if case == 'missing': self.model.orientation.z = []
+      for _ in range(10): self.assertEqual(self.tick(valid=case != 'invalid'), log.Desire.none)
+      self.assertFalse(self.helper.manual_entry.blocked)
+      self.cs.vEgo = saved_speed; self.cs.brakePressed = False; self.model.orientation.z = saved_yaw
+      if case == "stopped":
+        # A sustained corner may pre-arm while stopped, but it cannot emit the
+        # turn desire until the vehicle begins moving.
+        self.assertEqual(self.tick(), log.Desire.turnLeft)
+      else:
+        for _ in range(6): self.assertEqual(self.tick(), log.Desire.none)
+        for _ in range(4): self.tick()
+        self.assertEqual(self.helper.desire, log.Desire.turnLeft)
+
+  def test_shrinking_remaining_turn_keeps_desire_but_cannot_start_one(self):
+    self.prepare()
+    for _ in range(10): self.tick()
+    self.model.orientation.z = [0., -.05, -.15, -.26]
+    self.model.position.y = [0., -.2, -.5, -1.]
+    self.model.action.desiredCurvature = -.013
+    for _ in range(30): self.assertEqual(self.tick(), log.Desire.turnLeft)
+    self.helper.manual_entry.reset()
+    for _ in range(30): self.assertEqual(self.tick(), log.Desire.none)
+
+  def test_tap_and_unclassified_lamps_never_request_city_turn(self):
+    self.prepare()
+    for _ in range(30): self.assertEqual(self.tick(direction=0), log.Desire.none)
+    self.assertFalse(self.helper.manual_turn_command_active)
+
+  def test_near_path_requires_sustained_confirmation(self):
+    self.prepare()
+    for _ in range(6): self.assertEqual(self.tick(), log.Desire.none)
+    for _ in range(3): self.tick()
+    self.assertEqual(self.helper.desire, log.Desire.turnLeft)
+
+  def test_right_path_and_speed_bounds(self):
+    for speed in (0., 4., 8., 9., 11.):
+      self.setUp(); self.prepare()
+      self.cs.vEgo = speed
+      self.cs.leftBlinker, self.cs.rightBlinker = False, True
+      self.model.position.y = [-v for v in self.model.position.y]
+      self.model.orientation.z = [-v for v in self.model.orientation.z]
+      self.model.action.desiredCurvature *= -1
+      for _ in range(20): self.tick(direction=2)
+      self.assertEqual(self.helper.desire, log.Desire.turnRight if 0.3 < speed <= 25 * CV.MPH_TO_MS else log.Desire.none)
+
+  def test_override_cancel_and_opposite_do_not_rearm_until_neutral(self):
+    for field in ('steeringPressed', 'brakePressed', 'rightBlinker'):
+      self.setUp(); self.prepare()
+      for _ in range(10): self.tick()
+      self.assertEqual(self.helper.desire, log.Desire.turnLeft)
+      setattr(self.cs, field, True)
+      self.assertEqual(self.tick(), log.Desire.none)
+      setattr(self.cs, field, False)
+      # Hazards explicitly clear the direction; steering/brake remain latched.
+      if field != 'rightBlinker':
+        for _ in range(20): self.assertEqual(self.tick(), log.Desire.none)
+      self.cs.leftBlinker = False
+      self.tick(direction=0)
+      self.cs.leftBlinker = True
+      for _ in range(10): self.tick()
+      self.assertEqual(self.helper.desire, log.Desire.turnLeft)
+
+  def test_loss_of_path_releases_and_does_not_retrigger(self):
+    self.prepare()
+    for _ in range(10): self.tick()
+    self.model.position.y = [0.]*4
+    self.model.orientation.z = [0.]*4
+    self.model.action.desiredCurvature = 0.
+    for _ in range(15): self.tick()
     self.assertEqual(self.helper.desire, log.Desire.none)
-    self.assertEqual(self.helper.lane_change_state, LaneChangeState.off)
+    self.assertTrue(self.helper.manual_entry.blocked)
+
+  def test_disabled_and_invalid_inputs_never_request_turn(self):
+    for disabled in (True, False):
+      self.setUp(); self.prepare()
+      self.helper.params = N(get=lambda _: not disabled)
+      for _ in range(20): self.assertEqual(self.tick(valid=False), log.Desire.none)
 
   def test_disabled_city_turns_keep_ordinary_lane_change_threshold(self):
-    self.helper.params=N(get=lambda _: b'0')
+    self.helper.params=N(get=lambda _: False)
     self.cs.vEgo=21*CV.MPH_TO_MS
     self.helper.update(self.cs, True, 1.)
     self.assertEqual(self.helper.lane_change_state, LaneChangeState.preLaneChange)
@@ -61,32 +151,120 @@ class CityTurnGates(unittest.TestCase):
     self.helper.update(self.cs, True, 1.)
     self.assertEqual(self.helper.desire, log.Desire.laneChangeLeft)
 
-  def test_manual_takeover_latches_until_blinker_cancelled(self):
-    self.cs.vEgo=24*CV.MPH_TO_MS
-    self.helper.update(self.cs, True, 1.)
+  def test_repeated_frame_never_confirms_and_stale_frame_revokes(self):
+    self.prepare()
+    for _ in range(20):
+      self.model.frameId -= 1
+      self.assertEqual(self.tick(), log.Desire.none)
+    self.setUp(); self.prepare()
+    for _ in range(10): self.tick()
     self.assertEqual(self.helper.desire, log.Desire.turnLeft)
-    self.cs.steeringPressed=True
-    self.helper.update(self.cs, True, 1.)
-    self.assertTrue(self.helper.manual_turn_cancelled)
-    self.cs.steeringPressed=False
-    for _ in range(30): self.helper.update(self.cs, True, 1.)
-    self.assertEqual(self.helper.desire, log.Desire.none)
-    self.cs.leftBlinker=False
-    self.helper.update(self.cs, True, 1.)
-    self.cs.leftBlinker=True
-    self.helper.update(self.cs, True, 1.)
+    self.now += .2
+    self.assertEqual(self.tick(), log.Desire.none)
+
+  def test_missing_nonfinite_and_straight_paths_revoke(self):
+    for case in ('missing', 'nan', 'straight'):
+      self.setUp(); self.prepare()
+      for _ in range(10): self.tick()
+
+      if case == 'missing':
+        self.model.orientation.z = []
+      elif case == 'nan':
+        self.model.position.x[1] = float('nan')
+      else:
+        self.model.position.y = [0., 0., 0., 0.]
+        self.model.orientation.z = [0., 0., 0., 0.]
+        self.model.action.desiredCurvature = 0.
+
+      self.assertEqual(self.tick(), log.Desire.none)
+      self.assertTrue(self.helper.manual_entry.blocked)
+
+  def test_obvious_near_corner_can_start_with_zero_instantaneous_curvature(self):
+    """Physical blinker owns side when future path clearly shows a nearby corner.
+
+    Reproduces the road failure where the path already bends strongly into the
+    intersection while action.desiredCurvature is still approximately zero.
+    """
+    for direction in (1, 2):
+      self.setUp()
+      self.prepare()
+
+      if direction == 2:
+        self.cs.leftBlinker = False
+        self.cs.rightBlinker = True
+        self.model.position.y = [-v for v in self.model.position.y]
+        self.model.orientation.z = [-v for v in self.model.orientation.z]
+
+      # Important regression condition: future path is an obvious nearby
+      # corner, but instantaneous planner curvature has not started turning.
+      self.model.action.desiredCurvature = 0.0
+
+      # Still require sustained confirmation; blinker alone cannot turn.
+      for _ in range(6):
+        self.assertEqual(
+          self.tick(direction=direction),
+          log.Desire.none,
+        )
+
+      for _ in range(4):
+        self.tick(direction=direction)
+
+      expected = (
+        log.Desire.turnLeft
+        if direction == 1
+        else log.Desire.turnRight
+      )
+
+      self.assertEqual(self.helper.desire, expected)
+      self.assertTrue(self.helper.manual_turn_command_active)
+
+  def test_blinker_owns_side_when_model_draws_opposite_corner(self):
+    self.prepare()
+    for _ in range(10):
+      self.tick()
+
     self.assertEqual(self.helper.desire, log.Desire.turnLeft)
 
-  def test_blindspot_and_lateral_gates(self):
-    self.cs.vEgo=24*CV.MPH_TO_MS
-    self.cs.leftBlindspot=True
-    self.helper.update(self.cs, True, 1.)
-    self.assertEqual(self.helper.desire, log.Desire.none)
-    self.cs.leftBlindspot=False
-    self.helper.update(self.cs, False, 1.)
-    self.assertEqual(self.helper.desire, log.Desire.none)
-    self.helper.update(self.cs, True, 1.)
+    # Still a genuine corner, but the model currently draws it to the
+    # opposite side. Physical blinker remains authoritative.
+    self.model.position.y = [0., .5, 2., 4.]
+    self.model.orientation.z = [0., .1, .3, .6]
+    self.model.action.desiredCurvature = .03
+
+    self.assertEqual(self.tick(), log.Desire.turnLeft)
+    self.assertFalse(self.helper.manual_entry.blocked)
+
+  def test_opposite_instantaneous_curvature_does_not_cancel_matching_path(self):
+    self.prepare()
+
+    # First establish a real left City Turn.
+    for _ in range(10):
+      self.tick()
+
     self.assertEqual(self.helper.desire, log.Desire.turnLeft)
+
+    # Future path still clearly bends LEFT, but instantaneous model curvature
+    # briefly points RIGHT. The blinker + matching future path should retain
+    # the left City Turn.
+    self.model.action.desiredCurvature = .03
+
+    self.assertEqual(self.tick(), log.Desire.turnLeft)
+    self.assertFalse(self.helper.manual_entry.blocked)
+
+  def test_maximum_duration_releases_even_with_credible_path(self):
+    self.prepare()
+    for _ in range(180): self.tick()
+    self.assertEqual(self.helper.desire, log.Desire.none)
+    self.assertTrue(self.helper.manual_entry.blocked)
+
+  def test_opposite_full_signal_and_signal_cancellation_revoke(self):
+    self.prepare()
+    for _ in range(10): self.tick()
+    self.cs.leftBlinker, self.cs.rightBlinker = False, True
+    self.assertEqual(self.tick(direction=2), log.Desire.none)
+    self.cs.rightBlinker = False
+    self.assertEqual(self.tick(direction=0), log.Desire.none)
+    self.assertFalse(self.helper.manual_entry.blocked)
 
   def test_nav_speed_distance_and_override(self):
     with tempfile.TemporaryDirectory() as d:
