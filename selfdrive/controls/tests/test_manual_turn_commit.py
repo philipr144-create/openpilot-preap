@@ -358,15 +358,27 @@ class ManualTests(unittest.TestCase):
                     final_desire='none', received_mono=self.now,
                     frame_id=self.model.frameId)
       nav.decision = copy.deepcopy(self.d)
-      self.assertEqual(nav.update(-sign*.01, self.cs, True, self.now,
-                                  model=self.model, healthy=True,
-                                  actual_curvature=0.), 0.)
-      self.assertEqual(nav.state, 'MANUAL VETO')
-      # Matching curvature is never weakened by the veto.
+      boosted = nav.update(-sign*.01, self.cs, True, self.now,
+                           model=self.model, healthy=True,
+                           actual_curvature=0.)
+      self.assertEqual(boosted, sign * self.helper.EARLY_CURVATURE_FLOOR)
+      self.assertEqual(nav.state, 'MANUAL BOOST')
+      # Matching curvature is never weakened by the early boost.
       nav.decision = copy.deepcopy(self.d)
       self.assertEqual(nav.update(sign*.01, self.cs, True, self.now+.01,
                                   model=self.model, healthy=True,
                                   actual_curvature=0.), sign*.01)
+
+      # Without genuine corner geometry, an opposite request is only vetoed;
+      # the physical blinker cannot create a turn on a straight road.
+      self.model.position.y = [0.] * 4
+      self.model.orientation.z = [0.] * 4
+      self.model.action.desiredCurvature = 0.
+      nav.decision = copy.deepcopy(self.d)
+      self.assertEqual(nav.update(-sign*.01, self.cs, True, self.now+.02,
+                                  model=self.model, healthy=True,
+                                  actual_curvature=0.), 0.)
+      self.assertEqual(nav.state, 'MANUAL VETO')
 
   def test_navigation_wrapper_manual_independent_of_navigation_toggle(self):
     with patch('openpilot.selfdrive.controls.lib.navigation_turn_commit.Params'):

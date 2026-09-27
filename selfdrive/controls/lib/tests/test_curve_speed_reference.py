@@ -128,6 +128,15 @@ class PlannerReference(unittest.TestCase):
         self.assertGreaterEqual(result, 45.)
         self.assertLess(result, 47.)
 
+      # Exact on-road complaint: with a 45 mph MPP target, two consecutive
+      # 40 mph bends retain the same absolute 40 mph corridor target. They do
+      # not subtract again from the speed reached in the first bend.
+      for speed in (45, 40, 39, 40):
+        result = run(speed, [40, 40], cruise=45)
+        self.assertGreaterEqual(result, 40.)
+        self.assertLess(result, 42.)
+      self.assertAlmostEqual(run(40, [], cruise=45), 45.)
+
       # A genuinely tighter next bend must still command a lower ceiling.
       tight = run(45,[30])
       self.assertGreaterEqual(tight, 30.)

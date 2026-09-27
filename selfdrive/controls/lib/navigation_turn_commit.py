@@ -171,17 +171,37 @@ class NavigationTurnCommit:
           or (direction == 2 and bool(CS.rightBlinker))
         )
 
-        if (
-          matching_signal
-          and not (CS.leftBlindspot if direction == 1 else CS.rightBlindspot)
-          and requested_sign * float(curvature) < 0.0
-        ):
-          self.active = True
-          self.state = "MANUAL VETO"
-          self.side = "left" if direction == 1 else "right"
-          self.floor = 0.0
-          self.output_curvature = 0.0
-          return 0.0
+        if matching_signal and not (CS.leftBlindspot if direction == 1 else CS.rightBlindspot):
+          signed_curvature = requested_sign * float(curvature)
+          genuine_corner = (
+            model is not None
+            and ManualTurnCommit.directional_entry_evidence(
+              model, requested_sign, float(CS.vEgo)
+            )
+          )
+
+          # Before the sustained commitment dwell completes, give a genuine
+          # model-recognized corner a small push in the physical blinker
+          # direction. If geometry is not yet sufficient, still veto an
+          # opposite command to straight; never invent a turn on a straight.
+          if signed_curvature < 0.0 or (
+            genuine_corner
+            and signed_curvature < ManualTurnCommit.EARLY_CURVATURE_FLOOR
+          ):
+            floor = (
+              min(
+                ManualTurnCommit.EARLY_CURVATURE_FLOOR,
+                ManualTurnCommit.MAX_ACCEL / max(float(CS.vEgo) ** 2, 0.09),
+              )
+              if genuine_corner else 0.0
+            )
+            output = requested_sign * max(0.0, signed_curvature, floor)
+            self.active = True
+            self.state = "MANUAL BOOST" if floor > 0.0 else "MANUAL VETO"
+            self.side = "left" if direction == 1 else "right"
+            self.floor = floor
+            self.output_curvature = output
+            return output
 
     if not self.enabled:
       self.driver_assisting = False
