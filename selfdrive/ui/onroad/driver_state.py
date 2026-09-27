@@ -47,8 +47,11 @@ class ArcData:
 
 
 class DriverStateRenderer(Widget):
-  def __init__(self):
+  def __init__(self, onroad_top=False):
     super().__init__()
+    # NAP layout: the normal on-road HUD can place driver monitoring in the
+    # upper obscured region while camera-preview dialogs retain stock layout.
+    self.onroad_top = onroad_top
     # Initial state with NumPy arrays
     self.face_kpts_draw = DEFAULT_FACE_KPTS_3D.copy()
     self.is_active = False
@@ -162,11 +165,20 @@ class DriverStateRenderer(Widget):
 
   def _pre_calculate_drawing_elements(self):
     """Pre-calculate all drawing elements based on the current rectangle"""
-    # Calculate icon position (bottom-left or bottom-right)
+    # Calculate driver-monitoring icon position.
     width, height = self._rect.width, self._rect.height
     offset = UI_BORDER_SIZE + BTN_SIZE // 2
-    self.position_x = self._rect.x + (width - offset if self.is_rhd else offset)
-    self.position_y = self._rect.y + height - offset
+
+    if self.onroad_top:
+      # NAP HUD layout: this region is largely obscured by the rear-view
+      # mirror in the user's installation. Keep valuable lower screen space
+      # available for navigation information and controls.
+      self.position_x = self._rect.x + width - offset
+      self.position_y = self._rect.y + offset
+    else:
+      # Stock placement used by driver-camera/setup views.
+      self.position_x = self._rect.x + (width - offset if self.is_rhd else offset)
+      self.position_y = self._rect.y + height - offset
 
     # Pre-calculate the face lines positions
     positioned_keypoints = self.face_keypoints_transformed + np.array([self.position_x, self.position_y])

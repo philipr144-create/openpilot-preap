@@ -54,7 +54,8 @@ class AugmentedRoadView(CameraView):
     self.model_renderer = ModelRenderer()
     self._hud_renderer = HudRenderer()
     self.alert_renderer = AlertRenderer()
-    self.driver_state_renderer = DriverStateRenderer()
+    # NAP HUD: keep driver-monitoring graphics in the upper obscured region.
+    self.driver_state_renderer = DriverStateRenderer(onroad_top=True)
     self._route_button_rect = rl.Rectangle(0, 0, 0, 0)
     self._route_rows = []
     self._route_modal_rect = rl.Rectangle(0, 0, 0, 0)
