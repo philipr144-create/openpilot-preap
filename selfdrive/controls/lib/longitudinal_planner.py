@@ -19,6 +19,7 @@ from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.corner_assist import CornerAssist
+from openpilot.selfdrive.controls.lib.cruise_refinement import CruiseRefinement
 from openpilot.selfdrive.controls.lib.map_stop import MapStop, read_snapshot
 
 A_CRUISE_MAX_VALS = [1.2, 1.0, 1.0, 0.8]
@@ -437,6 +438,7 @@ class LongitudinalPlanner:
     self.allow_throttle = True
     self.corner_assist = CornerAssist()
     self.map_stop = MapStop()
+    self.cruise_refinement = CruiseRefinement(dt)
 
     self._is_preap = (CP.brand == "tesla" and CP.carFingerprint == "TESLA_MODEL_S_PREAP"
                        and CP.openpilotLongitudinalControl and not CP.pcmCruise)
@@ -551,6 +553,7 @@ class LongitudinalPlanner:
       if map_cap is not None:
         v_cruise = min(v_cruise, map_cap)
 
+    curve_cap = None
     if self._is_preap and not reset_state:
       # Route navigation and generic map assistance are intentionally separate.
       #
@@ -570,9 +573,13 @@ class LongitudinalPlanner:
       if self.nap_map_driving_assist:
         # Curves retain their existing ceiling. Direction-matched route stops
         # use the separate driver-brake / acknowledged-resume lifecycle.
-        map_cap = map_curve_speed_cap(v_ego=v_ego)
-        if map_cap is not None:
-          v_cruise = min(v_cruise, map_cap)
+        curve_cap = map_curve_speed_cap(v_ego=v_ego)
+
+    if self._is_preap:
+      curve_target = self.cruise_refinement.curve_target(
+        curve_cap, driver_cruise_speed, v_ego,
+        self.nap_map_driving_assist and not reset_state and not sm['carState'].gasPressed)
+      v_cruise = min(v_cruise, curve_target)
 
     # Optional Pre-AP follow cap. The NAPAdaptiveAccel toggle is the master
     # gate; when disabled, personality and the normal MPC limits apply.
@@ -622,6 +629,24 @@ class LongitudinalPlanner:
         self.phantom_brake_counter = 0
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
+
+    # Replace the historical constant E2E bias with bounded speed support.
+    # Never offset a negative model request or either lead's constraints.
+    # Normal cruise uses a floor, not another additive acceleration loop.
+    if self._is_preap:
+      lead_two = getattr(sm['radarState'], 'leadTwo', None)
+      support = self.cruise_refinement.speed_support(
+        v_cruise, v_ego, sm['carState'].aEgo,
+        self.nap_adaptive_accel and not reset_state and not sm['carState'].gasPressed
+        and self.allow_throttle and not force_slow_decel and v_ego >= 5.0
+        and not sm['radarState'].leadOne.status and not (lead_two is not None and lead_two.status)
+        and not output_should_stop_mpc and not output_should_stop_e2e and not map_should_stop
+        and output_a_target_mpc >= 0.0 and output_a_target_e2e >= 0.0
+        and v_cruise >= driver_cruise_speed - 1e-6)
+      if sm['selfdriveState'].experimentalMode:
+        output_a_target_e2e += support
+      elif support > 0.0:
+        output_a_target_mpc = max(output_a_target_mpc, support)
 
     if sm['selfdriveState'].experimentalMode:
       output_a_target = min(output_a_target_e2e, output_a_target_mpc)

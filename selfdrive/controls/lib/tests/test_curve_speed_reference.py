@@ -135,15 +135,24 @@ class PlannerReference(unittest.TestCase):
         result = run(speed, [40, 40], cruise=45)
         self.assertGreaterEqual(result, 40.)
         self.assertLess(result, 42.)
-      self.assertAlmostEqual(run(40, [], cruise=45), 45.)
+      recovered = run(40, [], cruise=45)
+      self.assertGreater(recovered, result)
+      self.assertLessEqual((recovered-result)*MPH, .6*.05+1e-9)
+      for _ in range(100): recovered = run(40, [], cruise=45)
+      self.assertAlmostEqual(recovered,45.)
 
       # A genuinely tighter next bend must still command a lower ceiling.
       tight = run(45,[30])
       self.assertGreaterEqual(tight, 30.)
       self.assertLess(tight, 32.)
 
-      self.assertAlmostEqual(run(35,[45],cruise=40),40.)
-      self.assertAlmostEqual(run(35,[]),55.)  # Release returns the original cruise target.
+      relaxed = run(35,[45],cruise=40)
+      self.assertGreater(relaxed,tight)
+      self.assertLess(relaxed,40.)
+      for _ in range(200): relaxed = run(35,[45],cruise=40)
+      self.assertAlmostEqual(relaxed,40.)
+      for _ in range(250): recovered = run(35,[])
+      self.assertAlmostEqual(recovered,55.)  # Recovery retains the original driver target.
       sm['controlsState'].forceDecel=True
       self.assertEqual(run(45,[45]),0.)
 
