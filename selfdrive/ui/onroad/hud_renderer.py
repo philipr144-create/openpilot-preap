@@ -237,14 +237,12 @@ class HudRenderer(Widget):
 
     direction, away, title, detail = self._nav_view
 
-    # NAP HUD layout:
-    # Put navigation in the driver's visible left-center area. The model/camera
-    # visualization is intentionally allowed to sit behind this information.
+    # Navigation occupies the right-hand card position.
     width = min(680, rect.width - 120)
     height = 275
     box = rl.Rectangle(
-      rect.x + 60,
-      rect.y + 235,
+      rect.x + rect.width - width - 60,
+      rect.y + 260,
       width,
       height,
     )
@@ -445,8 +443,8 @@ class HudRenderer(Widget):
     accent = colors.get(self._intent_kind, COLORS.WHITE)
     width = min(980, rect.width - 120)
     height = 250
-    x = max(rect.x + 780, rect.x + rect.width - width - 60)
-    box = rl.Rectangle(x, rect.y + 260, width, height)
+    # Driving intentions occupy the driver's visible left-hand position.
+    box = rl.Rectangle(rect.x + 60, rect.y + 235, width, height)
 
     rl.draw_rectangle_rounded(box, .10, 10, COLORS.BLACK_TRANSLUCENT)
     rl.draw_rectangle_rounded_lines_ex(box, .10, 10, 4, COLORS.BORDER_TRANSLUCENT)
@@ -523,7 +521,7 @@ class HudRenderer(Widget):
   def _draw_onscreen_controls(self, rect: rl.Rectangle) -> None:
     x = rect.x + 60
     btn_w = 140; lbl_w = 320; h = 130; gap = 25
-    # NAP HUD: controls form a visible left-side stack below navigation.
+    # NAP HUD: controls form a visible left-side stack below driving intentions.
     base_y = rect.y + rect.height - h - 105
     
     y_pers = base_y - h - gap
