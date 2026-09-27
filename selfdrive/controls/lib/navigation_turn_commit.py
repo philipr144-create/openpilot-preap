@@ -148,12 +148,14 @@ class NavigationTurnCommit:
 
       manual_valid = (
         one_blinker
+        and healthy
         and d.get("city_turns_enabled") is True
-        and d.get("source") == "driver_desire_helper"
         and d.get("signal_owner") == "driver"
         and d.get("tap_signal_active") is False
         and d.get("synthetic_indicator_request") == "none"
         and d.get("model_evaluated") is True
+        and 0.0 <= CS.vEgo <= COMMIT_SPEED_MPH * CV.MPH_TO_MS
+        and str(CS.gearShifter) in ("drive", "low", "sport", "eco")
         and not CS.steeringPressed
         and not getattr(CS, "steeringDisengage", False)
         and not CS.brakePressed
@@ -171,7 +173,7 @@ class NavigationTurnCommit:
 
         if (
           matching_signal
-          and d.get("final_desire") == expected
+          and not (CS.leftBlindspot if direction == 1 else CS.rightBlindspot)
           and requested_sign * float(curvature) < 0.0
         ):
           self.active = True

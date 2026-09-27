@@ -343,6 +343,31 @@ class ManualTests(unittest.TestCase):
     self.assertFalse(self.helper.active)
     self.assertTrue(self.helper.blocked)
 
+  def test_classified_physical_hold_vetoes_opposite_model_before_floor(self):
+    for direction, sign in ((1, -1.), (2, 1.)):
+      self.setUp()
+      if direction == 2:
+        self.cs.leftBlinker, self.cs.rightBlinker = False, True
+      with patch('openpilot.selfdrive.controls.lib.navigation_turn_commit.Params'):
+        nav = NavigationTurnCommit()
+      nav._refresh = lambda _: None
+      nav.enabled = False
+      # The full stalk is classified and fresh, but positive turn-floor
+      # evidence has not qualified yet. Opposite steering is still forbidden.
+      self.d.update(manual_turn_direction=direction, source='none',
+                    final_desire='none', received_mono=self.now,
+                    frame_id=self.model.frameId)
+      nav.decision = copy.deepcopy(self.d)
+      self.assertEqual(nav.update(-sign*.01, self.cs, True, self.now,
+                                  model=self.model, healthy=True,
+                                  actual_curvature=0.), 0.)
+      self.assertEqual(nav.state, 'MANUAL VETO')
+      # Matching curvature is never weakened by the veto.
+      nav.decision = copy.deepcopy(self.d)
+      self.assertEqual(nav.update(sign*.01, self.cs, True, self.now+.01,
+                                  model=self.model, healthy=True,
+                                  actual_curvature=0.), sign*.01)
+
   def test_navigation_wrapper_manual_independent_of_navigation_toggle(self):
     with patch('openpilot.selfdrive.controls.lib.navigation_turn_commit.Params'):
       nav = NavigationTurnCommit()
