@@ -8,6 +8,7 @@ from cereal import log
 import cereal.messaging as messaging
 from opendbc.car.tesla.preap.accel_policy import accel_ceiling, limit_positive_accel
 from opendbc.car.tesla.preap import interface
+from opendbc.car.tesla.preap.nap_conf import REGEN_MAX
 from opendbc.car.tesla.preap.virtual_das import VirtualDAS
 from openpilot.selfdrive.controls.lib import longitudinal_planner as lp
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc
@@ -25,6 +26,21 @@ class Policy(unittest.TestCase):
         for v in (0.,1.3,7.5,15.,30.):
           self.assertEqual(interface.get_preap_accel_limits(v),(-2.5,accel_ceiling(v,p)))
     self.assertEqual(accel_ceiling(5,log.LongitudinalPersonality.relaxed),accel_ceiling(5,2))
+
+  def test_should_stop_configuration_uses_full_regen_with_matching_jerk(self):
+    from cereal import car
+    cp = car.CarParams.new_message()
+    cp.longitudinalTuning.kpBP = []
+    cp.longitudinalTuning.kpV = []
+    cp.longitudinalTuning.kiBP = []
+    cp.longitudinalTuning.kiV = []
+    with patch.object(interface, 'nap_conf') as conf:
+      conf.use_pedal = True
+      conf.radar_enabled = False
+      conf.radar_behind_nosecone = False
+      interface.get_preap_params(cp, "TESLA_MODEL_S_PREAP")
+    self.assertEqual(cp.stopAccel, REGEN_MAX)
+    self.assertEqual(cp.stoppingDecelRate, 2.5)
 
   def test_reduced_demand_immediate(self):
     for request in (-3.,-1.,0.,.1):

@@ -9,7 +9,7 @@ from opendbc.car.tesla.preap.virtual_das import JerkLimiter
 
 def setup_controller(fingerprint="TESLA_MODEL_S_PREAP"):
   cp = N(carFingerprint=fingerprint, startingState=False, vEgoStarting=.1,
-         stopAccel=-1.5, stoppingDecelRate=1., startAccel=.5,
+         stopAccel=-2.5, stoppingDecelRate=2.5, startAccel=.5,
          longitudinalTuning=N(kpBP=[0., 3., 6., 35.], kpV=[0., 0., 0., 0.],
                               kiBP=[0., 3., 6., 35.], kiV=[.04, .06, .10, .15]))
   cs = N(vEgo=31., aEgo=0., brakePressed=False, cruiseState=N(standstill=False))
@@ -59,12 +59,18 @@ class TestPreAPLongControl(unittest.TestCase):
     self.assertEqual(controller.update(False, cs, .2, False, (-1.5, .8)), 0.)
     self.assertEqual(controller.pid.i, 0.)
 
-  def test_stopping_reaches_configured_regen(self):
+  def test_stopping_reaches_full_regen_with_smooth_firm_ramp(self):
     controller, cs = setup_controller()
     controller.pid.i = .3
-    for _ in range(200):
-      output = controller.update(True, cs, -1., True, (-1.5, .8))
-    self.assertEqual(output, -1.5)
+    previous = 0.
+    outputs = []
+    for _ in range(100):
+      output = controller.update(True, cs, -1., True, (-2.5, .8))
+      outputs.append(output)
+      self.assertLessEqual(previous - output, .02500001)
+      self.assertLessEqual(output, previous)
+      previous = output
+    self.assertAlmostEqual(outputs[-1], -2.5, places=9)
     self.assertEqual(controller.pid.i, 0.)
 
   def test_fast_target_changes_respect_command_jerk_limit(self):
