@@ -397,7 +397,7 @@ class NavigationDesire:
   def record_model_selection(self, selected, source, evaluated, frame_id, *,
                              signal_owner='none', tap_enabled=False,
                              tap_status='unavailable', tap_signal_active=False,
-                             manual_turn_direction=0, city_turns_enabled=False):
+                             manual_turn_direction=0, city_turns_enabled=False, manual_turn_blocked=False):
     # Captured after model.run, before DesireHelper updates for the next frame.
     self.decision.update(selected_desire=selected, final_desire=selected if evaluated else None,
                          source=source, model_evaluated=bool(evaluated), frame_id=int(frame_id),
@@ -405,13 +405,16 @@ class NavigationDesire:
                          tap_enabled=bool(tap_enabled),
                          tap_status=tap_status, tap_signal_active=bool(tap_signal_active),
                          manual_turn_direction=manual_turn_direction,
-                         city_turns_enabled=bool(city_turns_enabled))
+                         city_turns_enabled=bool(city_turns_enabled),
+                         manual_turn_blocked=bool(manual_turn_blocked))
 
   def publish_diagnostics(self, now=None):
     now = time.monotonic() if now is None else now
     # Manual commitment needs fresh model ownership and an immediate revocation.
     # Keep the existing navigation-only diagnostic cadence unchanged.
-    manual = (self.decision.get('source') == 'driver_desire_helper'
+    # Armed physical intent needs the same freshness as a selected desire.
+    # Otherwise the 0.5 s idle cadence outlives controlsd's 0.35 s validity.
+    manual = (self.decision.get('signal_owner') == 'driver'
               and self.decision.get('city_turns_enabled') is True
               and self.decision.get('manual_turn_direction') in (1, 2))
     interval = .05 if manual or self.manual_diagnostics_active else .5

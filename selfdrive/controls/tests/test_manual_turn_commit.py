@@ -64,8 +64,8 @@ class ManualTests(unittest.TestCase):
         self.actual *= -1
       outputs = [sign * self.tick() for _ in range(30)]
       self.assertEqual(outputs[0], .005)
-      self.assertGreater(outputs[-1], .02)
-      self.assertLessEqual(max(outputs), self.helper.COMMIT_CURVATURE_FLOOR + 1e-6)
+      self.assertAlmostEqual(outputs[-1], .005)  # Matching model path is never tightened.
+      self.assertTrue(self.helper.model_acquired)
       self.assertTrue(all(b >= a for a, b in zip(outputs, outputs[1:])))
       self.curvature = sign * .04
       self.assertEqual(self.tick(), self.curvature)  # Never reduce model authority.
@@ -81,33 +81,16 @@ class ManualTests(unittest.TestCase):
 
     self.assertTrue(self.helper.active)
     self.assertEqual(self.helper.state, 'MANUAL TURN')
-    # With the rolling City Turns state machine, start() may advance far
-    # enough to leave the light .008 approach phase and enter strong commit.
-    # Verify the floor matches the helper's actual phase.
-    if self.helper.strong_commit:
-      self.assertGreaterEqual(self.helper.floor, self.helper.COMMIT_CURVATURE_FLOOR)
-      self.assertLessEqual(self.helper.floor, self.helper.STOP_COMMIT_CURVATURE_FLOOR)
-    else:
-      self.assertAlmostEqual(
-        self.helper.floor,
-        self.helper.EARLY_CURVATURE_FLOOR,
-        places=6,
-      )
+    self.assertLessEqual(self.helper.floor, self.helper.SEED_MAX_CURVATURE)
+    self.assertGreaterEqual(self.helper.floor, self.helper.EARLY_CURVATURE_FLOOR)
     self.assertLessEqual(out, -.008)
 
-    # A stronger correctly-signed model request must still win normally.
     self.model.action.desiredCurvature = -.030
     self.curvature = -.030
-
-    out = self.tick()
-
-    # During strong City Turn commitment, a correct-direction model request
-    # weaker than MODEL_AUTHORITY_CURVATURE is intentionally strengthened
-    # to at least the committed floor.
-    if self.helper.strong_commit:
-      self.assertLessEqual(out, -self.helper.COMMIT_CURVATURE_FLOOR)
-    else:
-      self.assertEqual(out, -.030)
+    self.assertEqual(self.tick(), -.030)
+    # As the model unwinds, never put the seed floor back underneath it.
+    self.curvature = -.002
+    self.assertEqual(self.tick(), -.002)
 
   def test_shrinking_remaining_heading_is_continuation_not_completion(self):
     self.start()
@@ -231,23 +214,29 @@ class ManualTests(unittest.TestCase):
     for _ in range(30): self.assertEqual(self.tick(new_frame=False), self.curvature)
     self.assertFalse(self.helper.active)
 
-  def test_interrupted_evidence_restarts_dwell(self):
+  def test_instantaneous_curvature_noise_does_not_restart_geometry_dwell(self):
+    self.curvature = 0.
     for _ in range(5): self.tick()
     self.model.action.desiredCurvature = 0.
     self.tick()
     self.model.action.desiredCurvature = -.03
+    for _ in range(5): self.tick()
+    self.assertTrue(self.helper.active)
+
+  def test_missing_corner_geometry_restarts_dwell(self):
+    for _ in range(5): self.tick()
+    saved = self.model.orientation.z
+    self.model.orientation.z = [0.]*4
+    self.tick()
+    self.model.orientation.z = saved
     for _ in range(5):
       self.tick()
       self.assertFalse(self.helper.active)
 
-  def test_snap_to_straight_briefly_retained_then_released(self):
+  def test_straight_path_releases_without_synthetic_retention(self):
     self.start()
-    self.assertGreater(self.helper.heading, math.radians(5))
     self.straight()
-    out = [self.tick() for _ in range(15)]
-    self.assertLess(out[0], 0.)
-    self.assertTrue(all(b >= a for a, b in zip(out, out[1:])))
-    self.assertEqual(out[-1], 0.)
+    self.assertEqual(self.tick(), 0.)
     self.assertTrue(self.helper.blocked)
 
   def test_no_retention_before_measured_turn(self):
@@ -279,7 +268,7 @@ class ManualTests(unittest.TestCase):
       self.cs.leftBlinker = False
       self.tick()
       self.cs.leftBlinker = True
-      self.assertLess(self.start(), self.curvature)
+      self.assertEqual(self.start(), self.curvature)  # Reacquire model without tightening it.
 
   def test_opposite_intent_and_opposite_model_cancel(self):
     self.start()
@@ -306,7 +295,7 @@ class ManualTests(unittest.TestCase):
              ('d', 'source', 'navigation'), ('d', 'source', 'tap_lane_change'),
              ('d', 'source', 'navigation_signal_cleanup'), ('d', 'signal_owner', 'navigation'),
              ('d', 'tap_signal_active', True), ('d', 'synthetic_indicator_request', 'left'),
-             ('d', 'model_evaluated', False), ('d', 'final_desire', 'turnRight')]
+             ('d', 'model_evaluated', False), ('d', 'manual_turn_blocked', True), ('d', 'final_desire', 'turnRight')]
     for obj, key, value in cases:
       with self.subTest(key=key, value=value):
         self.setUp()
@@ -361,16 +350,16 @@ class ManualTests(unittest.TestCase):
       boosted = nav.update(-sign*.01, self.cs, True, self.now,
                            model=self.model, healthy=True,
                            actual_curvature=0.)
-      self.assertEqual(boosted, sign * self.helper.EARLY_CURVATURE_FLOOR)
-      self.assertEqual(nav.state, 'MANUAL BOOST')
+      self.assertEqual(boosted, 0.)
+      self.assertEqual(nav.state, 'MANUAL VETO')
       # Matching curvature is never weakened by the early boost.
       nav.decision = copy.deepcopy(self.d)
       self.assertEqual(nav.update(sign*.01, self.cs, True, self.now+.01,
                                   model=self.model, healthy=True,
                                   actual_curvature=0.), sign*.01)
 
-      # Without genuine corner geometry, an opposite request is only vetoed;
-      # the physical blinker cannot create a turn on a straight road.
+      # Waiting intent remains a continuous direction veto, without a
+      # positive blinker-side seed until sustained corner geometry qualifies.
       self.model.position.y = [0.] * 4
       self.model.orientation.z = [0.] * 4
       self.model.action.desiredCurvature = 0.
@@ -389,8 +378,28 @@ class ManualTests(unittest.TestCase):
       self.tick()
       nav.decision = copy.deepcopy(self.d)
       out = nav.update(self.curvature, self.cs, True, self.now, model=self.model, healthy=True, actual_curvature=self.actual)
-    self.assertLess(out, self.curvature)
-    self.assertEqual(nav.state, 'MANUAL TURN')
+    self.assertEqual(out, self.curvature)
+    self.assertEqual(nav.state, 'MANUAL MODEL PATH')
+
+  def test_seed_does_not_wait_for_model_desire_selection(self):
+    self.d.update(source='none', final_desire='none')
+    self.curvature = .02
+    self.model.action.desiredCurvature = .02
+    self.assertLess(self.start(), 0.)
+
+  def test_completed_turn_cannot_reboost_while_signal_remains_on(self):
+    with patch('openpilot.selfdrive.controls.lib.navigation_turn_commit.Params'):
+      nav = NavigationTurnCommit()
+    nav._refresh = lambda _: None
+    nav.manual.blocked = True
+    for i in range(20):
+      self.d.update(received_mono=self.now, frame_id=self.model.frameId)
+      nav.decision = copy.deepcopy(self.d)
+      self.assertEqual(nav.update(0., self.cs, True, self.now, model=self.model,
+                                  healthy=True, actual_curvature=0.), 0.)
+      self.now += .05
+      self.model.frameId += 1
+      self.assertFalse(nav.active)
 
   def test_navigation_floor_and_driver_handoff(self):
     with patch('openpilot.selfdrive.controls.lib.navigation_turn_commit.Params'):
@@ -440,6 +449,23 @@ class StalkAndDiagnostics(unittest.TestCase):
       for _ in range(14): held = tick(2)
       self.assertEqual(held, 2)
       self.assertEqual(tick(0), 0)
+
+  def test_armed_waiting_intent_is_published_at_control_freshness(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      root = Path(tmp)
+      nav = NavigationDesire(str(root/'nav'), str(root/'diag'), str(root/'signal'))
+      nav.decision = dict(received_mono=100.)
+      nav.record_model_selection('none', 'none', True, 42, signal_owner='driver',
+                                 manual_turn_direction=1, city_turns_enabled=True,
+                                 manual_turn_blocked=False)
+      for i in range(10):
+        now = 100. + i*.1
+        nav.decision['received_mono'] = now
+        nav.publish_diagnostics(now)
+        import json
+        written = json.loads((root/'diag').read_text())
+        self.assertEqual(written['received_mono'], now)
+        self.assertFalse(written['manual_turn_blocked'])
 
   def test_diagnostics_cadence_and_selection(self):
     with tempfile.TemporaryDirectory() as tmp:

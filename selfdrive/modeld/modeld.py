@@ -487,7 +487,8 @@ def main(demo=False):
                                       tap_status=tap_model.status if tap_model is not None else 'unavailable',
                                       tap_signal_active=tap_signal_active,
                                       manual_turn_direction=tap_model.manual_turn_direction if tap_model is not None else 0,
-                                      city_turns_enabled=DH.manual_turns_enabled)
+                                      city_turns_enabled=DH.manual_turns_enabled,
+                                      manual_turn_blocked=DH.manual_entry.blocked)
     nav_desire.publish_diagnostics()
     mt2 = time.perf_counter()
     model_execution_time = mt2 - mt1

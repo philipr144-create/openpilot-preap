@@ -19,7 +19,7 @@ from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.corner_assist import CornerAssist
-from openpilot.selfdrive.controls.lib.cruise_refinement import CruiseRefinement
+from openpilot.selfdrive.controls.lib.cruise_refinement import CruiseRefinement, model_support_weight
 from openpilot.selfdrive.controls.lib.map_stop import MapStop, read_snapshot
 
 A_CRUISE_MAX_VALS = [1.2, 1.0, 1.0, 0.8]
@@ -247,7 +247,10 @@ def map_curve_speed_cap(path=MAP_CONTEXT_SNAPSHOT, now=None, v_ego=None):
         continue
 
       if (
-        start < 10.0
+        # Keep an active mapped curve authoritative through its exit.
+        # start <= 0 < end means the vehicle is inside the curve, so its
+        # independently calculated target remains the longitudinal ceiling.
+        end <= 0.0
         or start > 450.0
         or end <= start
         or end > 500.0
@@ -631,20 +634,21 @@ class LongitudinalPlanner:
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
 
     # Replace the historical constant E2E bias with bounded speed support.
-    # Never offset a negative model request or either lead's constraints.
+    # Weak model coasting may receive bounded support; braking predictions
+    # and either lead's constraints retain authority.
     # Normal cruise uses a floor, not another additive acceleration loop.
     if self._is_preap:
       lead_two = getattr(sm['radarState'], 'leadTwo', None)
+      model_weight = model_support_weight(sm['modelV2'], v_ego, output_a_target_e2e)
       support = self.cruise_refinement.speed_support(
         v_cruise, v_ego, sm['carState'].aEgo,
         self.nap_adaptive_accel and not reset_state and not sm['carState'].gasPressed
         and self.allow_throttle and not force_slow_decel and v_ego >= 5.0
         and not sm['radarState'].leadOne.status and not (lead_two is not None and lead_two.status)
         and not output_should_stop_mpc and not output_should_stop_e2e and not map_should_stop
-        and output_a_target_mpc >= 0.0 and output_a_target_e2e >= 0.0
-        and v_cruise >= driver_cruise_speed - 1e-6)
+        and output_a_target_mpc >= 0.0 and model_weight > 0.0)
       if sm['selfdriveState'].experimentalMode:
-        output_a_target_e2e += support
+        output_a_target_e2e += support * model_weight
       elif support > 0.0:
         output_a_target_mpc = max(output_a_target_mpc, support)
 
@@ -675,6 +679,11 @@ class LongitudinalPlanner:
       accel_clip[1] = min(accel_clip[1], accel_ceiling(v_ego, personality))
     self.output_a_target = np.clip(output_a_target, accel_clip[0], accel_clip[1])
     self.prev_accel_clip = accel_clip
+    if self._is_preap and not reset_state and self._frame % 20 == 0:
+      cloudlog.info('NAP long speed=%.2f driver=%.2f effective=%.2f map=%s curve=%.2f model=%.3f mpc=%.3f support=%.3f output=%.3f source=%s',
+                    v_ego, driver_cruise_speed, v_cruise, curve_cap, curve_target,
+                    sm['modelV2'].action.desiredAcceleration, output_a_target_mpc,
+                    support * model_weight, self.output_a_target, self.mpc.source)
 
   def publish(self, sm, pm):
     plan_send = messaging.new_message('longitudinalPlan')

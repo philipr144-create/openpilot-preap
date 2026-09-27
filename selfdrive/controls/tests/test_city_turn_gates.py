@@ -64,12 +64,25 @@ class CityTurnGates(unittest.TestCase):
       if case == 'stopped': self.cs.vEgo = 0.
       if case == 'brake': self.cs.brakePressed = True
       if case == 'missing': self.model.orientation.z = []
-      for _ in range(10): self.assertEqual(self.tick(valid=case != 'invalid'), log.Desire.none)
+
+      desires = [
+        self.tick(valid=case != 'invalid')
+        for _ in range(10)
+      ]
+
+      if case == 'stopped':
+        # A genuine sustained corner may condition the model while stopped.
+        # Actuator-side ManualTurnCommit still requires vehicle motion.
+        self.assertEqual(desires[-1], log.Desire.turnLeft)
+      else:
+        self.assertTrue(all(d == log.Desire.none for d in desires))
+
       self.assertFalse(self.helper.manual_entry.blocked)
-      self.cs.vEgo = saved_speed; self.cs.brakePressed = False; self.model.orientation.z = saved_yaw
-      if case == "stopped":
-        # A sustained corner may pre-arm while stopped, but it cannot emit the
-        # turn desire until the vehicle begins moving.
+      self.cs.vEgo = saved_speed
+      self.cs.brakePressed = False
+      self.model.orientation.z = saved_yaw
+
+      if case == 'stopped':
         self.assertEqual(self.tick(), log.Desire.turnLeft)
       else:
         for _ in range(6): self.assertEqual(self.tick(), log.Desire.none)
@@ -106,7 +119,12 @@ class CityTurnGates(unittest.TestCase):
       self.model.orientation.z = [-v for v in self.model.orientation.z]
       self.model.action.desiredCurvature *= -1
       for _ in range(20): self.tick(direction=2)
-      self.assertEqual(self.helper.desire, log.Desire.turnRight if 0.3 < speed <= 25 * CV.MPH_TO_MS else log.Desire.none)
+      # At zero speed a sustained physical blinker may condition the model,
+      # while actuator-side steering remains motion-gated.
+      self.assertEqual(
+        self.helper.desire,
+        log.Desire.turnRight if 0.0 <= speed <= 25 * CV.MPH_TO_MS else log.Desire.none,
+      )
 
   def test_override_cancel_and_opposite_do_not_rearm_until_neutral(self):
     for field in ('steeringPressed', 'brakePressed', 'rightBlinker'):

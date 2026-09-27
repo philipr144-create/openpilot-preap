@@ -14,6 +14,7 @@ import time
 
 from openpilot.common.constants import CV
 from openpilot.common.params import Params
+from openpilot.common.swaglog import cloudlog
 
 
 DECISION_PATH = "/dev/shm/nap_navigation_decision.json"
@@ -45,6 +46,7 @@ class NavigationTurnCommit:
     self.enabled = False
     self.last_param_read = -1e9
     self.last_read = -1e9
+    self.last_diagnostic = -1e9
     self.decision = None
 
     self.active = False
@@ -111,6 +113,19 @@ class NavigationTurnCommit:
 
   def update(self, curvature, CS, lat_active, now=None, *, model=None, healthy=False, actual_curvature=0.0):
     now = time.monotonic() if now is None else now
+    output = self._update(curvature, CS, lat_active, now, model=model,
+                          healthy=healthy, actual_curvature=actual_curvature)
+    if lat_active and (CS.leftBlinker != CS.rightBlinker) and now - self.last_diagnostic >= 1.0:
+      self.last_diagnostic = now
+      decision = self.decision or {}
+      stamp = decision.get('received_mono')
+      age = now - stamp if type(stamp) in (int, float) else -1.0
+      cloudlog.info('NAP turn state=%s side=%s speed=%.2f model=%.5f request=%.5f age=%.3f source=%s blocked=%s',
+                    self.state, self.side, CS.vEgo, curvature, output, age,
+                    decision.get('source'), decision.get('manual_turn_blocked'))
+    return output
+
+  def _update(self, curvature, CS, lat_active, now, *, model, healthy, actual_curvature):
     self._refresh(now)
 
     self.active = False
@@ -154,7 +169,7 @@ class NavigationTurnCommit:
         and d.get("tap_signal_active") is False
         and d.get("synthetic_indicator_request") == "none"
         and d.get("model_evaluated") is True
-        and 0.0 <= CS.vEgo <= COMMIT_SPEED_MPH * CV.MPH_TO_MS
+        and -0.1 <= CS.vEgo <= COMMIT_SPEED_MPH * CV.MPH_TO_MS
         and str(CS.gearShifter) in ("drive", "low", "sport", "eco")
         and not CS.steeringPressed
         and not getattr(CS, "steeringDisengage", False)
@@ -173,35 +188,17 @@ class NavigationTurnCommit:
 
         if matching_signal and not (CS.leftBlindspot if direction == 1 else CS.rightBlindspot):
           signed_curvature = requested_sign * float(curvature)
-          genuine_corner = (
-            model is not None
-            and ManualTurnCommit.directional_entry_evidence(
-              model, requested_sign, float(CS.vEgo)
-            )
-          )
-
-          # Before the sustained commitment dwell completes, give a genuine
-          # model-recognized corner a small push in the physical blinker
-          # direction. If geometry is not yet sufficient, still veto an
-          # opposite command to straight; never invent a turn on a straight.
-          if signed_curvature < 0.0 or (
-            genuine_corner
-            and signed_curvature < ManualTurnCommit.EARLY_CURVATURE_FLOOR
-          ):
-            floor = (
-              min(
-                ManualTurnCommit.EARLY_CURVATURE_FLOOR,
-                ManualTurnCommit.MAX_ACCEL / max(float(CS.vEgo) ** 2, 0.09),
-              )
-              if genuine_corner else 0.0
-            )
-            output = requested_sign * max(0.0, signed_curvature, floor)
+          # A fresh physical hold owns direction even while the model is
+          # still waiting to choose a corner. This is only a veto: no positive
+          # blinker-side boost. Once the maneuver is handed back/cancelled,
+          # leave the model free to make its exit alignment corrections.
+          guard_allowed = (d.get('manual_turn_blocked') is not True and not self.manual.blocked)
+          if guard_allowed and signed_curvature < 0.0:
             self.active = True
-            self.state = "MANUAL BOOST" if floor > 0.0 else "MANUAL VETO"
+            self.state = "MANUAL VETO"
             self.side = "left" if direction == 1 else "right"
-            self.floor = floor
-            self.output_curvature = output
-            return output
+            self.output_curvature = 0.0
+            return 0.0
 
     if not self.enabled:
       self.driver_assisting = False
@@ -379,30 +376,13 @@ class ManualTurnCommit:
   # all succeed first.
   EARLY_CURVATURE_FLOOR = 0.008
 
-  # City Turns has two phases:
-  #   approach: light bias while rolling toward the corner
-  #   committed: stronger low-speed bias once the corner is near
-  #
-  # The physical blinker owns direction. Model geometry only proves that
-  # a genuine corner exists.
-  COMMIT_CURVATURE_FLOOR = 0.045
-  STOP_COMMIT_CURVATURE_FLOOR = 0.055
-
-  # If the model is already confidently turning toward the physical
-  # blinker, leave that request alone. Strong City Turn forcing is for
-  # weak, straight, or opposite-direction model behavior.
-  MODEL_AUTHORITY_CURVATURE = 0.035
-
-  # A rolling approach must travel a little before the stronger floor can
-  # take over, unless the corner is already very near.
-  ROLLING_FORCE_DISTANCE_M = 1.5
-
-  # Starting from a stop/very slow creep can commit much sooner.
+  # A short, geometry-derived seed assists initial selection only. Never
+  # impose the old fixed .045/.055 curvature after the model picks a path.
+  SEED_MAX_CURVATURE = 0.025
+  MODEL_AUTHORITY_CURVATURE = MIN_CURVATURE
   STOP_RELEASE_SPEED = 1.0
   STOP_EVIDENCE_SECONDS = 0.10
   STOP_EVIDENCE_FRAMES = 3
-
-  COMMIT_RAMP_SECONDS = 0.25
   STOP_COMMIT_RAMP_SECONDS = 0.20
 
   # Once the vehicle has made meaningful progress through the corner, stop
@@ -446,8 +426,7 @@ class ManualTurnCommit:
     self.distance = 0.0
     self.straight_since = None
     self.started_from_stop = False
-    self.strong_commit = False
-    self.strong_started = None
+    self.model_acquired = False
 
   def cancel(self):
     self.blocked = self.blocked or self.started is not None
@@ -763,8 +742,11 @@ class ManualTurnCommit:
         or type(direction) is not int or direction not in (1, 2)
         or (direction == 1) != bool(cs.leftBlinker)
         or decision.get('city_turns_enabled') is not True
-        or decision.get('source') != 'driver_desire_helper'
-        or decision.get('final_desire') != expected
+        # Physical ownership plus the independent near-corner dwell authorizes
+        # the seed; model selection must not be a prerequisite for correcting it.
+        or decision.get('source') not in ('none', 'driver_desire_helper')
+        or decision.get('final_desire') not in ('none', expected)
+        or decision.get('manual_turn_blocked') is True
         or decision.get('model_evaluated') is not True
         or decision.get('signal_owner') != 'driver'
         or decision.get('tap_signal_active') is not False
@@ -802,31 +784,6 @@ class ManualTurnCommit:
         or self.directional_entry_evidence(model, sign, cs.vEgo)
       )
 
-      if self.started is None:
-        # Sustained near-zero instantaneous curvature is allowed when
-        # strong future corner geometry proves the intersection.
-        #
-        # But a transition:
-        #   signed -> near-zero
-        # or:
-        #   near-zero -> signed
-        #
-        # is an interruption and must restart the qualification dwell.
-        entry_mode = (
-          "ambiguous"
-          if -self.MIN_CURVATURE < raw < self.MIN_CURVATURE
-          else "signed"
-        )
-
-        if (
-          self.entry_evidence_mode is not None
-          and entry_mode != self.entry_evidence_mode
-        ):
-          self.evidence_since = None
-          self.evidence_frames = 0
-
-        self.entry_evidence_mode = entry_mode
-
       if credible and entry_ok:
         if self.evidence_since is None:
           self.evidence_since = now
@@ -841,57 +798,10 @@ class ManualTurnCommit:
             self.started = now
             self.started_from_stop = starting_from_stop
 
-          # Rolling approaches begin gently. A stop-start turn can become
-          # committed immediately; a rolling turn becomes committed after
-          # some travel or when the corner is clearly right in front of us.
-          should_commit = (
-            self.started_from_stop
-            or self.distance >= self.ROLLING_FORCE_DISTANCE_M
-            or (
-              self.distance >= 0.5
-              and self.deep_turn_evidence(model, cs.vEgo)
-            )
-          )
-
-          if should_commit and not self.strong_commit:
-            self.strong_commit = True
-            self.strong_started = now
-
-          model_floor = max(0.0, 0.8 * raw)
-
-          base_floor = self.EARLY_CURVATURE_FLOOR
-
-          if self.strong_commit:
-            strong_target = (
-              self.STOP_COMMIT_CURVATURE_FLOOR
-              if self.started_from_stop
-              else self.COMMIT_CURVATURE_FLOOR
-            )
-
-            strong_ramp_seconds = (
-              self.STOP_COMMIT_RAMP_SECONDS
-              if self.started_from_stop
-              else self.COMMIT_RAMP_SECONDS
-            )
-
-            strong_progress = min(
-              1.0,
-              max(0.0, (now - self.strong_started) / strong_ramp_seconds),
-            )
-
-            base_floor += strong_progress * (
-              strong_target - self.EARLY_CURVATURE_FLOOR
-            )
-
-          requested_floor = max(
-            base_floor,
-            model_floor,
-          )
-
           self.floor = min(
-            CURVATURE_FLOOR_NEAR,
+            self.SEED_MAX_CURVATURE,
             self.MAX_ACCEL / cs.vEgo**2,
-            requested_floor,
+            self.geometry_floor(model, sign),
           )
       elif self.started is None:
         self.evidence_since = None
@@ -923,8 +833,9 @@ class ManualTurnCommit:
     if age > self.HOLD_SECONDS:
       self.cancel()
       return curvature
-    # Before measured turn initiation, loss of model agreement drops the floor.
-    if not credible and self.heading < math.radians(5):
+    # Loss of turn geometry releases the seed immediately. Final curvature
+    # limiting handles unwind; retaining a synthetic arc here delayed exits.
+    if not credible:
       self.cancel()
       return curvature
     ramp_seconds = (
@@ -940,13 +851,15 @@ class ManualTurnCommit:
 
     signed_curvature = sign * curvature
 
-    # Once the model is confidently producing the requested turn direction,
-    # don't tighten it merely to satisfy our force floor. City Turns primarily
-    # supplies authority while the model is weak, straight, or wrong-way.
-    if signed_curvature >= self.MODEL_AUTHORITY_CURVATURE:
-      return curvature
+    # Once the model supplies usable matching curvature, follow it through
+    # the whole unwind. Do not reapply a floor as its curvature falls at exit.
+    self.model_acquired = self.model_acquired or signed_curvature >= self.MODEL_AUTHORITY_CURVATURE
+    if self.model_acquired:
+      self.state = 'MANUAL MODEL PATH'
+      return sign * max(0.0, signed_curvature)
 
     return sign * max(signed_curvature, floor)
+
 
 
 class ManualTurnEntry:
@@ -1063,10 +976,16 @@ class ManualTurnEntry:
       self.last_evidence = now
       self.stop_armed = False
 
-    # At a full stop we may pre-arm internally, but do not send a turn
-    # desire to steering/model logic until the vehicle begins moving.
+    # A genuine corner that has completed the normal evidence dwell may
+    # condition the model while stopped. This does NOT grant actuator-side
+    # steering authority: ManualTurnCommit still requires vehicle motion
+    # before applying its curvature floor.
+    #
+    # Conditioning the model before rollout prevents the old behavior where
+    # the car rolled several feet into the intersection before the model was
+    # finally told which direction the physical blinker intended.
     if speed <= 0.3:
-      return False
+      return self.stop_armed
 
     if self.started is None:
       return False

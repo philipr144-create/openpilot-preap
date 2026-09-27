@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import patch
 from types import SimpleNamespace as N
 
-from openpilot.selfdrive.controls.lib.cruise_refinement import CruiseRefinement, CruiseRefinementConfig
+from openpilot.selfdrive.controls.lib.cruise_refinement import CruiseRefinement, CruiseRefinementConfig, model_support_weight
 from openpilot.selfdrive.controls.lib.tests import test_preap_accel_transitions as existing
 from openpilot.selfdrive.controls.lib import longitudinal_planner as lp
 
@@ -116,9 +116,54 @@ class TestPlannerRefinement(unittest.TestCase):
     with patch.object(lp,'map_curve_speed_cap',return_value=10.2) as cap:
       self.tick()
       self.assertEqual(self.mpc.update.call_args.args[1],10.2)
-      self.assertEqual(self.p.cruise_refinement.support,0.)
+      self.assertGreater(self.p.cruise_refinement.support,0.)
       cap.return_value=None
       self.tick()
       self.assertAlmostEqual(self.mpc.update.call_args.args[1],10.23)
       self.p.corner_assist.apply.side_effect=lambda a,*args:min(a,-.8)
       self.assertEqual(self.tick(),-.8)
+
+
+class TestModelSupport(unittest.TestCase):
+  def test_weak_coast_support_fades_and_preserves_planned_slowdown(self):
+    model=N(velocity=N(t=[0.,1.,2.,3.],x=[20.,19.9,19.8,19.7]))
+    self.assertAlmostEqual(model_support_weight(model,20.,-.05),.75)
+    self.assertAlmostEqual(model_support_weight(model,20.,-.1),.5)
+    self.assertEqual(model_support_weight(model,20.,-.2),0.)
+    model.velocity.x=[20.,19.5,18.,17.]
+    self.assertEqual(model_support_weight(model,20.,-.05),0.)
+    self.assertEqual(model_support_weight(N(),20.,-.05),0.)
+    model.velocity.x=[20.,20.,float('nan'),20.]
+    self.assertEqual(model_support_weight(model,20.,-.05),0.)
+
+  def test_loosening_map_cannot_keep_braking_below_actual_speed(self):
+    r=CruiseRefinement(.05)
+    r.curve_target(12.,25.,16.,True)
+    self.assertAlmostEqual(r.curve_target(20.,25.,16.,True),16.03)
+    self.assertEqual(r.curve_target(10.,25.,16.,True),10.)
+
+
+class TestMappedCoastSupport(unittest.TestCase):
+  setUp = existing.PlannerTransitions.setUp
+  tick = existing.PlannerTransitions.tick
+
+  def test_weak_coast_below_curve_target_gets_bounded_support(self):
+    self.p.nap_adaptive_accel=True
+    self.p.nap_map_driving_assist=True
+    self.p._params.get_bool.side_effect=lambda key:key in ('NAPAdaptiveAccel','NAPMapDrivingAssist')
+    self.sm['carState'].vEgo=17.
+    self.sm['carState'].vCruise=90.
+    self.sm['selfdriveState'].experimentalMode=True
+    self.sm['modelV2'].action.desiredAcceleration=-.05
+    self.sm['modelV2'].velocity=N(t=[0.,1.,2.,3.],x=[17.,16.9,16.8,16.7])
+    self.plan.return_value=(.4,False)
+    with patch.object(lp,'map_curve_speed_cap',return_value=20.):
+      for _ in range(80): output=self.tick()
+      self.assertGreater(output,0.)
+      self.assertLessEqual(output,.2)
+      self.assertEqual(self.mpc.update.call_args.args[1],20.)
+      self.sm['radarState'].leadOne.status=True
+      self.assertEqual(self.tick(),-.05)
+      self.sm['radarState'].leadOne.status=False
+      self.sm['modelV2'].action.desiredAcceleration=-.5
+      self.assertEqual(self.tick(),-.5)

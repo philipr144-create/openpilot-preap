@@ -31,8 +31,12 @@ class CruiseRefinement:
     if self.map_cap is None:
       self.map_cap = target
     else:
-      # Stale/missing map data must not keep asking for further slowdown.
-      previous = max(self.map_cap, speed) if cap is None else self.map_cap
+      # A loosening curve must not retain an obsolete target below actual
+      # speed and keep braking while the current corridor permits recovery.
+      # Tighter ceilings still win immediately; command jerk is bounded later.
+      previous = self.map_cap
+      if target > previous:
+        previous = max(previous, min(speed, target))
       self.map_cap = min(target, previous + self.config.map_release_accel * self.dt)
     return self.map_cap
 
@@ -53,3 +57,30 @@ class CruiseRefinement:
     wanted = min(self.config.support_max, self.config.speed_gain * error + self.config.falling_speed_gain * falling)
     self.support = min(wanted, self.support + self.config.support_rise_jerk * self.dt)
     return self.support
+
+
+def model_support_weight(model, speed, request):
+  """Allow bounded compensation for weak model coasting, never a planned stop.
+
+  Full support at zero demand fades continuously to zero at -0.2 m/s².
+  Negative requests additionally require a complete, nearly speed-holding
+  three-second prediction. Missing/invalid predictions preserve the request.
+  """
+  if request >= 0.0:
+    return 1.0
+  if request <= -0.2:
+    return 0.0
+  try:
+    times, speeds = list(model.velocity.t), list(model.velocity.x)
+    if (len(times) < 3 or len(times) != len(speeds)
+        or not all(math.isfinite(x) for x in times + speeds + [speed, request])
+        or any(b <= a for a, b in zip(times, times[1:]))
+        or times[0] > 0.1 or times[-1] < 3.0
+        or abs(speeds[0] - speed) > 2.0):
+      return 0.0
+    near = [v for t, v in zip(times, speeds) if 0.0 <= t <= 3.0]
+    if not near or min(near) < max(speed - 1.0, speeds[0] - 0.5):
+      return 0.0
+    return max(0.0, 1.0 + request / 0.2)
+  except (AttributeError, TypeError, ValueError):
+    return 0.0

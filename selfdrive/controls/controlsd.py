@@ -443,6 +443,40 @@ class Controls:
         else NAP_TURN_RATE_OUT
       )
 
+    # ----------------------------------------------------------
+    # NAP CITY TURN FINAL DIRECTION GUARD
+    #
+    # The physical City Turns blinker owns LEFT/RIGHT intent below
+    # the City Turns speed limit. navigation_turn_commit already
+    # suppresses contradictory model curvature early in the pipeline,
+    # but this second guard is intentionally immediately before
+    # clip_curvature() so later trajectory processing cannot reintroduce
+    # an opposite-direction target.
+    #
+    # IMPORTANT: this does not force a turn and does not bypass the
+    # normal curvature/rate limiter. An opposite request is changed to
+    # straight (0.0); clip_curvature() then safely unwinds delivered
+    # curvature before entering the requested direction.
+    # ----------------------------------------------------------
+    city_direction_guard = (
+      CC.latActive
+      and one_blinker
+      and nap_turn_speed_mph <= 25.0
+      and manual_city_intent
+      and self.navigation_turn_commit.active
+      and self.navigation_turn_commit.side == ('left' if CS.leftBlinker else 'right')
+      and not CS.steeringPressed
+      and not getattr(CS, "steeringDisengage", False)
+      and not CS.brakePressed
+      and CS.canValid
+    )
+
+    if city_direction_guard:
+      if CS.leftBlinker and new_desired_curvature > 0.0:
+        new_desired_curvature = 0.0
+      elif CS.rightBlinker and new_desired_curvature < 0.0:
+        new_desired_curvature = 0.0
+
     self.desired_curvature, curvature_limited = clip_curvature(
       CS.vEgo,
       self.desired_curvature,
