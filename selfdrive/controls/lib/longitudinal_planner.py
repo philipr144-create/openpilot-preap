@@ -459,9 +459,220 @@ class LongitudinalPlanner:
     self.phantom_brake_counter = 0
     self.output_should_stop = False
 
+    # NAP Experimental longitudinal arbitration.
+    #
+    # The Tesla drivetrain responds very clearly to transitions across
+    # zero acceleration: positive torque -> lift -> regen can feel like
+    # three separate pedal inputs. Keep model-only hesitation from
+    # repeatedly crossing that boundary while preserving immediate
+    # authority for verified leads, stops, speed ceilings and hard braking.
+    self.exp_model_brake_frames = 0
+    self.exp_long_state = "OFF"
+
     self.v_desired_trajectory = np.zeros(CONTROL_N)
     self.a_desired_trajectory = np.zeros(CONTROL_N)
     self.j_desired_trajectory = np.zeros(CONTROL_N)
+
+  def _experimental_longitudinal_arbiter(
+      self,
+      model_accel,
+      mpc_accel,
+      v_cruise,
+      driver_cruise_speed,
+      v_ego,
+      has_lead,
+      should_stop_e2e,
+      should_stop_mpc,
+      map_should_stop,
+      force_slow_decel,
+      allow_throttle,
+      gas_pressed,
+      reset_state,
+      model_braking_required=False,
+  ):
+    """Blend Experimental E2E behavior with stable Tesla speed control.
+
+    Safety / real constraints retain normal min(E2E, MPC) authority.
+
+    On an otherwise clear road:
+      * weak model hesitation becomes HOLD/RECOVER instead of immediate regen
+      * moderate model-only braking must persist before regen is introduced
+      * positive-to-negative transitions are slowed to avoid EV torque/regen
+        oscillation
+      * strong model braking remains available immediately
+    """
+
+    model_accel = float(model_accel)
+    mpc_accel = float(mpc_accel)
+    raw_target = min(model_accel, mpc_accel)
+
+    # Keep this feature out of low-speed / stop-and-go operation.
+    # Also fail back to stock Experimental arbitration whenever the
+    # driver or normal engagement lifecycle owns longitudinal control.
+    if (
+      reset_state
+      or gas_pressed
+      or not self.nap_adaptive_accel
+      or v_ego < 5.0
+    ):
+      self.exp_model_brake_frames = 0
+      self.exp_long_state = "PASS"
+      return raw_target
+
+    # A lower effective cruise target means navigation/map/curve logic has
+    # supplied a real speed constraint. MPC negative accel is also evidence
+    # of a real longitudinal reason to slow.
+    constrained_cruise = (
+      v_cruise < driver_cruise_speed - 0.30
+    )
+
+    verified_slowdown = (
+      model_braking_required
+      or has_lead
+      or should_stop_e2e
+      or should_stop_mpc
+      or map_should_stop
+      or force_slow_decel
+      or constrained_cruise
+      # A tiny MPC decel near cruise is normal speed regulation, not enough
+      # evidence to authorize a much stronger E2E regen request. MPC itself
+      # remains a hard ceiling below, so its requested decel is still honored.
+      or mpc_accel < -0.20
+    )
+
+    if verified_slowdown:
+      self.exp_model_brake_frames = 0
+      self.exp_long_state = "VERIFIED"
+      return raw_target
+
+    # If E2E is not asking for anything more restrictive than MPC,
+    # there is nothing to arbitrate.
+    if model_accel >= mpc_accel - 0.02:
+      self.exp_model_brake_frames = 0
+      self.exp_long_state = (
+        "RECOVER"
+        if v_cruise - v_ego > 0.30
+        else "HOLD"
+      )
+      return mpc_accel
+
+    # Strong E2E braking is intentionally not delayed. This is the escape
+    # hatch for a serious visual hazard that radar/MPC has not classified.
+    if model_accel <= -1.00:
+      self.exp_model_brake_frames = 20
+      self.exp_long_state = "E2E HARD"
+      return raw_target
+
+    # How far below the effective cruise target are we?
+    speed_error = max(
+      0.0,
+      float(v_cruise) - float(v_ego),
+    )
+
+    # Smooth recovery floor. This is deliberately modest for the Tesla:
+    # enough to stop speed sag, but well below the car's available torque.
+    recovery_floor = float(np.interp(
+      speed_error,
+      [0.0, 0.25, 0.75, 1.50, 2.50],
+      [0.0, 0.04, 0.14, 0.28, 0.45],
+    ))
+
+    # Never ask this helper for more positive accel than MPC permits.
+    # If modeld does not currently permit throttle, coast/hold rather
+    # than inventing positive torque here.
+    recovery_target = min(
+      max(mpc_accel, 0.0),
+      recovery_floor,
+    )
+
+    if not allow_throttle:
+      recovery_target = 0.0
+
+    # Moderate model-only braking must persist.
+    if model_accel < -0.12:
+      self.exp_model_brake_frames += 1
+    else:
+      self.exp_model_brake_frames = 0
+
+    frames = self.exp_model_brake_frames
+
+    if frames < 7:
+      # First ~0.35 s:
+      # acknowledge the model by removing most acceleration, but do not
+      # immediately cross into regen. If we're below cruise, retain only a
+      # tiny amount of recovery torque.
+      if model_accel < -0.12:
+        recovery_target = min(
+          recovery_target,
+          0.08,
+        )
+
+      target = max(
+        model_accel,
+        recovery_target,
+      )
+
+      self.exp_long_state = (
+        "RECOVER"
+        if speed_error > 0.30
+        else "HOLD"
+      )
+
+    elif frames < 20:
+      # ~0.35 to 1.0 s:
+      # persistent model caution may introduce gentle regen, but while we
+      # are materially under cruise prefer neutral acceleration instead of
+      # continuing to bleed road speed.
+      caution_floor = -0.12
+
+      if speed_error >= 0.75:
+        caution_floor = 0.0
+
+      target = max(
+        model_accel,
+        caution_floor,
+      )
+      self.exp_long_state = "E2E CAUTION"
+
+    else:
+      # More than ~1 s of continuous model braking is no longer treated as
+      # a one-frame hesitation. Permit the model request, but transition
+      # toward it smoothly below.
+      target = model_accel
+      self.exp_long_state = "E2E BRAKE"
+
+    # MPC always remains the positive-accel ceiling.
+    target = min(
+      target,
+      mpc_accel,
+    )
+
+    # The P85 makes small accel/regen sign changes very noticeable.
+    # Shape only UNVERIFIED model-only decel; verified constraints returned
+    # above without this comfort limiter.
+    if target < self.output_a_target:
+      down_rate = (
+        0.40
+        if frames < 20
+        else 0.80
+      )  # m/s^3
+
+      target = max(
+        target,
+        self.output_a_target - down_rate * self.dt,
+      )
+
+    # Small neutral zone prevents repeated + / - chatter around zero.
+    if (
+      abs(target) < 0.06
+      and abs(self.output_a_target) < 0.15
+    ):
+      target = 0.0
+
+    # Comfort shaping must never relax the MPC ceiling or add propulsion
+    # when model throttle permission is absent. Apply these AFTER smoothing.
+    return float(min(target, mpc_accel, 0.0 if not allow_throttle else target))
+
 
   @staticmethod
   def parse_model(model_msg):
@@ -653,13 +864,61 @@ class LongitudinalPlanner:
         output_a_target_mpc = max(output_a_target_mpc, support)
 
     if sm['selfdriveState'].experimentalMode:
-      output_a_target = min(output_a_target_e2e, output_a_target_mpc)
       self.output_should_stop = output_should_stop_e2e or output_should_stop_mpc
-      if output_a_target < output_a_target_mpc:
-        self.mpc.source = LongitudinalPlanSource.e2e
+
+      if self._is_preap:
+        has_lead = (
+          sm['radarState'].leadOne.status
+          or (
+            lead_two is not None
+            and lead_two.status
+          )
+        )
+
+        output_a_target = self._experimental_longitudinal_arbiter(
+          output_a_target_e2e,
+          output_a_target_mpc,
+          v_cruise,
+          driver_cruise_speed,
+          v_ego,
+          has_lead,
+          output_should_stop_e2e,
+          output_should_stop_mpc,
+          map_should_stop,
+          force_slow_decel,
+          self.allow_throttle,
+          sm['carState'].gasPressed,
+          reset_state,
+          # A missing lead is not evidence that visual braking is phantom.
+          # Only weak coasting with a validated speed-holding forecast may
+          # receive the existing bounded compensation.
+          model_braking_required=(sm['modelV2'].action.desiredAcceleration < 0.0
+                                  and model_weight <= 0.0),
+        )
+
+        if (
+          self.exp_long_state.startswith("E2E")
+          and output_a_target
+              < output_a_target_mpc - 0.01
+        ):
+          self.mpc.source = LongitudinalPlanSource.e2e
+
+      else:
+        output_a_target = min(
+          output_a_target_e2e,
+          output_a_target_mpc,
+        )
+
+        if output_a_target < output_a_target_mpc:
+          self.mpc.source = LongitudinalPlanSource.e2e
+
     else:
       output_a_target = output_a_target_mpc
       self.output_should_stop = output_should_stop_mpc
+
+      if self._is_preap:
+        self.exp_model_brake_frames = 0
+        self.exp_long_state = "OFF"
 
     # Release removes only map authority; model/MPC stop requests remain intact.
     self.output_should_stop = self.output_should_stop or map_should_stop
@@ -680,10 +939,11 @@ class LongitudinalPlanner:
     self.output_a_target = np.clip(output_a_target, accel_clip[0], accel_clip[1])
     self.prev_accel_clip = accel_clip
     if self._is_preap and not reset_state and self._frame % 20 == 0:
-      cloudlog.info('NAP long speed=%.2f driver=%.2f effective=%.2f map=%s curve=%.2f model=%.3f mpc=%.3f support=%.3f output=%.3f source=%s',
+      cloudlog.info('NAP long speed=%.2f driver=%.2f effective=%.2f map=%s curve=%.2f model=%.3f mpc=%.3f support=%.3f output=%.3f source=%s state=%s frames=%d',
                     v_ego, driver_cruise_speed, v_cruise, curve_cap, curve_target,
                     sm['modelV2'].action.desiredAcceleration, output_a_target_mpc,
-                    support * model_weight, self.output_a_target, self.mpc.source)
+                    support * model_weight, self.output_a_target, self.mpc.source,
+                    self.exp_long_state, self.exp_model_brake_frames)
 
   def publish(self, sm, pm):
     plan_send = messaging.new_message('longitudinalPlan')

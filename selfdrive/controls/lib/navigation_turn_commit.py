@@ -385,6 +385,15 @@ class ManualTurnCommit:
   STOP_EVIDENCE_FRAMES = 3
   STOP_COMMIT_RAMP_SECONDS = 0.20
 
+  # Intent-first stopped-intersection fallback.
+  #
+  # A classified physical blinker may pre-arm while fully stopped even if
+  # modeld still draws the intersection straight. Steering remains untouched
+  # at standstill. On rollout, provide only a small bounded seed and require
+  # the model/path geometry to acquire the maneuver shortly afterward.
+  STOP_INTENT_GRACE_SECONDS = 0.80
+  STOP_INTENT_MAX_DISTANCE_M = 4.0
+
   # Once the vehicle has made meaningful progress through the corner, stop
   # forcing the committed floor as soon as the near path and both curvature
   # requests agree that the road directly ahead is straight. Far-horizon
@@ -427,6 +436,13 @@ class ManualTurnCommit:
     self.straight_since = None
     self.started_from_stop = False
     self.model_acquired = False
+
+    # Intent-first stopped-intersection state.
+    self.intent_frame = None
+    self.stop_intent_since = None
+    self.stop_intent_frames = 0
+    self.stop_intent_armed = False
+    self.intent_seed_start = None
 
   def cancel(self):
     self.blocked = self.blocked or self.started is not None
@@ -756,12 +772,65 @@ class ManualTurnCommit:
         or str(cs.gearShifter) not in ('drive', 'low', 'sport', 'eco')
         or (cs.leftBlindspot if direction == 1 else cs.rightBlindspot)
         or not all(math.isfinite(v) for v in (cs.vEgo, curvature, actual_curvature))
-        or not 0.3 < cs.vEgo <= COMMIT_SPEED_MPH * CV.MPH_TO_MS):
+        or not -0.1 <= cs.vEgo <= COMMIT_SPEED_MPH * CV.MPH_TO_MS
+        # Standstill is valid only for pre-arming a new intersection turn.
+        # If an already-started maneuver falls back to essentially stopped,
+        # cancel it and latch blocked until the physical signal is cleared.
+        or (self.started is not None and cs.vEgo <= 0.3)):
       self.cancel()
       return curvature
     if self.direction and self.direction != direction:
       self.cancel()  # Opposite intent cancels; require neutral before rearming.
       return curvature
+
+    # ----------------------------------------------------------
+    # Intent-first stopped intersection.
+    #
+    # Direction comes from the classified physical full stalk. While stopped
+    # this ONLY arms intent; it never adds curvature. This breaks the old
+    # circular dependency where model geometry had to show the corner before
+    # we could tell the model/controls which way the driver intended to turn.
+    # ----------------------------------------------------------
+    if model_frame != self.intent_frame:
+      self.intent_frame = model_frame
+
+      if cs.vEgo <= 0.3 and self.started is None:
+        if self.stop_intent_since is None:
+          self.stop_intent_since = now
+        self.stop_intent_frames += 1
+
+        if (
+          self.stop_intent_frames >= 6
+          and now - self.stop_intent_since >= self.EVIDENCE_SECONDS
+        ):
+          self.stop_intent_armed = True
+
+      elif self.started is None and not self.stop_intent_armed:
+        self.stop_intent_since = None
+        self.stop_intent_frames = 0
+
+    # Absolutely no synthetic steering while sitting still.
+    if cs.vEgo <= 0.3:
+      self.state = (
+        'MANUAL STOP ARMED'
+        if self.stop_intent_armed
+        else 'MANUAL WAITING'
+      )
+      return curvature
+
+    # First movement after a valid stopped hold. Start with only the existing
+    # small early floor. Model geometry gets a short grace period to acquire.
+    if self.stop_intent_armed and self.started is None:
+      self.started = now
+      self.started_from_stop = True
+      self.intent_seed_start = now
+      self.stop_intent_armed = False
+      self.last_evidence = now
+      self.floor = min(
+        self.EARLY_CURVATURE_FLOOR,
+        self.MAX_ACCEL / max(cs.vEgo, 1.0) ** 2,
+      )
+
     evidence = self.turn_shape_evidence(
       model,
       sign,
@@ -771,6 +840,16 @@ class ManualTurnCommit:
       self.cancel()
       return curvature
     credible, remaining_heading, raw = evidence
+
+    if self.intent_seed_start is not None and credible:
+      self.floor = min(
+        self.SEED_MAX_CURVATURE,
+        self.MAX_ACCEL / cs.vEgo**2,
+        self.geometry_floor(model, sign),
+      )
+      self.last_evidence = now
+      self.intent_seed_start = None
+
     self.direction = direction
     self.side = 'left' if direction == 1 else 'right'
     if self.last_model_time is not None and now - self.last_model_time > 0.15:
@@ -829,6 +908,34 @@ class ManualTurnCommit:
             and now - self.straight_since >= 0.25)):
       self.cancel()
       return curvature
+    intent_seed_grace = (
+      self.intent_seed_start is not None
+      and not credible
+      and now - self.intent_seed_start <= self.STOP_INTENT_GRACE_SECONDS
+      and self.distance <= self.STOP_INTENT_MAX_DISTANCE_M
+    )
+
+    if intent_seed_grace:
+      ramp = min(
+        1.0,
+        (now - self.intent_seed_start) / self.STOP_COMMIT_RAMP_SECONDS,
+      )
+      seed = min(
+        self.EARLY_CURVATURE_FLOOR,
+        self.MAX_ACCEL / cs.vEgo**2,
+      ) * ramp
+
+      self.active = True
+      self.state = 'MANUAL STOP SEED'
+
+      signed_curvature = sign * curvature
+      return sign * max(0.0, signed_curvature, seed)
+
+    # The model never found the corner. Do not keep inventing a path.
+    if self.intent_seed_start is not None and not credible:
+      self.cancel()
+      return curvature
+
     age = now - self.last_evidence
     if age > self.HOLD_SECONDS:
       self.cancel()
@@ -884,6 +991,11 @@ class ManualTurnEntry:
     self.last_evidence = None
     self.stop_armed = False
 
+    # Intent-first stopped-intersection state.
+    self.stop_intent_since = None
+    self.stop_intent_frames = 0
+    self.started_from_stop = False
+
   def cancel(self):
     # An interrupted approach is not a completed/cancelled turn. Discard its
     # evidence and require a full fresh dwell, but permit early signaling.
@@ -919,7 +1031,7 @@ class ManualTurnEntry:
 
   def update(self, model, direction, speed, authorized, now):
     if (not authorized or self.blocked or not math.isfinite(speed)
-        or not 0.0 <= speed <= COMMIT_SPEED_MPH * CV.MPH_TO_MS
+        or not -0.1 <= speed <= COMMIT_SPEED_MPH * CV.MPH_TO_MS
         or self.direction not in (0, direction)):
       self.cancel()
       return False
@@ -947,11 +1059,37 @@ class ManualTurnEntry:
       self.frame, self.last_frame_time = frame, now
       credible, _, raw = evidence
 
-      # Once City Turns is active, loss of a genuine TURN SHAPE revokes it.
-      # The model's left/right prediction does not override the physical blinker.
+      # A classified full-stalk hold while stopped may establish intent
+      # before the model has drawn the corner. This authorizes model
+      # conditioning only; actuator steering still remains zero at standstill.
+      if speed <= 0.3 and self.started is None:
+        if self.stop_intent_since is None:
+          self.stop_intent_since = now
+        self.stop_intent_frames += 1
+
+        if (
+          self.stop_intent_frames >= 6
+          and now - self.stop_intent_since >= ManualTurnCommit.EVIDENCE_SECONDS
+        ):
+          self.stop_armed = True
+
+      elif self.started is None and not self.stop_armed:
+        self.stop_intent_since = None
+        self.stop_intent_frames = 0
+
+      # Normally loss of turn shape revokes City Turns immediately. A turn
+      # started from a complete stop receives a short acquisition grace period
+      # so modeld can react to the newly supplied turn desire.
       if self.started is not None and not credible:
-        self.cancel()
-        return False
+        stop_grace = (
+          self.started_from_stop
+          and now - self.started <= ManualTurnCommit.STOP_INTENT_GRACE_SECONDS
+        )
+        if not stop_grace:
+          self.cancel()
+          return False
+
+        self.last_evidence = now
 
       entry_ok = (
         self.started is not None
@@ -971,8 +1109,9 @@ class ManualTurnEntry:
       elif self.started is None:
         self.evidence_since = None
         self.frames = 0
-    if self.stop_armed and speed > 0.3 and credible:
+    if self.stop_armed and speed > 0.3:
       self.started = now
+      self.started_from_stop = True
       self.last_evidence = now
       self.stop_armed = False
 
