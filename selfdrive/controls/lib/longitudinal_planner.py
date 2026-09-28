@@ -455,6 +455,7 @@ class LongitudinalPlanner:
     self.a_desired = init_a
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
     self.prev_accel_clip = [ACCEL_MIN, ACCEL_MAX]
+    self.prev_turn_accel_max = ACCEL_MAX
     self.output_a_target = 0.0
     self.phantom_brake_counter = 0
     self.output_should_stop = False
@@ -587,6 +588,17 @@ class LongitudinalPlanner:
     steer_angle_without_offset = sm['carState'].steeringAngleDeg - sm['liveParameters'].angleOffsetDeg
     accel_clip = limit_accel_in_turns(v_ego, steer_angle_without_offset, accel_clip, self.CP)
 
+    _, _, _, _, throttle_prob = self.parse_model(sm['modelV2'])
+    was_allow_throttle = self.allow_throttle
+    # Don't clip at low speeds since throttle_prob doesn't account for creep.
+    self.allow_throttle = throttle_prob > ALLOW_THROTTLE_THRESHOLD or v_ego <= MIN_ALLOW_THROTTLE_SPEED
+    if self._is_preap and self.allow_throttle and not was_allow_throttle:
+      # The expired coast ceiling is not a turn limit. Restore the previous
+      # geometry/profile ceiling before smoothing; current geometry still
+      # bounds it below, and command/actuator rise limits remain in force.
+      self.prev_accel_clip[1] = self.prev_turn_accel_max
+    self.prev_turn_accel_max = accel_clip[1]
+
     # Smooth curve exit: restrict how fast the acceleration cap can increase.
     # 0.025 per frame (at 20Hz) = 0.5 m/s^2 per second.
     if not reset_state and accel_clip[1] > self.prev_accel_clip[1]:
@@ -600,9 +612,6 @@ class LongitudinalPlanner:
 
     # Prevent divergence, smooth in current v_ego
     self.v_desired_filter.x = max(0.0, self.v_desired_filter.update(v_ego))
-    _, _, _, _, throttle_prob = self.parse_model(sm['modelV2'])
-    # Don't clip at low speeds since throttle_prob doesn't account for creep
-    self.allow_throttle = throttle_prob > ALLOW_THROTTLE_THRESHOLD or v_ego <= MIN_ALLOW_THROTTLE_SPEED
 
     if not self.allow_throttle:
       clipped_accel_coast = max(accel_coast, accel_clip[0])
@@ -794,11 +803,12 @@ class LongitudinalPlanner:
     self.output_a_target = np.clip(output_a_target, accel_clip[0], accel_clip[1])
     self.prev_accel_clip = accel_clip
     if self._is_preap and not reset_state and self._frame % 20 == 0:
-      cloudlog.info('NAP long speed=%.2f driver=%.2f effective=%.2f map=%s curve=%.2f model=%.3f mpc=%.3f support=%.3f output=%.3f source=%s state=%s frames=%d',
+      cloudlog.info('NAP long speed=%.2f driver=%.2f effective=%.2f map=%s curve=%.2f model=%.3f mpc=%.3f support=%.3f output=%.3f source=%s state=%s frames=%d throttle=%.3f allow=%d cap=%.3f turncap=%.3f',
                     v_ego, driver_cruise_speed, v_cruise, curve_cap, curve_target,
                     sm['modelV2'].action.desiredAcceleration, output_a_target_mpc,
                     support * model_weight, self.output_a_target, self.mpc.source,
-                    self.exp_long_state, self.exp_model_brake_frames)
+                    self.exp_long_state, self.exp_model_brake_frames, throttle_prob,
+                    self.allow_throttle, accel_clip[1], self.prev_turn_accel_max)
 
   def publish(self, sm, pm):
     plan_send = messaging.new_message('longitudinalPlan')
