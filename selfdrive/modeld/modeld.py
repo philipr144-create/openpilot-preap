@@ -190,10 +190,6 @@ class ModelState:
 
   def run(self, bufs: dict[str, VisionBuf], transforms: dict[str, np.ndarray],
                 inputs: dict[str, np.ndarray], prepare_only: bool) -> dict[str, np.ndarray] | None:
-    # Model decides when action is completed, so desire input is just a pulse triggered on rising edge
-    inputs['desire_pulse'][0] = 0
-    new_desire = np.where(inputs['desire_pulse'] - self.prev_desire > .99, inputs['desire_pulse'], 0)
-    self.prev_desire[:] = inputs['desire_pulse']
     if self.update_imgs is None:
       for key in bufs.keys():
         w, h = bufs[key].width, bufs[key].height
@@ -220,6 +216,13 @@ class ModelState:
 
     if prepare_only:
       return None
+
+    # Consume intent only on an evaluated frame. A dropped camera frame must
+    # not swallow the rising edge before it reaches the policy input queue.
+    # Model decides when action is completed, so desire input is just a pulse triggered on rising edge
+    inputs['desire_pulse'][0] = 0
+    new_desire = np.where(inputs['desire_pulse'] - self.prev_desire > .99, inputs['desire_pulse'], 0)
+    self.prev_desire[:] = inputs['desire_pulse']
 
     self.vision_output = self.vision_run(**vision_inputs).contiguous().realize().uop.base.buffer.numpy().flatten()
     vision_outputs_dict = self.parser.parse_vision_outputs(self.slice_outputs(self.vision_output, self.vision_output_slices))
