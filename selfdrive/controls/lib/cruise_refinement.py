@@ -79,7 +79,11 @@ def model_support_weight(model, speed, request):
         or abs(speeds[0] - speed) > 2.0):
       return 0.0
     near = [v for t, v in zip(times, speeds) if 0.0 <= t <= 3.0]
-    if not near or min(near) < max(speed - 1.0, speeds[0] - 0.5):
+    # Model velocity has its own ego-speed estimate. Compare its predicted
+    # change with that estimate; a bounded initial offset from wheel speed
+    # is not a predicted deceleration. The 2 m/s plausibility gate above
+    # still rejects unreliable estimates.
+    if not near or min(near) < speeds[0] - 0.5:
       return 0.0
     return max(0.0, 1.0 + request / 0.2)
   except (AttributeError, TypeError, ValueError):
