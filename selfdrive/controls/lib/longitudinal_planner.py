@@ -42,6 +42,19 @@ def _get_preap_follow_limit(v_ego):
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 ALLOW_THROTTLE_THRESHOLD = 0.4
 MIN_ALLOW_THROTTLE_SPEED = 2.5
+
+# Pre-AP Experimental longitudinal V2.
+#
+# gasPressProb is useful model context, but it is not the same thing as an
+# acceleration limit. Keep the raw model permission separate from the actual
+# geometry/profile MPC envelope.
+PREAP_EXP_RECOVERY_MIN_ERROR = 0.50       # m/s below effective cruise
+PREAP_EXP_MODEL_DRIVE_MIN = 0.05          # explicit positive E2E request
+PREAP_EXP_MPC_DRIVE_MIN = 0.05            # cruise/MPC must also want propulsion
+PREAP_EXP_DISAGREEMENT_CAP = 0.25         # bounded recovery when signals disagree
+PREAP_EXP_COAST_ENTRY_RATE = 0.40         # m/s^3, gentle neutral -> coast entry
+PREAP_EXP_NEUTRAL_TARGET = 0.05            # suppress tiny +/- accel chatter
+PREAP_EXP_NEUTRAL_PREVIOUS = 0.12
 MAPPED_STOP_APPROACH_SPEED = 5.0 * CV.MPH_TO_MS
 NAV_SNAPSHOT = '/dev/shm/nap_navigation_desire.json'
 STOP_SETTINGS = '/data/nap_turn_settings.json'
@@ -438,7 +451,13 @@ class LongitudinalPlanner:
     self.mpc = LongitudinalMpc(dt=dt)
     self.fcw = False
     self.dt = dt
+    # Raw model gas/throttle probability permission.
     self.allow_throttle = True
+
+    # Effective Pre-AP propulsion decision. In Experimental V2 this may remain
+    # True during a narrowly validated recovery even if raw gasPressProb is low.
+    self.propulsion_allowed = True
+
     self.corner_assist = CornerAssist()
     self.map_stop = MapStop()
     self.cruise_refinement = CruiseRefinement(dt)
@@ -490,44 +509,201 @@ class LongitudinalPlanner:
       gas_pressed,
       reset_state,
       model_braking_required=False,
+      coast_accel=-0.30,
   ):
-    """One continuous recovery policy; lead/stop/braking constraints win.
+    """Tesla-aware Experimental longitudinal arbitration.
 
-    The caller validates weak model coasting against the model's relative
-    speed forecast. Do not turn that permission into periodic regen merely
-    because an arbitrary number of frames has passed.
+    Keep three concepts separate:
+
+      * MPC / geometry acceleration authority
+      * desired vehicle acceleration
+      * model propulsion permission
+
+    Verified braking, leads, stops and real speed ceilings retain immediate
+    authority. A low gasPressProb alone is treated as a coast preference, not
+    as a fake negative MPC acceleration ceiling.
+
+    If modeld explicitly requests positive acceleration, MPC agrees, the car is
+    materially below the effective cruise target, and no braking constraint is
+    active, permit only a small bounded recovery even when gasPressProb is low.
     """
-    model_accel, mpc_accel = float(model_accel), float(mpc_accel)
+
+    model_accel = float(model_accel)
+    mpc_accel = float(mpc_accel)
+    coast_accel = float(coast_accel)
     raw_target = min(model_accel, mpc_accel)
+
+    # Retained for existing diagnostics/tests. V2 intentionally has no
+    # persistence timer which can turn weak hesitation into braking.
     self.exp_model_brake_frames = 0
-    if reset_state or gas_pressed or not self.nap_adaptive_accel or v_ego < 5.0:
+    self.propulsion_allowed = bool(allow_throttle)
+
+    # Preserve the existing pass-through behavior when Adaptive Accel is not
+    # the owner, at low speed, on driver gas, or outside active longitudinal
+    # control. Legacy no-throttle clipping remains outside this arbiter for
+    # those modes.
+    if (
+      reset_state
+      or gas_pressed
+      or not self.nap_adaptive_accel
+      or v_ego < 5.0
+    ):
       self.exp_long_state = "PASS"
       return raw_target
 
-    # MPC enforces the effective target, including map/curve ceilings. A
-    # ceiling above current speed is not itself a reason to keep braking.
-    approaching_ceiling = (v_cruise < driver_cruise_speed - 0.30
-                           and v_ego >= v_cruise - 0.30)
-    if (model_braking_required or has_lead or should_stop_e2e or should_stop_mpc
-        or map_should_stop or force_slow_decel or approaching_ceiling
-        or mpc_accel < -0.20 or model_accel <= -1.0):
+    speed_error = max(
+      0.0,
+      float(v_cruise) - float(v_ego),
+    )
+
+    # A lowered map/navigation/curve target becomes a braking reason only once
+    # the car is actually approaching that effective target.
+    approaching_ceiling = (
+      v_cruise < driver_cruise_speed - 0.30
+      and v_ego >= v_cruise - 0.30
+    )
+
+    verified_slowdown = (
+      model_braking_required
+      or has_lead
+      or should_stop_e2e
+      or should_stop_mpc
+      or map_should_stop
+      or force_slow_decel
+      or approaching_ceiling
+      or mpc_accel < -0.20
+      or model_accel <= -1.0
+    )
+
+    # Raw low throttle probability must never manufacture positive propulsion
+    # while a real longitudinal constraint exists. Negative verified requests
+    # retain immediate authority.
+    if verified_slowdown:
       self.exp_long_state = "VERIFIED"
-      return raw_target
 
-    speed_error = max(0.0, float(v_cruise) - float(v_ego))
-    # Retain the existing bounded recovery envelope, without adding a second
-    # acceleration bias or resetting its command history on source changes.
-    recovery = float(np.interp(speed_error,
-                               [0.0, 0.25, 0.75, 1.50, 2.50],
-                               [0.0, 0.04, 0.14, 0.28, 0.45]))
-    target = min(mpc_accel, max(model_accel, recovery if allow_throttle else 0.0))
-    self.exp_long_state = "RECOVER" if speed_error > 0.30 else "HOLD"
+      if raw_target <= 0.0 or allow_throttle:
+        self.propulsion_allowed = bool(allow_throttle)
+        return raw_target
 
-    # Smooth only unconstrained reductions in propulsion. Stronger visual
-    # braking and real constraints returned above without a comfort delay.
-    target = max(target, self.output_a_target - 0.40 * self.dt)
-    # Enforce ceilings AFTER shaping; smoothing cannot add disallowed torque.
-    return float(min(target, mpc_accel, 0.0 if not allow_throttle else target))
+      # The unusual case where a constraint is active but both accel sources
+      # are still positive: remove added acceleration instead of inventing a
+      # stronger brake request.
+      self.propulsion_allowed = False
+      target = min(raw_target, coast_accel)
+
+      # Do not jump directly from positive drive into regen for a weak/raw
+      # permission transition. Reach neutral immediately, then enter coast at
+      # the existing comfort rate on subsequent planner frames.
+      target = max(
+        target,
+        self.output_a_target - PREAP_EXP_COAST_ENTRY_RATE * self.dt,
+      )
+
+      return float(min(0.0, target))
+
+    # Existing bounded cruise-recovery envelope.
+    recovery = float(np.interp(
+      speed_error,
+      [0.0, 0.25, 0.75, 1.50, 2.50],
+      [0.0, 0.04, 0.14, 0.28, 0.45],
+    ))
+
+    # --------------------------------------------------------------
+    # Model-signal disagreement recovery
+    # --------------------------------------------------------------
+    #
+    # gasPressProb can be below threshold at the same instant that the model's
+    # explicit desiredAcceleration is positive. Do not let that metadata bit
+    # force natural coast when:
+    #
+    #   * model acceleration is explicitly positive,
+    #   * MPC also permits acceleration,
+    #   * the car is materially below the effective target, and
+    #   * no lead/stop/curve/braking constraint above is active.
+    #
+    # This is deliberately capped well below the normal accel envelope.
+    disagreement_recovery = (
+      not allow_throttle
+      and speed_error >= PREAP_EXP_RECOVERY_MIN_ERROR
+      and model_accel > PREAP_EXP_MODEL_DRIVE_MIN
+      and mpc_accel > PREAP_EXP_MPC_DRIVE_MIN
+    )
+
+    if disagreement_recovery:
+      self.propulsion_allowed = True
+      self.exp_long_state = "RECOVER_LIMITED"
+
+      target = min(
+        mpc_accel,
+        max(model_accel, recovery),
+        PREAP_EXP_DISAGREEMENT_CAP,
+      )
+
+      # The normal Pre-AP positive-accel limiter below still controls the
+      # actual rise rate. This cap is only arbitration authority.
+      return float(target)
+
+    # --------------------------------------------------------------
+    # Normal raw-permission path
+    # --------------------------------------------------------------
+
+    if allow_throttle:
+      self.propulsion_allowed = True
+      target = min(
+        mpc_accel,
+        max(model_accel, recovery),
+      )
+
+      self.exp_long_state = (
+        "RECOVER"
+        if speed_error > 0.30
+        else "HOLD"
+      )
+
+      # Smooth only unverified reductions in propulsion. Real braking returned
+      # above immediately.
+      target = max(
+        target,
+        self.output_a_target - PREAP_EXP_COAST_ENTRY_RATE * self.dt,
+      )
+
+      # MPC remains the hard acceleration ceiling after comfort shaping.
+      target = min(target, mpc_accel)
+
+      # The P85 makes tiny drive/coast/regen sign changes unusually obvious.
+      # Neutralize only small unverified chatter; never mask real braking.
+      if (
+        abs(target) < PREAP_EXP_NEUTRAL_TARGET
+        and abs(self.output_a_target) < PREAP_EXP_NEUTRAL_PREVIOUS
+      ):
+        target = 0.0
+
+      return float(target)
+
+    # --------------------------------------------------------------
+    # Genuine model coast request
+    # --------------------------------------------------------------
+    #
+    # No verified brake exists and the positive-model disagreement exception
+    # did not qualify. Move toward the calibrated natural-coast acceleration,
+    # but do not jump directly from positive drive torque into regen.
+    self.propulsion_allowed = False
+    self.exp_long_state = "COAST"
+
+    target = min(
+      raw_target,
+      coast_accel,
+    )
+
+    target = max(
+      target,
+      self.output_a_target - PREAP_EXP_COAST_ENTRY_RATE * self.dt,
+    )
+
+    # Raw no-throttle permission may remove positive vehicle acceleration, but
+    # it may not itself create a positive recovery command. The next frames
+    # then enter calibrated coast progressively.
+    return float(min(0.0, target))
 
 
   @staticmethod
@@ -561,8 +737,12 @@ class LongitudinalPlanner:
 
     if len(sm['carControl'].orientationNED) == 3:
       accel_coast = get_coast_accel(sm['carControl'].orientationNED[1])
+      experimental_coast_accel = accel_coast
     else:
+      # Preserve legacy behavior for Normal mode while giving Experimental V2
+      # a sane no-pitch fallback instead of treating ACCEL_MAX as "coast".
       accel_coast = ACCEL_MAX
+      experimental_coast_accel = get_coast_accel(0.0)
 
     v_ego = sm['carState'].vEgo
     v_cruise_kph = min(sm['carState'].vCruise, V_CRUISE_MAX)
@@ -590,13 +770,27 @@ class LongitudinalPlanner:
 
     _, _, _, _, throttle_prob = self.parse_model(sm['modelV2'])
     was_allow_throttle = self.allow_throttle
-    # Don't clip at low speeds since throttle_prob doesn't account for creep.
+
+    # Raw model permission remains available for diagnostics and legacy modes.
+    # Experimental V2 computes a separate effective propulsion decision later.
     self.allow_throttle = throttle_prob > ALLOW_THROTTLE_THRESHOLD or v_ego <= MIN_ALLOW_THROTTLE_SPEED
-    if self._is_preap and self.allow_throttle and not was_allow_throttle:
-      # The expired coast ceiling is not a turn limit. Restore the previous
-      # geometry/profile ceiling before smoothing; current geometry still
-      # bounds it below, and command/actuator rise limits remain in force.
-      self.prev_accel_clip[1] = self.prev_turn_accel_max
+    self.propulsion_allowed = self.allow_throttle
+
+    experimental_preap = (
+      self._is_preap
+      and sm['selfdriveState'].experimentalMode
+      and self.nap_adaptive_accel
+    )
+
+    if self._is_preap:
+      if experimental_preap and self.prev_accel_clip[1] < 0.0:
+        # Entering V2 must not inherit a legacy temporary coast ceiling.
+        self.prev_accel_clip[1] = self.prev_turn_accel_max
+      elif not experimental_preap and self.allow_throttle and not was_allow_throttle:
+        # Legacy/Normal path: retain the 817a fix. An expired coast ceiling is
+        # not a turn limit, so restore the remembered geometry/profile ceiling.
+        self.prev_accel_clip[1] = self.prev_turn_accel_max
+
     self.prev_turn_accel_max = accel_clip[1]
 
     # Smooth curve exit: restrict how fast the acceleration cap can increase.
@@ -613,7 +807,9 @@ class LongitudinalPlanner:
     # Prevent divergence, smooth in current v_ego
     self.v_desired_filter.x = max(0.0, self.v_desired_filter.update(v_ego))
 
-    if not self.allow_throttle:
+    if not self.allow_throttle and not experimental_preap:
+      # Legacy/Normal behavior. Experimental V2 applies coast after arbitration
+      # so this temporary model permission cannot contaminate MPC/turn limits.
       clipped_accel_coast = max(accel_coast, accel_clip[0])
       clipped_accel_coast_interp = np.interp(v_ego, [MIN_ALLOW_THROTTLE_SPEED, MIN_ALLOW_THROTTLE_SPEED*2], [accel_clip[1], clipped_accel_coast])
       accel_clip[1] = min(accel_clip[1], clipped_accel_coast_interp)
@@ -753,6 +949,7 @@ class LongitudinalPlanner:
           self.allow_throttle,
           sm['carState'].gasPressed,
           reset_state,
+          coast_accel=max(experimental_coast_accel, accel_clip[0]),
           # A missing lead is not evidence that visual braking is phantom.
           # Only weak coasting with a validated speed-holding forecast may
           # receive the existing bounded compensation.
@@ -761,7 +958,7 @@ class LongitudinalPlanner:
         )
 
         if (
-          self.exp_long_state in ("VERIFIED", "PASS")
+          self.exp_long_state in ("VERIFIED", "PASS", "COAST")
           and output_a_target
               < output_a_target_mpc - 0.01
         ):
@@ -803,12 +1000,13 @@ class LongitudinalPlanner:
     self.output_a_target = np.clip(output_a_target, accel_clip[0], accel_clip[1])
     self.prev_accel_clip = accel_clip
     if self._is_preap and not reset_state and self._frame % 20 == 0:
-      cloudlog.info('NAP long speed=%.2f driver=%.2f effective=%.2f map=%s curve=%.2f model=%.3f mpc=%.3f support=%.3f output=%.3f source=%s state=%s frames=%d throttle=%.3f allow=%d cap=%.3f turncap=%.3f',
+      cloudlog.info('NAP long speed=%.2f driver=%.2f effective=%.2f map=%s curve=%.2f model=%.3f mpc=%.3f support=%.3f output=%.3f source=%s state=%s frames=%d throttle=%.3f raw_allow=%d prop=%d cap=%.3f turncap=%.3f',
                     v_ego, driver_cruise_speed, v_cruise, curve_cap, curve_target,
                     sm['modelV2'].action.desiredAcceleration, output_a_target_mpc,
                     support * model_weight, self.output_a_target, self.mpc.source,
                     self.exp_long_state, self.exp_model_brake_frames, throttle_prob,
-                    self.allow_throttle, accel_clip[1], self.prev_turn_accel_max)
+                    self.allow_throttle, self.propulsion_allowed,
+                    accel_clip[1], self.prev_turn_accel_max)
 
   def publish(self, sm, pm):
     plan_send = messaging.new_message('longitudinalPlan')
@@ -831,6 +1029,6 @@ class LongitudinalPlanner:
     longitudinalPlan.aTarget = float(self.output_a_target)
     longitudinalPlan.shouldStop = bool(self.output_should_stop)
     longitudinalPlan.allowBrake = True
-    longitudinalPlan.allowThrottle = bool(self.allow_throttle)
+    longitudinalPlan.allowThrottle = bool(self.propulsion_allowed)
 
     pm.send('longitudinalPlan', plan_send)
