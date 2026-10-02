@@ -45,15 +45,15 @@ LOW_SPEED_TURN_SMOOTH_END_MPH = 25.0
 LOW_SPEED_TURN_EARLY_CURVATURE = 0.008
 LOW_SPEED_TURN_RATE_START = 0.020    # Smooth initial steering buildup
 LOW_SPEED_TURN_RATE_MAX = 0.060      # Entry steering rate
-LOW_SPEED_TURN_RATE_CATCHUP = 0.090  # Restore model curvature after entry
+LOW_SPEED_TURN_RATE_CATCHUP = 0.130  # Restore model curvature after entry
 LOW_SPEED_TURN_RATE_OUT = 0.060
 
-LOW_SPEED_TURN_RAMP_SECONDS = 0.70
+LOW_SPEED_TURN_RAMP_SECONDS = 0.35
 
 # Widen only the entrance. Restore full model curvature at the apex so the
 # vehicle can complete its rotation into the destination lane.
-LOW_SPEED_TURN_ENTRY_MIN_SECONDS = 0.35
-LOW_SPEED_TURN_ENTRY_MAX_SECONDS = 0.75
+LOW_SPEED_TURN_ENTRY_MIN_SECONDS = 0.25
+LOW_SPEED_TURN_ENTRY_MAX_SECONDS = 0.55
 LOW_SPEED_TURN_ENTRY_RELEASE_CURVATURE = 0.060
 
 

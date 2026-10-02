@@ -360,9 +360,9 @@ class ManualTurnCommit:
   # Manual blinker intent still requires matching model geometry, but
   # react to the beginning of the turn rather than waiting until the
   # model has already committed deeply into the intersection.
-  EVIDENCE_SECONDS = 0.30
-  RAMP_SECONDS = 0.35
-  HOLD_SECONDS = 0.60
+  EVIDENCE_SECONDS = 0.20
+  RAMP_SECONDS = 0.25
+  HOLD_SECONDS = 0.75
   MAX_SECONDS = 8.0
   MAX_ACCEL = 1.5
   MIN_CURVATURE = 0.004
@@ -372,23 +372,23 @@ class ManualTurnCommit:
   # model's immediate desiredCurvature is still nearly straight.
   #
   # This is NOT a blinker-only steering command: entry_evidence(),
-  # direction, ownership, freshness, health and the 0.30 s dwell must
+  # direction, ownership, freshness, health and the 0.20 s dwell must
   # all succeed first.
-  EARLY_CURVATURE_FLOOR = 0.008
+  EARLY_CURVATURE_FLOOR = 0.010
 
   # A short, geometry-derived seed assists initial selection only. Never
   # impose the old fixed .045/.055 curvature after the model picks a path.
-  SEED_MAX_CURVATURE = 0.025
+  SEED_MAX_CURVATURE = 0.032
   MODEL_AUTHORITY_CURVATURE = MIN_CURVATURE
   STOP_RELEASE_SPEED = 1.0
   STOP_EVIDENCE_SECONDS = 0.10
   STOP_EVIDENCE_FRAMES = 3
-  STOP_COMMIT_RAMP_SECONDS = 0.20
+  STOP_COMMIT_RAMP_SECONDS = 0.15
 
   # Intent-first stopped-intersection fallback.
   #
-  # A classified physical blinker may pre-arm while fully stopped even if
-  # modeld still draws the intersection straight. Steering remains untouched
+  # A classified physical blinker may pre-arm while fully stopped only when
+  # matching near-path geometry establishes a turn. Steering remains untouched
   # at standstill. On rollout, provide only a small bounded seed and require
   # the model/path geometry to acquire the maneuver shortly afterward.
   STOP_INTENT_GRACE_SECONDS = 0.80
@@ -607,16 +607,16 @@ class ManualTurnCommit:
 
     Correct-direction model curvature qualifies normally.
 
-    Near-zero/ambiguous instantaneous curvature interrupts the initial dwell.
+    Near-zero instantaneous curvature can qualify from matching future geometry.
 
     Strong opposite instantaneous curvature may still be overridden when the
     future scene contains substantial real corner geometry. This is the case
     City Turns is specifically intended to repair.
     """
-    evidence = ManualTurnCommit.turn_shape_evidence(
+    evidence = ManualTurnCommit.path_evidence(
       model,
       sign,
-      continuing=False,
+      require_raw_direction=False,
     )
     if evidence is None or not evidence[0]:
       return False
@@ -624,25 +624,25 @@ class ManualTurnCommit:
     credible, heading, raw = evidence
 
     try:
-      near = min(COMMIT_DISTANCE_M, max(3.0, speed * 1.5))
+      near = min(COMMIT_DISTANCE_M, max(4.0, speed * 2.0))
 
       start_x = float(model.position.x[0])
       start_y = float(model.position.y[0])
       start_yaw = float(model.orientation.z[0])
 
       offsets = [
-        abs(float(y) - start_y)
+        sign * (float(y) - start_y)
         for t, y in zip(model.position.t, model.position.y)
         if 0.5 <= float(t) <= 3.0
       ]
       max_offset = max(offsets) if offsets else 0.0
 
-      developing_turn = max_offset >= 1.2
+      developing_turn = max_offset >= 0.8
 
       near_heading = any(
-        0 < float(t) <= 1.0
+        0 < float(t) <= 1.4
         and 0 < float(x) - start_x <= near
-        and abs(float(yaw) - start_yaw) >= math.radians(2.5)
+        and sign * (float(yaw) - start_yaw) >= math.radians(1.7)
         for t, x, yaw in zip(
           model.position.t,
           model.position.x,
@@ -664,8 +664,8 @@ class ManualTurnCommit:
       # Strongly opposite instantaneous prediction can be overridden, but
       # only when the future scene contains substantial corner geometry.
       return (
-        heading >= math.radians(15)
-        and max_offset >= 1.5
+        heading >= math.radians(12)
+        and max_offset >= 1.0
       )
 
     except (AttributeError, TypeError, ValueError, OverflowError):
@@ -711,7 +711,7 @@ class ManualTurnCommit:
     )
     if evidence is None or not evidence[0]:
       return False
-    near = min(COMMIT_DISTANCE_M, max(3.0, speed * 1.5))
+    near = min(COMMIT_DISTANCE_M, max(4.0, speed * 2.0))
 
     # Starting a NEW manual turn needs more than a small residual bend.
     # A turn that is already unwinding can still have a few degrees of nearby
@@ -719,14 +719,14 @@ class ManualTurnCommit:
     # 3-second path as evidence that an actual corner is developing ahead.
     start_y = model.position.y[0]
     developing_turn = any(
-      0.5 <= t <= 3.0 and sign * (y - start_y) >= 1.2
+      0.5 <= t <= 3.0 and sign * (y - start_y) >= 0.8
       for t, y in zip(model.position.t, model.position.y)
     )
 
     near_heading = any(
-      0 < t <= 1.0
+      0 < t <= 1.4
       and 0 < x - model.position.x[0] <= near
-      and sign * (yaw - model.orientation.z[0]) >= math.radians(2.5)
+      and sign * (yaw - model.orientation.z[0]) >= math.radians(1.7)
       for t, x, yaw in zip(model.position.t, model.position.x, model.orientation.z)
     )
 
@@ -787,14 +787,15 @@ class ManualTurnCommit:
     # Intent-first stopped intersection.
     #
     # Direction comes from the classified physical full stalk. While stopped
-    # this ONLY arms intent; it never adds curvature. This breaks the old
-    # circular dependency where model geometry had to show the corner before
-    # we could tell the model/controls which way the driver intended to turn.
+    # matching near-path geometry is required; arming adds no curvature.
+    # Model conditioning may establish intent earlier, but actuator seeding
+    # always needs independent geometry on the physical blinker side.
     # ----------------------------------------------------------
     if model_frame != self.intent_frame:
       self.intent_frame = model_frame
 
-      if cs.vEgo <= 0.3 and self.started is None:
+      if (cs.vEgo <= 0.3 and self.started is None
+          and self.directional_entry_evidence(model, sign, cs.vEgo)):
         if self.stop_intent_since is None:
           self.stop_intent_since = now
         self.stop_intent_frames += 1
@@ -805,9 +806,10 @@ class ManualTurnCommit:
         ):
           self.stop_intent_armed = True
 
-      elif self.started is None and not self.stop_intent_armed:
+      elif self.started is None:
         self.stop_intent_since = None
         self.stop_intent_frames = 0
+        self.stop_intent_armed = False
 
     # Absolutely no synthetic steering while sitting still.
     if cs.vEgo <= 0.3:
@@ -820,7 +822,8 @@ class ManualTurnCommit:
 
     # First movement after a valid stopped hold. Start with only the existing
     # small early floor. Model geometry gets a short grace period to acquire.
-    if self.stop_intent_armed and self.started is None:
+    if (self.stop_intent_armed and self.started is None
+        and self.directional_entry_evidence(model, sign, cs.vEgo)):
       self.started = now
       self.started_from_stop = True
       self.intent_seed_start = now
@@ -831,9 +834,10 @@ class ManualTurnCommit:
         self.MAX_ACCEL / max(cs.vEgo, 1.0) ** 2,
       )
 
-    evidence = self.turn_shape_evidence(
+    evidence = self.path_evidence(
       model,
       sign,
+      require_raw_direction=False,
       continuing=self.started is not None,
     )
     if evidence is None:
@@ -869,7 +873,7 @@ class ManualTurnCommit:
         self.last_evidence = now
         self.evidence_frames += 1
         starting_from_stop = cs.vEgo <= self.STOP_RELEASE_SPEED
-        required_frames = self.STOP_EVIDENCE_FRAMES if starting_from_stop else 6
+        required_frames = self.STOP_EVIDENCE_FRAMES if starting_from_stop else 5
         required_seconds = self.STOP_EVIDENCE_SECONDS if starting_from_stop else self.EVIDENCE_SECONDS
 
         if self.evidence_frames >= required_frames and now - self.evidence_since >= required_seconds:
@@ -1101,7 +1105,7 @@ class ManualTurnEntry:
         if self.evidence_since is None:
           self.evidence_since = now
         self.frames += 1
-        if self.frames >= 6 and now - self.evidence_since >= ManualTurnCommit.EVIDENCE_SECONDS:
+        if self.frames >= 5 and now - self.evidence_since >= ManualTurnCommit.EVIDENCE_SECONDS:
           if speed <= 0.3:
             self.stop_armed = True
           elif self.started is None:
