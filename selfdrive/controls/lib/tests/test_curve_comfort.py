@@ -80,7 +80,10 @@ class CurveComfortTests(unittest.TestCase):
         path.write_text(json.dumps(state))
         cap=map_curve_speed_cap(path,now=101.,v_ego=20.)
         self.assertGreater(cap,last);last=cap
-        self.assertEqual(map_curve_speed_cap(path,now=101.,v_ego=10.),cap)
+        # A fresh absolute curve target is speed-independent. With an aged
+        # snapshot, different speed means different travel toward that curve.
+        fresh_cap=map_curve_speed_cap(path,now=100.,v_ego=20.)
+        self.assertEqual(map_curve_speed_cap(path,now=100.,v_ego=10.),fresh_cap)
         self.assertIsNone(map_curve_speed_cap(path,now=103.,v_ego=20.))
         state['enabled']=False;path.write_text(json.dumps(state))
         self.assertIsNone(map_curve_speed_cap(path,now=101.,v_ego=20.))

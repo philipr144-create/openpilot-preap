@@ -211,6 +211,10 @@ def map_curve_speed_cap(path=MAP_CONTEXT_SNAPSHOT, now=None, v_ego=None):
       )
 
     caps = []
+    # Map geometry is published at 2 Hz. Propagate its brief age at the
+    # measured speed so approach/exit distances evolve at planner rate.
+    # This does not extend the snapshot lifetime or lower its quality gates.
+    traveled = v_ego * (now - received)
 
     # ------------------------------------------------------------
     # CURVE CORRIDOR
@@ -263,7 +267,7 @@ def map_curve_speed_cap(path=MAP_CONTEXT_SNAPSHOT, now=None, v_ego=None):
         # Keep an active mapped curve authoritative through its exit.
         # start <= 0 < end means the vehicle is inside the curve, so its
         # independently calculated target remains the longitudinal ceiling.
-        end <= 0.0
+        end - traveled <= 0.0
         or start > 450.0
         or end <= start
         or end > 500.0
@@ -280,7 +284,7 @@ def map_curve_speed_cap(path=MAP_CONTEXT_SNAPSHOT, now=None, v_ego=None):
       # feel unnecessarily slow before ordinary road curves.
       distance = max(
         0.0,
-        start - 6.0,
+        start - traveled - 6.0,
       )
 
       comfort_decel = 1.2
@@ -1000,13 +1004,15 @@ class LongitudinalPlanner:
     self.output_a_target = np.clip(output_a_target, accel_clip[0], accel_clip[1])
     self.prev_accel_clip = accel_clip
     if self._is_preap and not reset_state and self._frame % 20 == 0:
-      cloudlog.info('NAP long speed=%.2f driver=%.2f effective=%.2f map=%s curve=%.2f model=%.3f mpc=%.3f support=%.3f output=%.3f source=%s state=%s frames=%d throttle=%.3f raw_allow=%d prop=%d cap=%.3f turncap=%.3f',
+      cloudlog.info('NAP long speed=%.2f driver=%.2f effective=%.2f map=%s curve=%.2f model=%.3f mpc=%.3f support=%.3f output=%.3f source=%s state=%s frames=%d throttle=%.3f raw_allow=%d prop=%d cap=%.3f turncap=%.3f model_stop=%d mpc_stop=%d final_stop=%d long_off=%d corner=%s',
                     v_ego, driver_cruise_speed, v_cruise, curve_cap, curve_target,
                     sm['modelV2'].action.desiredAcceleration, output_a_target_mpc,
                     support * model_weight, self.output_a_target, self.mpc.source,
                     self.exp_long_state, self.exp_model_brake_frames, throttle_prob,
                     self.allow_throttle, self.propulsion_allowed,
-                    accel_clip[1], self.prev_turn_accel_max)
+                    accel_clip[1], self.prev_turn_accel_max,
+                    output_should_stop_e2e, output_should_stop_mpc, self.output_should_stop,
+                    reset_state, self.corner_assist.reason)
 
   def publish(self, sm, pm):
     plan_send = messaging.new_message('longitudinalPlan')
