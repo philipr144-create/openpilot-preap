@@ -88,3 +88,36 @@ def model_support_weight(model, speed, request):
     return max(0.0, 1.0 + request / 0.2)
   except (AttributeError, TypeError, ValueError):
     return 0.0
+
+
+def mild_transition_forecast(model, speed):
+  """Recognize a complete, nearly steady-speed forecast, never a planned stop."""
+  try:
+    ts, vs = list(model.velocity.t), list(model.velocity.x)
+    if (len(ts) < 3 or len(ts) != len(vs)
+        or not all(math.isfinite(x) for x in ts + vs + [speed])
+        or any(b <= a for a, b in zip(ts, ts[1:]))
+        or ts[0] > .1 or ts[-1] < 9.9 or speed < 8.
+        or abs(vs[0] - speed) > 2. or model.action.shouldStop):
+      return False
+    near = [v for t, v in zip(ts, vs) if t <= 6.]
+    return min(near) >= vs[0] - .75 and min(vs) >= max(5., vs[0] - 1.5)
+  except (AttributeError, TypeError, ValueError):
+    return False
+
+
+def shape_mild_transition(request, previous, dt, eligible):
+  """Smooth only independently validated model/cruise disagreements.
+
+  The caller bypasses this for any lead, stop, binding speed ceiling, MPC
+  braking, or stronger model braking. Negative entry removes added propulsion
+  immediately, then ramps regen. Recovery releases regen before adding drive.
+  """
+  if not eligible or not all(math.isfinite(v) for v in (request, previous, dt)) or not 0 < dt <= .1:
+    return request
+  step = .4 * dt
+  if request < previous:
+    return max(request, min(0., previous) - step)
+  if previous < 0.:
+    return min(request, previous + step)
+  return request

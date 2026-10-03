@@ -19,7 +19,7 @@ from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.corner_assist import CornerAssist
-from openpilot.selfdrive.controls.lib.cruise_refinement import CruiseRefinement, model_support_weight
+from openpilot.selfdrive.controls.lib.cruise_refinement import CruiseRefinement, model_support_weight, mild_transition_forecast, shape_mild_transition
 from openpilot.selfdrive.controls.lib.map_stop import MapStop, read_snapshot
 
 A_CRUISE_MAX_VALS = [1.2, 1.0, 1.0, 0.8]
@@ -514,6 +514,7 @@ class LongitudinalPlanner:
       reset_state,
       model_braking_required=False,
       coast_accel=-0.30,
+      recovery_weight=1.0,
   ):
     """Tesla-aware Experimental longitudinal arbitration.
 
@@ -612,6 +613,10 @@ class LongitudinalPlanner:
       [0.0, 0.04, 0.14, 0.28, 0.45],
     ))
 
+    # Fade optional recovery with model confidence instead of jumping from
+    # positive cruise support to braking at the weak-coast threshold.
+    recovery_weight = float(np.clip(recovery_weight, 0.0, 1.0))
+
     # --------------------------------------------------------------
     # Model-signal disagreement recovery
     # --------------------------------------------------------------
@@ -655,7 +660,7 @@ class LongitudinalPlanner:
       self.propulsion_allowed = True
       target = min(
         mpc_accel,
-        max(model_accel, recovery),
+        model_accel + recovery_weight * max(0.0, recovery - model_accel),
       )
 
       self.exp_long_state = (
@@ -954,6 +959,7 @@ class LongitudinalPlanner:
           sm['carState'].gasPressed,
           reset_state,
           coast_accel=max(experimental_coast_accel, accel_clip[0]),
+          recovery_weight=model_weight,
           # A missing lead is not evidence that visual braking is phantom.
           # Only weak coasting with a validated speed-holding forecast may
           # receive the existing bounded compensation.
@@ -984,6 +990,25 @@ class LongitudinalPlanner:
       if self._is_preap:
         self.exp_model_brake_frames = 0
         self.exp_long_state = "OFF"
+
+    # Comfort shaping is confined to mild, speed-holding model disagreement.
+    # The MPC must still permit propulsion, with headroom below the effective
+    # speed ceiling. A real curve/lead/stop slowdown bypasses it immediately.
+    mild_comfort = (
+      experimental_preap and not reset_state and not sm['carState'].gasPressed
+      and not has_lead and not self.output_should_stop and not map_should_stop
+      and not force_slow_decel and v_ego < v_cruise - .5
+      and output_a_target_mpc >= 0.0
+      and sm['modelV2'].action.desiredAcceleration > -.6
+      and output_a_target > -.6
+      and mild_transition_forecast(sm['modelV2'], v_ego)
+    )
+    shaped = shape_mild_transition(output_a_target, self.output_a_target, self.dt, mild_comfort)
+    if shaped != output_a_target:
+      self.exp_long_state = 'MODEL_COMFORT'
+    output_a_target = min(shaped, output_a_target_mpc) if mild_comfort else shaped
+    if experimental_preap and output_a_target < output_a_target_mpc - .01:
+      self.mpc.source = LongitudinalPlanSource.e2e
 
     # Release removes only map authority; model/MPC stop requests remain intact.
     self.output_should_stop = self.output_should_stop or map_should_stop
