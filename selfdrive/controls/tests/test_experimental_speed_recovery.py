@@ -8,6 +8,7 @@ from openpilot.selfdrive.controls.tests import test_intent_and_accel_constraints
 from openpilot.selfdrive.controls.lib.tests import test_preap_accel_transitions as transitions
 from openpilot.selfdrive.controls.lib import longitudinal_planner as lp
 from cereal import log
+from openpilot.selfdrive.controls.lib.acceleration_handoff import handoff_acceleration
 
 class RelativeForecast(unittest.TestCase):
   def test_recorded_57_mph_coasting_forecasts(self):
@@ -45,9 +46,11 @@ class PersistentRecovery(unittest.TestCase):
   def test_alternating_coast_and_accel_remain_continuous(self):
     previous=.4
     for i in range(100):
-      value=self.call(model_accel=-.18 if i%2 else .03,mpc_accel=.5,v_ego=18.5)
+      selected=self.call(model_accel=-.18 if i%2 else .03,mpc_accel=.5,v_ego=18.5)
+      value=handoff_acceleration(selected,previous,self.p.dt,1,-2.5,.5)
       self.assertGreaterEqual(value,0.)
-      self.assertLessEqual(abs(value-previous),.4*self.p.dt+1e-9)
+      self.assertGreaterEqual(value-previous,-.6*self.p.dt-1e-9)
+      self.assertLessEqual(value-previous,.4*self.p.dt+1e-9)
       self.p.output_a_target=previous=value
 
   def test_recovery_below_curve_cap_keeps_effective_ceiling(self):
@@ -94,7 +97,7 @@ class PlannerSource(unittest.TestCase):
       # Preserve the model request as a lower bound, with MPC as ceiling.
       self.assertGreaterEqual(value,min(0.,self.sm["modelV2"].action.desiredAcceleration))
       self.assertLessEqual(value,.8)
-      self.assertLessEqual(value-previous,.015+1e-9)
+      self.assertLessEqual(value-previous,(.03 if previous<0. else .015)+1e-9)
       previous=value
     # A newly detected lead revokes the optional recovery immediately.
     self.sm['radarState'].leadOne.status=True

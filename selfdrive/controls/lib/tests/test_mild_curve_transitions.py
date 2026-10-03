@@ -56,12 +56,13 @@ class PlannerComfort(unittest.TestCase):
   def test_recorded_brake_switch_ramps_and_recovery_crosses_zero(self):
     self.prepare()
     self.sm['modelV2'].action.desiredAcceleration=-.3
-    self.assertAlmostEqual(self.tick(),-.02)
-    self.assertEqual(self.p.exp_long_state,'MODEL_COMFORT')
-    for _ in range(20):value=self.tick()
+    previous=self.p.output_a_target
+    self.assertAlmostEqual(self.tick(),previous-.02)
+    self.assertEqual(self.p.handoff_reason,'ORDINARY')
+    for _ in range(50):value=self.tick()
     self.assertAlmostEqual(value,-.3)
     self.sm['modelV2'].action.desiredAcceleration=.4
-    self.assertAlmostEqual(self.tick(),-.28)
+    self.assertAlmostEqual(self.tick(),-.27)
     for _ in range(30):value=self.tick()
     self.assertGreater(value,0.)
     self.assertLessEqual(value,.5)

@@ -168,4 +168,9 @@ class TestMappedCoastSupport(unittest.TestCase):
       self.assertEqual(self.tick(),-.05)
       self.sm['radarState'].leadOne.status=False
       self.sm['modelV2'].action.desiredAcceleration=-.5
-      self.assertEqual(self.tick(),-.5)
+      # A steady forecast permits a continuous ordinary deceleration ramp.
+      self.assertAlmostEqual(self.tick(),-.07)
+      for _ in range(30): output=self.tick()
+      self.assertEqual(output,-.5)
+      self.sm['modelV2'].action.desiredAcceleration=-1.5
+      self.assertEqual(self.tick(),-1.5)

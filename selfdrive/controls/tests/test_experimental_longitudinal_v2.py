@@ -79,16 +79,18 @@ class ExperimentalLongitudinalV2(unittest.TestCase):
 
     self.assertGreater(previous, 0.0)
 
-    # A raw permission loss with no real braking reason reaches neutral first.
+    # A coast preference removes carried propulsion smoothly, without
+    # resetting acceleration history at the raw permission transition.
     self.set_permission(False)
     self.sm['modelV2'].action.desiredAcceleration = 0.0
 
     first = self.tick()
     second = self.tick()
 
-    self.assertEqual(first, 0.0)
-    self.assertLess(second, 0.0)
-    self.assertGreaterEqual(second, -0.021)
+    self.assertAlmostEqual(first, previous-.02)
+    self.assertAlmostEqual(second, first-.02)
+    for _ in range(50): value=self.tick()
+    self.assertAlmostEqual(value,-.3)
     self.assertFalse(self.p.propulsion_allowed)
 
   def test_real_braking_interrupts_recovery_immediately(self):

@@ -19,8 +19,9 @@ from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.corner_assist import CornerAssist
-from openpilot.selfdrive.controls.lib.cruise_refinement import CruiseRefinement, model_support_weight, mild_transition_forecast, shape_mild_transition
+from openpilot.selfdrive.controls.lib.cruise_refinement import CruiseRefinement, model_support_weight
 from openpilot.selfdrive.controls.lib.map_stop import MapStop, read_snapshot
+from openpilot.selfdrive.controls.lib.acceleration_handoff import braking_priority, handoff_acceleration
 
 A_CRUISE_MAX_VALS = [1.2, 1.0, 1.0, 0.8]
 A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]
@@ -596,14 +597,6 @@ class LongitudinalPlanner:
       self.propulsion_allowed = False
       target = min(raw_target, coast_accel)
 
-      # Do not jump directly from positive drive into regen for a weak/raw
-      # permission transition. Reach neutral immediately, then enter coast at
-      # the existing comfort rate on subsequent planner frames.
-      target = max(
-        target,
-        self.output_a_target - PREAP_EXP_COAST_ENTRY_RATE * self.dt,
-      )
-
       return float(min(0.0, target))
 
     # Existing bounded cruise-recovery envelope.
@@ -669,16 +662,6 @@ class LongitudinalPlanner:
         else "HOLD"
       )
 
-      # Smooth only unverified reductions in propulsion. Real braking returned
-      # above immediately.
-      target = max(
-        target,
-        self.output_a_target - PREAP_EXP_COAST_ENTRY_RATE * self.dt,
-      )
-
-      # MPC remains the hard acceleration ceiling after comfort shaping.
-      target = min(target, mpc_accel)
-
       # The P85 makes tiny drive/coast/regen sign changes unusually obvious.
       # Neutralize only small unverified chatter; never mask real braking.
       if (
@@ -704,14 +687,6 @@ class LongitudinalPlanner:
       coast_accel,
     )
 
-    target = max(
-      target,
-      self.output_a_target - PREAP_EXP_COAST_ENTRY_RATE * self.dt,
-    )
-
-    # Raw no-throttle permission may remove positive vehicle acceleration, but
-    # it may not itself create a positive recovery command. The next frames
-    # then enter calibrated coast progressively.
     return float(min(0.0, target))
 
 
@@ -991,45 +966,51 @@ class LongitudinalPlanner:
         self.exp_model_brake_frames = 0
         self.exp_long_state = "OFF"
 
-    # Comfort shaping is confined to mild, speed-holding model disagreement.
-    # The MPC must still permit propulsion, with headroom below the effective
-    # speed ceiling. A real curve/lead/stop slowdown bypasses it immediately.
-    mild_comfort = (
-      experimental_preap and not reset_state and not sm['carState'].gasPressed
-      and not has_lead and not self.output_should_stop and not map_should_stop
-      and not force_slow_decel and v_ego < v_cruise - .5
-      and output_a_target_mpc >= 0.0
-      and sm['modelV2'].action.desiredAcceleration > -.6
-      and output_a_target > -.6
-      and mild_transition_forecast(sm['modelV2'], v_ego)
-    )
-    shaped = shape_mild_transition(output_a_target, self.output_a_target, self.dt, mild_comfort)
-    if shaped != output_a_target:
-      self.exp_long_state = 'MODEL_COMFORT'
-    output_a_target = min(shaped, output_a_target_mpc) if mild_comfort else shaped
-    if experimental_preap and output_a_target < output_a_target_mpc - .01:
-      self.mpc.source = LongitudinalPlanSource.e2e
-
     # Release removes only map authority; model/MPC stop requests remain intact.
     self.output_should_stop = self.output_should_stop or map_should_stop
 
     # CornerAssist is the sole gate for NAP turn-related longitudinal
     # behavior. Do not apply the old blinker-only -2.5 m/s^2 override: it
     # ignored path geometry and remained active when Corner Assist was off.
+    corner_braking = False
     if self._is_preap:
+      before_corner = output_a_target
       output_a_target = self.corner_assist.apply(output_a_target, sm, self.CP, reset_state, accel_coast, driver_cruise_speed)
+
+      corner_braking = output_a_target < min(0., before_corner)
 
     for idx in range(2):
       accel_clip[idx] = np.clip(accel_clip[idx], self.prev_accel_clip[idx] - 0.05, self.prev_accel_clip[idx] + 0.05)
     if self._is_preap:
       previous = 0.0 if reset_state or sm["carState"].gasPressed else self.output_a_target
-      output_a_target = limit_positive_accel(output_a_target, previous, v_ego, personality, self.dt)
-      # A newly lowered profile/curve ceiling takes effect immediately.
+      # Physical/profile envelopes remain hard bounds. Request selection and
+      # CornerAssist are complete before this single source-independent handoff.
       accel_clip[1] = min(accel_clip[1], accel_ceiling(v_ego, personality))
+      self.handoff_request = float(output_a_target)
+      self.handoff_reason = 'OFF'
+      handoff_active = experimental_preap and not reset_state and not sm['carState'].gasPressed and v_ego >= 5.
+      if handoff_active:
+        self.handoff_reason = braking_priority(
+          sm['modelV2'], v_ego, output_a_target, output_a_target_mpc,
+          has_lead, self.output_should_stop, force_slow_decel,
+          v_cruise, driver_cruise_speed, self.corner_assist.target_speed,
+          valid=sm.all_checks(service_list=['carState', 'modelV2', 'radarState']))
+        if corner_braking:
+          self.handoff_reason = "CORNER_BRAKING"
+        output_a_target = handoff_acceleration(
+          output_a_target, previous, self.dt, personality,
+          accel_clip[0], accel_clip[1], self.handoff_reason)
+        # A coast preference may smoothly remove existing propulsion, but
+        # cannot create a new acceleration request. Report carried drive truthfully.
+        self.propulsion_allowed = self.propulsion_allowed or output_a_target > 0.
+      else:
+        output_a_target = limit_positive_accel(output_a_target, previous, v_ego, personality, self.dt)
+      if experimental_preap and self.handoff_request < output_a_target_mpc - .01:
+        self.mpc.source = LongitudinalPlanSource.e2e
     self.output_a_target = np.clip(output_a_target, accel_clip[0], accel_clip[1])
     self.prev_accel_clip = accel_clip
     if self._is_preap and not reset_state and self._frame % 20 == 0:
-      cloudlog.info('NAP long speed=%.2f driver=%.2f effective=%.2f map=%s curve=%.2f model=%.3f mpc=%.3f support=%.3f output=%.3f source=%s state=%s frames=%d throttle=%.3f raw_allow=%d prop=%d cap=%.3f turncap=%.3f model_stop=%d mpc_stop=%d final_stop=%d long_off=%d corner=%s',
+      cloudlog.info('NAP long speed=%.2f driver=%.2f effective=%.2f map=%s curve=%.2f model=%.3f mpc=%.3f support=%.3f output=%.3f source=%s state=%s frames=%d throttle=%.3f raw_allow=%d prop=%d cap=%.3f turncap=%.3f model_stop=%d mpc_stop=%d final_stop=%d long_off=%d corner=%s request=%.3f handoff=%s',
                     v_ego, driver_cruise_speed, v_cruise, curve_cap, curve_target,
                     sm['modelV2'].action.desiredAcceleration, output_a_target_mpc,
                     support * model_weight, self.output_a_target, self.mpc.source,
@@ -1037,7 +1018,7 @@ class LongitudinalPlanner:
                     self.allow_throttle, self.propulsion_allowed,
                     accel_clip[1], self.prev_turn_accel_max,
                     output_should_stop_e2e, output_should_stop_mpc, self.output_should_stop,
-                    reset_state, self.corner_assist.reason)
+                    reset_state, self.corner_assist.reason, self.handoff_request, self.handoff_reason)
 
   def publish(self, sm, pm):
     plan_send = messaging.new_message('longitudinalPlan')
