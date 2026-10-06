@@ -38,6 +38,7 @@ Built on the foundation of the [Tinkla project](https://tinkla.us/t/index) (whic
 - **Longitudinal control** — Comma Pedal interceptor with zero-torque learning, smooth engagement, and three driving profiles (Aggressive, Standard, Chill)
 - **Radar** — Bosch radar support with GTW emulation for lead car detection and adaptive following
 - **Driver monitoring** — Stock openpilot driver monitoring camera
+- **Air Ride web controls** — Front, rear, all-four, and individual-corner lowering with hold-to-pulse controls, factory restoration, error reset, and a 40 mph safety gate
 - **On-device settings** — Full NAP settings panel for pedal calibration, radar configuration, EPAS firmware management, and tuning
 
 ### Hardware Required
@@ -54,6 +55,47 @@ On your comma device, enter this URL during setup or in Software settings under 
 
 ```
 https://installer.comma.ai/NotAutopilot/openpilot/nap-release
+```
+
+## NAP Web Dashboard and Air Ride Control
+
+On the same network as the comma, open `http://<comma-address>:7070/` and select **Air Ride**. The Air Ride page is also available at `/airride`. The comma address can change when switching between Wi-Fi and a phone hotspot.
+
+### Lowering the suspension
+
+- Hold **Front Down** to pulse the two front corners, or **Rear Down** for the rear corners.
+- Hold **Pancake · All Four** to pulse all four corners.
+- Expand **Individual corners** for Driver Front, Passenger Front, Driver Rear, and Passenger Rear.
+- Selected corners vent in sequence, with the pulse cycle repeated approximately every 0.8 seconds. Release the button to stop venting.
+
+The controller uses the recovered Tesla Model S Continental EAS service and vent routines. Letting go stops venting while retaining manual service state; it does not run the factory restoration routine. Select **Restore Factory Control** to run the recovered restoration sequence and return leveling to the factory controller. This restores control rather than selecting a particular suspension height. The page currently provides lowering only; inflation and a target-height command have not been established.
+
+### Safety, recovery, and connection handling
+
+Manual lowering requires fresh, valid vehicle-speed data and a speed strictly **below 40 mph**. At 40 mph or above, or when speed data becomes unavailable, manual commands are blocked and the controller attempts to stop venting and restore factory control. Restoration errors remain visible; an attempted restoration is not treated as confirmed success.
+
+The page maintains a short hold heartbeat. Pointer release/cancel, leaving the button, losing page focus, and connection loss end the hold. An expired backend hold lease triggers factory restoration. Opening the page or checking status does not move the suspension.
+
+**Reset Error** becomes available once fault cleanup has finished, speed data is valid, and the car is below the speed limit. It clears the error without sending a suspension command, so a hold button can be used to retry. Resetting an error does not confirm factory restoration or remove the speed gate. The status API retains recent requests, responses, and timeouts for diagnosis.
+
+Air Ride shares the existing openpilot `sendcan` publisher. The Tesla Pre-AP Panda safety changes allow only the recovered diagnostic address, exact payloads, and bus; manual starts also require fresh speed data below 40 mph. Stop and restoration commands remain available for recovery above the speed limit. Off-road Panda `noOutput` mode blocks transmission, and Camp Mode does not override it. Existing dashboard navigation and watchdog behavior are retained.
+
+Moving-vehicle operation is still under investigation: parked commands have received positive responses, but reported errors/timeouts while moving below 40 mph have not yet been diagnosed. Reservoir isolation during corner dumping has not been verified.
+
+### MPP speed-limit updates and startup
+
+The existing `mpp_writer.py` reads the vehicle's raw MPP speed-limit signal and updates `/dev/shm/mpp_speed_limit`. In pedal longitudinal mode, the existing engagement logic uses changes in this file to update the cruise target when longitudinal control is enabled.
+
+Preserve the device's `launch_openpilot.sh` startup wrapper: it starts the MPP writer before launching openpilot. Starting `launch_chffrplus.sh` directly bypasses that writer and can leave automatic speed-limit updates reading a stale value. After a restart, verify that one MPP writer is running and that the shared file refreshes from CAN. The recent recovery confirmed a refreshing file matching the received 55 mph limit; automatic cruise-target changes still require driving confirmation.
+
+### Source and verification
+
+The web server is a separate repository at `/data/server`, linked into openpilot as `server`. Air Ride lives in `airride.py` and `airride_page.py`, with routes in `server_v21.py`; openpilot integration is in `selfdrive/car/card.py`. The Panda safety changes and tests live in the `opendbc_repo` submodule. Preserve all three repositories when backing up or reproducing this installation.
+
+The 27 Air Ride tests pass, covering controller behavior, the local endpoint, HTTP/navigation integration, and shared CAN publication. Run them from `/data/openpilot` using the `server` symlink path:
+
+```sh
+PYTHONPATH=/data/openpilot /usr/local/venv/bin/python -m unittest discover -s /data/openpilot/server/tests -q
 ```
 
 ## Branches
