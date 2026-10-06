@@ -88,11 +88,15 @@ The existing `mpp_writer.py` reads the vehicle's raw MPP speed-limit signal and 
 
 Preserve the device's `launch_openpilot.sh` startup wrapper: it starts the MPP writer before launching openpilot. Starting `launch_chffrplus.sh` directly bypasses that writer and can leave automatic speed-limit updates reading a stale value. After a restart, verify that one MPP writer is running and that the shared file refreshes from CAN. The recent recovery confirmed a refreshing file matching the received 55 mph limit; automatic cruise-target changes still require driving confirmation.
 
+### Continental EAS fault reading
+
+The backend supports a stationary, read-only DTC request: POST `{"action":"read_dtc"}` to `/api/airride`, then poll `/api/airride/status` for `dtc`. It opens the known extended diagnostic session, sends UDS `19 02 FF` (DTCs by status mask), handles ISO-TP multi-frame replies through card's existing CAN publisher, and returns to the default session. Results retain the raw DTC bytes and status masks. No fault-clearing request is permitted. This reader uses the installed openDBC UDS implementation; DTC descriptions for the Continental controller must be established separately. It requires valid stationary speed, active Tesla Pre-AP safety mode, and no active manual suspension operation.
+
 ### Source and verification
 
 The web server is a separate repository at `/data/server`, linked into openpilot as `server`. Air Ride lives in `airride.py` and `airride_page.py`, with routes in `server_v21.py`; openpilot integration is in `selfdrive/car/card.py`. The Panda safety changes and tests live in the `opendbc_repo` submodule. Preserve all three repositories when backing up or reproducing this installation.
 
-The 34 Air Ride tests pass, covering controller behavior, the local endpoint, HTTP/navigation integration, and shared CAN publication. Run them from `/data/openpilot` using the `server` symlink path:
+The 38 Air Ride tests pass, covering controller behavior, the local endpoint, HTTP/navigation integration, and shared CAN publication. Run them from `/data/openpilot` using the `server` symlink path:
 
 ```sh
 PYTHONPATH=/data/openpilot /usr/local/venv/bin/python -m unittest discover -s /data/openpilot/server/tests -q
