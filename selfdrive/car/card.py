@@ -150,6 +150,13 @@ class Car:
     self.params.put_nonblocking("CarParamsCache", cp_bytes)
     self.params.put_nonblocking("CarParamsPersistent", cp_bytes)
 
+    # Share card's sendcan publisher; never open a second publishing socket.
+    self.airride = None
+    self.airride_sends = []
+    if not REPLAY and os.path.exists('/data/nap_airride_enabled') and any(c.safetyModel == car.CarParams.SafetyModel.teslaPreap for c in self.CP.safetyConfigs):
+      from server.airride import Endpoint
+      self.airride = Endpoint()
+
     self.v_cruise_helper = VCruiseHelper(self.CP)
 
     self.is_metric = self.params.get_bool("IsMetric")
@@ -171,6 +178,14 @@ class Car:
     RD: structs.RadarDataT | None = self.RI.update(can_list)
 
     self.sm.update(0)
+
+    if self.airride is not None:
+      pandas = self.sm['pandaStates']
+      eas_active = self.sm.all_checks(['pandaStates']) and bool(pandas) and all(
+        p.safetyModel == car.CarParams.SafetyModel.teslaPreap for p in pandas)
+      self.airride_sends = self.airride.update(float(CS.vEgo), bool(CS.canValid),
+                                             [frame for _, frames in can_list for frame in frames],
+                                             active=eas_active)
 
     can_rcv_valid = len(can_strs) > 0
 
@@ -258,7 +273,13 @@ class Car:
       # send car controls over can
       now_nanos = self.can_log_mono_time if REPLAY else int(time.monotonic() * 1e9)
       self.last_actuators_output, can_sends = self.CI.apply(CC, now_nanos)
-      self.pm.send('sendcan', can_list_to_can_capnp(can_sends, msgtype='sendcan', valid=CS.canValid))
+      # One sendcan publication per cycle, preserving the existing socket owner.
+      valid = CS.canValid
+      if self.airride_sends:
+        can_sends = list(can_sends) + self.airride_sends if valid else self.airride_sends
+        valid = True  # Invalid vehicle data permits EAS cleanup only.
+        self.airride_sends = []
+      self.pm.send('sendcan', can_list_to_can_capnp(can_sends, msgtype='sendcan', valid=valid))
 
       self.CC_prev = CC
 
@@ -271,6 +292,11 @@ class Car:
                    self.sm.seen['onroadEvents'])
     if not self.CP.passive and initialized:
       self.controls_update(CS, self.sm['carControl'])
+
+    if self.airride_sends:
+      # Release is independent of engagement and carControl liveness.
+      self.pm.send('sendcan', can_list_to_can_capnp(self.airride_sends, msgtype='sendcan', valid=True))
+      self.airride_sends = []
 
     self.initialized_prev = initialized
     self.CS_prev = CS

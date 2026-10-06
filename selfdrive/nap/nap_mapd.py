@@ -32,7 +32,10 @@ CONTROL_HEADING_MAX_DEG = 35.0
 
 # Geometry processing
 RESAMPLE_M = 5.0
-CURVATURE_HALF_WINDOW_M = 15.0
+# Road-speed curvature should represent the sustained road arc rather
+# than individual OSM polyline vertices.  With 5 m resampling this
+# measures approximately 25 m on each side of the sample.
+CURVATURE_HALF_WINDOW_M = 25.0
 CURVE_START_K = 0.0025
 CURVE_KEEP_K = 0.0018
 MIN_CURVE_LENGTH_M = 20.0
@@ -924,16 +927,28 @@ def curve_events(samples, comfort=None):
     vals_sorted = sorted(vals)
 
     # Use a strong percentile instead of one maximum point.
-    # This suppresses isolated OSM geometry spikes.
-    idx = int(
-      clamp(
-        round(0.75 * (len(vals_sorted) - 1)),
-        0,
-        len(vals_sorted) - 1,
+    # Robust sustained-road curvature.
+    #
+    # The old controller used p75 directly.  On sparse OSM geometry
+    # that can let a relatively short polygonal/tight section dictate
+    # the speed of an entire bend.  The wider curvature window above
+    # already smooths individual vertices; p65 then represents the
+    # sustained upper half of the bend without simply using its peak.
+    #
+    # p50/p75 are retained in the published event for diagnostics.
+    def percentile(frac):
+      idx = int(
+        clamp(
+          round(frac * (len(vals_sorted) - 1)),
+          0,
+          len(vals_sorted) - 1,
+        )
       )
-    )
+      return vals_sorted[idx]
 
-    k = vals_sorted[idx]
+    k_p50 = percentile(0.50)
+    k = percentile(0.65)
+    k_p75 = percentile(0.75)
 
     if k <= 1e-6:
       continue
@@ -963,6 +978,19 @@ def curve_events(samples, comfort=None):
       ),
       "curvature": round(k, 6),
       "radius_m": round(1.0 / k, 1),
+      "curvature_p50": round(k_p50, 6),
+      "curvature_p65": round(k, 6),
+      "curvature_p75": round(k_p75, 6),
+      "radius_p50_m": (
+        round(1.0 / k_p50, 1)
+        if k_p50 > 1e-6
+        else None
+      ),
+      "radius_p75_m": (
+        round(1.0 / k_p75, 1)
+        if k_p75 > 1e-6
+        else None
+      ),
       "target_speed_mps": round(target, 2),
       "target_speed_mph": round(
         target * 2.236936, 1
@@ -980,17 +1008,25 @@ def build_control_curves(events):
 
   for e in events:
     start = e.get("start_distance_m")
+    end = e.get("end_distance_m")
     target = e.get("target_speed_mps")
 
     if (
       not isinstance(start, (int, float))
+      or not isinstance(end, (int, float))
       or not isinstance(target, (int, float))
       or not math.isfinite(start)
+      or not math.isfinite(end)
       or not math.isfinite(target)
     ):
       continue
 
-    if start < 10.0:
+    # Keep the curve authoritative until its physical exit passes the car.
+    #
+    # start <= 0 < end means we are currently inside the curve.  In that
+    # state the approach distance below becomes zero and the published cap
+    # is exactly the independently calculated curve target.
+    if end <= 0.0 or end <= start:
       continue
 
     # Geometry indicating > ~69 mph does not need to influence

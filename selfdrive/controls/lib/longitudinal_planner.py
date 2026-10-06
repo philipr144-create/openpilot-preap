@@ -43,6 +43,8 @@ def _get_preap_follow_limit(v_ego):
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 ALLOW_THROTTLE_THRESHOLD = 0.4
 MIN_ALLOW_THROTTLE_SPEED = 2.5
+PREAP_EXP_THROTTLE_OFF = 0.35
+PREAP_EXP_THROTTLE_ON = 0.45
 
 # Pre-AP Experimental longitudinal V2.
 #
@@ -462,6 +464,7 @@ class LongitudinalPlanner:
     # Effective Pre-AP propulsion decision. In Experimental V2 this may remain
     # True during a narrowly validated recovery even if raw gasPressProb is low.
     self.propulsion_allowed = True
+    self._exp_allow_throttle = None
 
     self.corner_assist = CornerAssist()
     self.map_stop = MapStop()
@@ -766,6 +769,20 @@ class LongitudinalPlanner:
       and self.nap_adaptive_accel
     )
 
+    # Keep the raw 0.4 permission for diagnostics and legacy behavior. Only
+    # active Experimental V2 gets hysteresis; braking authority below remains
+    # independent of this preference and bypasses the final comfort limiter.
+    effective_allow_throttle = self.allow_throttle
+    if experimental_preap and not reset_state and not sm['carState'].gasPressed and v_ego >= 5.0:
+      if self._exp_allow_throttle is None:
+        self._exp_allow_throttle = self.allow_throttle
+      else:
+        threshold = PREAP_EXP_THROTTLE_OFF if self._exp_allow_throttle else PREAP_EXP_THROTTLE_ON
+        self._exp_allow_throttle = math.isfinite(throttle_prob) and throttle_prob > threshold
+      effective_allow_throttle = self._exp_allow_throttle
+    else:
+      self._exp_allow_throttle = None
+
     if self._is_preap:
       if experimental_preap and self.prev_accel_clip[1] < 0.0:
         # Entering V2 must not inherit a legacy temporary coast ceiling.
@@ -898,7 +915,7 @@ class LongitudinalPlanner:
       support = self.cruise_refinement.speed_support(
         v_cruise, v_ego, sm['carState'].aEgo,
         self.nap_adaptive_accel and not reset_state and not sm['carState'].gasPressed
-        and self.allow_throttle and not force_slow_decel and v_ego >= 5.0
+        and effective_allow_throttle and not force_slow_decel and v_ego >= 5.0
         and not sm['radarState'].leadOne.status and not (lead_two is not None and lead_two.status)
         and not output_should_stop_mpc and not output_should_stop_e2e and not map_should_stop
         and output_a_target_mpc >= 0.0 and model_weight > 0.0)
@@ -930,7 +947,7 @@ class LongitudinalPlanner:
           output_should_stop_mpc,
           map_should_stop,
           force_slow_decel,
-          self.allow_throttle,
+          effective_allow_throttle,
           sm['carState'].gasPressed,
           reset_state,
           coast_accel=max(experimental_coast_accel, accel_clip[0]),
@@ -1010,7 +1027,7 @@ class LongitudinalPlanner:
     self.output_a_target = np.clip(output_a_target, accel_clip[0], accel_clip[1])
     self.prev_accel_clip = accel_clip
     if self._is_preap and not reset_state and self._frame % 20 == 0:
-      cloudlog.info('NAP long speed=%.2f driver=%.2f effective=%.2f map=%s curve=%.2f model=%.3f mpc=%.3f support=%.3f output=%.3f source=%s state=%s frames=%d throttle=%.3f raw_allow=%d prop=%d cap=%.3f turncap=%.3f model_stop=%d mpc_stop=%d final_stop=%d long_off=%d corner=%s request=%.3f handoff=%s',
+      cloudlog.info('NAP long speed=%.2f driver=%.2f effective=%.2f map=%s curve=%.2f model=%.3f mpc=%.3f support=%.3f output=%.3f source=%s state=%s frames=%d throttle=%.3f raw_allow=%d prop=%d cap=%.3f turncap=%.3f model_stop=%d mpc_stop=%d final_stop=%d long_off=%d corner=%s request=%.3f handoff=%s long_active=%d gas=%d brake=%d signal=%d steer=%.2f corner_target=%s weight=%.2f aego=%.3f',
                     v_ego, driver_cruise_speed, v_cruise, curve_cap, curve_target,
                     sm['modelV2'].action.desiredAcceleration, output_a_target_mpc,
                     support * model_weight, self.output_a_target, self.mpc.source,
@@ -1018,7 +1035,13 @@ class LongitudinalPlanner:
                     self.allow_throttle, self.propulsion_allowed,
                     accel_clip[1], self.prev_turn_accel_max,
                     output_should_stop_e2e, output_should_stop_mpc, self.output_should_stop,
-                    reset_state, self.corner_assist.reason, self.handoff_request, self.handoff_reason)
+                    reset_state, self.corner_assist.reason, self.handoff_request, self.handoff_reason,
+                    bool(getattr(sm['carControl'], 'longActive', False)), sm['carState'].gasPressed,
+                    bool(getattr(sm['carState'], 'brakePressed', False)),
+                    int(bool(getattr(sm['carState'], 'leftBlinker', False)))
+                    + 2 * int(bool(getattr(sm['carState'], 'rightBlinker', False))),
+                    sm['carState'].steeringAngleDeg, self.corner_assist.target_speed,
+                    model_weight, sm['carState'].aEgo)
 
   def publish(self, sm, pm):
     plan_send = messaging.new_message('longitudinalPlan')

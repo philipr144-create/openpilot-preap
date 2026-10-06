@@ -1,0 +1,561 @@
+#!/usr/bin/env python3
+import math
+from numbers import Number
+
+from cereal import car, log
+import cereal.messaging as messaging
+from openpilot.common.constants import CV
+from openpilot.common.params import Params
+from openpilot.common.realtime import config_realtime_process, DT_CTRL, Priority, Ratekeeper
+from openpilot.common.swaglog import cloudlog
+
+from opendbc.car.car_helpers import interfaces
+from opendbc.car.vehicle_model import VehicleModel
+from openpilot.selfdrive.controls.lib.drive_helpers import clip_curvature
+from openpilot.selfdrive.controls.lib.lane_centering import LaneCenteringAssist
+from openpilot.selfdrive.controls.lib.navigation_turn_commit import NavigationTurnCommit
+from openpilot.selfdrive.controls.lib.latcontrol import LatControl
+from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
+from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, STEER_ANGLE_SATURATION_THRESHOLD
+from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
+from openpilot.selfdrive.controls.lib.longcontrol import LongControl
+from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
+from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
+
+State = log.SelfdriveState.OpenpilotState
+LaneChangeState = log.LaneChangeState
+LaneChangeDirection = log.LaneChangeDirection
+
+ACTUATOR_FIELDS = tuple(car.CarControl.Actuators.schema.fields.keys())
+
+# Pre-AP low-speed corner-cut compensation. The driving model can request a
+# tighter radius than the legacy Model S EPAS can track during walking-speed
+# 90-degree turns. Keep stock behavior at 15 mph and above, and only widen
+# strong turns when exactly one blinker establishes turn intent.
+# PREAP_BLINKER_WIDE_TURN_TO_25_V1
+# Full entrance widening remains confined to walking speed, then fades
+# progressively to stock curvature at 25 mph.
+LOW_SPEED_TURN_FULL_EFFECT_MPH = 5.0
+LOW_SPEED_TURN_END_MPH = 25.0
+LOW_SPEED_TURN_CURVATURE_START = 0.025  # Ignore ordinary lane centering
+LOW_SPEED_TURN_CURVATURE_FULL = 0.080   # Full correction on sharp turns
+# PREAP_WIDER_LOW_SPEED_TURN_ENTRY_V1
+LOW_SPEED_TURN_MAX_REDUCTION = 0.21     # Retain at least 79% during entry
+LOW_SPEED_TURN_SMOOTH_END_MPH = 25.0
+LOW_SPEED_TURN_EARLY_CURVATURE = 0.008
+LOW_SPEED_TURN_RATE_START = 0.020    # Smooth initial steering buildup
+LOW_SPEED_TURN_RATE_MAX = 0.060      # Entry steering rate
+LOW_SPEED_TURN_RATE_CATCHUP = 0.090  # Restore model curvature after entry
+LOW_SPEED_TURN_RATE_OUT = 0.060
+
+LOW_SPEED_TURN_RAMP_SECONDS = 0.70
+
+# Widen only the entrance. Restore full model curvature at the apex so the
+# vehicle can complete its rotation into the destination lane.
+LOW_SPEED_TURN_ENTRY_MIN_SECONDS = 0.35
+LOW_SPEED_TURN_ENTRY_MAX_SECONDS = 0.75
+LOW_SPEED_TURN_ENTRY_RELEASE_CURVATURE = 0.060
+
+
+# NAP_LOW_SPEED_TURN_RATE_ASSIST
+#
+# Stock clip_curvature() is intentionally conservative, but a 90-degree
+# intersection can require curvature to arrive and disappear much faster.
+#
+# These rates apply only to a latched low-speed turn. Normal/highway
+# curvature limiting is untouched.
+NAP_TURN_RATE_ENABLE_MPH = 15.0
+NAP_TURN_RATE_RELEASE_MPH = 18.0
+NAP_TURN_RATE_TRIGGER_CURVATURE = 0.020
+NAP_TURN_RATE_RELEASE_CURVATURE = 0.008
+
+# curvature / second
+NAP_TURN_RATE_IN = 0.80
+NAP_TURN_RATE_OUT = 1.20
+
+
+def low_speed_turn_scale(v_ego: float, desired_curvature: float,
+                         one_blinker: bool) -> float:
+  if not one_blinker:
+    return 1.0
+
+  speed_mph = max(v_ego, 0.0) * CV.MS_TO_MPH
+  if speed_mph >= LOW_SPEED_TURN_END_MPH:
+    return 1.0
+
+  speed_weight = max(0.0, min(
+    1.0,
+    (LOW_SPEED_TURN_END_MPH - speed_mph) /
+    (LOW_SPEED_TURN_END_MPH - LOW_SPEED_TURN_FULL_EFFECT_MPH),
+  ))
+
+  curvature_weight = max(0.0, min(
+    1.0,
+    (abs(desired_curvature) - LOW_SPEED_TURN_CURVATURE_START) /
+    (LOW_SPEED_TURN_CURVATURE_FULL - LOW_SPEED_TURN_CURVATURE_START),
+  ))
+
+  return 1.0 - (
+    LOW_SPEED_TURN_MAX_REDUCTION *
+    speed_weight *
+    curvature_weight
+  )
+
+
+class Controls:
+  def __init__(self) -> None:
+    self.params = Params()
+    cloudlog.info("controlsd is waiting for CarParams")
+    self.CP = messaging.log_from_bytes(self.params.get("CarParams", block=True), car.CarParams)
+    cloudlog.info("controlsd got CarParams")
+
+    self.CI = interfaces[self.CP.carFingerprint](self.CP)
+
+    self.sm = messaging.SubMaster(['liveDelay', 'liveParameters', 'liveTorqueParameters', 'modelV2', 'selfdriveState',
+                                   'liveCalibration', 'livePose', 'longitudinalPlan', 'carState', 'carOutput',
+                                   'driverMonitoringState', 'onroadEvents', 'driverAssistance'], poll='selfdriveState')
+    self.pm = messaging.PubMaster(['carControl', 'controlsState'])
+
+    self.steer_limited_by_safety = False
+    self.curvature = 0.0
+    self.desired_curvature = 0.0
+    self.lane_centering = LaneCenteringAssist()
+    # NAP_NAVIGATION_TURN_COMMIT_V1
+    self.navigation_turn_commit = NavigationTurnCommit()
+    self.nap_turn_rate_assist_active = False
+    self.lane_centering_enabled = False
+    self.lane_centering_strength = 1
+    self.lane_centering_offset = 0
+    self.low_speed_turn_curvature = 0.0
+    self.low_speed_turn_smoothing_active = False
+    self.low_speed_turn_entry_active = False
+    self.low_speed_turn_ramp_time = 0.0
+
+    self.pose_calibrator = PoseCalibrator()
+    self.calibrated_pose: Pose | None = None
+
+    self.LoC = LongControl(self.CP)
+    self.VM = VehicleModel(self.CP)
+    self.LaC: LatControl
+    if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
+      self.LaC = LatControlAngle(self.CP, self.CI, DT_CTRL)
+    elif self.CP.lateralTuning.which() == 'pid':
+      self.LaC = LatControlPID(self.CP, self.CI, DT_CTRL)
+    elif self.CP.lateralTuning.which() == 'torque':
+      self.LaC = LatControlTorque(self.CP, self.CI, DT_CTRL)
+
+  def update(self):
+    self.sm.update(15)
+    if self.sm.updated["liveCalibration"]:
+      self.pose_calibrator.feed_live_calib(self.sm['liveCalibration'])
+    if self.sm.updated["livePose"]:
+      device_pose = Pose.from_live_pose(self.sm['livePose'])
+      self.calibrated_pose = self.pose_calibrator.build_calibrated_pose(device_pose)
+
+  def state_control(self):
+    CS = self.sm['carState']
+
+    # Update VehicleModel
+    lp = self.sm['liveParameters']
+    x = max(lp.stiffnessFactor, 0.1)
+    sr = max(lp.steerRatio, 0.1)
+    self.VM.update_params(x, sr)
+
+    steer_angle_without_offset = math.radians(CS.steeringAngleDeg - lp.angleOffsetDeg)
+    self.curvature = -self.VM.calc_curvature(steer_angle_without_offset, CS.vEgo, lp.roll)
+
+    # Update Torque Params
+    if self.CP.lateralTuning.which() == 'torque':
+      torque_params = self.sm['liveTorqueParameters']
+      if self.sm.all_checks(['liveTorqueParameters']) and torque_params.useParams:
+        self.LaC.update_live_torque_params(torque_params.latAccelFactorFiltered, torque_params.latAccelOffsetFiltered,
+                                           torque_params.frictionCoefficientFiltered)
+
+    long_plan = self.sm['longitudinalPlan']
+    model_v2 = self.sm['modelV2']
+
+    CC = car.CarControl.new_message()
+    CC.enabled = self.sm['selfdriveState'].enabled
+
+    # Check which actuators can be enabled
+    standstill = abs(CS.vEgo) <= max(self.CP.minSteerSpeed, 0.3) or CS.standstill
+    CC.latActive = self.sm['selfdriveState'].active and not CS.steerFaultTemporary and not CS.steerFaultPermanent and \
+                   (not standstill or self.CP.steerAtStandstill)
+    CC.longActive = CC.enabled and not any(e.overrideLongitudinal for e in self.sm['onroadEvents']) and self.CP.openpilotLongitudinalControl
+
+    actuators = CC.actuators
+    actuators.longControlState = self.LoC.long_control_state
+
+    # Enable blinkers while lane changing
+    if model_v2.meta.laneChangeState != LaneChangeState.off:
+      CC.leftBlinker = model_v2.meta.laneChangeDirection == LaneChangeDirection.left
+      CC.rightBlinker = model_v2.meta.laneChangeDirection == LaneChangeDirection.right
+
+    if not CC.latActive:
+      self.LaC.reset()
+    if not CC.longActive:
+      self.LoC.reset()
+
+    # accel PID loop
+    pid_accel_limits = self.CI.get_pid_accel_limits(self.CP, CS.vEgo, CS.vCruise * CV.KPH_TO_MS)
+    actuators.accel = float(self.LoC.update(CC.longActive, CS, long_plan.aTarget, long_plan.shouldStop, pid_accel_limits))
+
+    # Steering PID loop and lateral MPC
+    # Reset desired curvature to current to avoid violating the limits on engage
+    new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
+
+    # Resolve manual/navigation turn commitment before entrance shaping.
+    # Authorized city-turn paths bypass optional wide-entry shaping below.
+    new_desired_curvature = self.navigation_turn_commit.update(
+      new_desired_curvature,
+      CS,
+      CC.latActive,
+      model=model_v2,
+      healthy=(self.CP.carFingerprint == "TESLA_MODEL_S_PREAP"
+               and self.sm.all_checks(['modelV2', 'carState', 'liveCalibration'])
+               and self.sm['liveCalibration'].calStatus == log.LiveCalibrationData.Status.calibrated),
+      actual_curvature=self.curvature,
+    )
+
+    one_blinker = CS.leftBlinker != CS.rightBlinker
+
+    if self.sm.frame % 100 == 0:
+      self.wide_low_speed_turns_enabled = self.params.get_bool("NAPWideLowSpeedTurns")
+      self.lane_centering_enabled = self.params.get_bool("NAPLaneCentering")
+      self.lane_centering_strength = self.params.get("NAPLaneCenteringStrength", return_default=True)
+      self.lane_centering_offset = self.params.get("NAPLaneCenterOffset", return_default=True)
+
+    decision = getattr(self.navigation_turn_commit, 'decision', None)
+    manual_city_intent = (one_blinker and isinstance(decision, dict)
+                          and decision.get('city_turns_enabled') is True
+                          and decision.get('signal_owner') == 'driver'
+                          and decision.get('manual_turn_direction') == (1 if CS.leftBlinker else 2))
+    city_turn_path = manual_city_intent or getattr(self.navigation_turn_commit, 'active', False)
+    # City turns must follow their model/commit path through the normal safety
+    # limits, without an extra entrance-radius expansion or steering delay.
+    wide_turns_enabled = getattr(self, 'wide_low_speed_turns_enabled', False) and not city_turn_path
+    if wide_turns_enabled:
+      turn_scale = low_speed_turn_scale(
+        CS.vEgo,
+        new_desired_curvature,
+        one_blinker,
+      )
+    else:
+      turn_scale = 1.0
+
+    speed_mph = max(CS.vEgo, 0.0) * CV.MS_TO_MPH
+
+    # Never carry low-speed turn smoothing into highway control.
+    # Wide-turn behavior below 20 mph remains unchanged.
+    if speed_mph >= LOW_SPEED_TURN_SMOOTH_END_MPH:
+      self.low_speed_turn_curvature = new_desired_curvature
+      self.low_speed_turn_smoothing_active = False
+      self.low_speed_turn_ramp_time = 0.0
+
+    early_turn_request = (
+      wide_turns_enabled
+      and CC.latActive
+      and one_blinker
+      and speed_mph < LOW_SPEED_TURN_SMOOTH_END_MPH
+      and abs(new_desired_curvature)
+          >= LOW_SPEED_TURN_EARLY_CURVATURE
+    )
+
+    if (
+        early_turn_request
+        and not self.low_speed_turn_smoothing_active
+    ):
+      self.low_speed_turn_smoothing_active = True
+      self.low_speed_turn_entry_active = True
+      self.low_speed_turn_ramp_time = 0.0
+
+    if wide_turns_enabled and CC.latActive and self.low_speed_turn_smoothing_active:
+      # Smooth and widen only the entrance. At the apex, restore the
+      # complete model target and permit a controlled catch-up rate.
+      if self.low_speed_turn_entry_active:
+        self.low_speed_turn_ramp_time += DT_CTRL
+
+        entry_shape_complete = (
+          self.low_speed_turn_ramp_time
+          >= LOW_SPEED_TURN_ENTRY_MIN_SECONDS
+          and abs(new_desired_curvature)
+              >= LOW_SPEED_TURN_ENTRY_RELEASE_CURVATURE
+        )
+
+        entry_time_complete = (
+          self.low_speed_turn_ramp_time
+          >= LOW_SPEED_TURN_ENTRY_MAX_SECONDS
+        )
+
+        if (
+            not one_blinker
+            or entry_shape_complete
+            or entry_time_complete
+        ):
+          self.low_speed_turn_entry_active = False
+
+      entry_scale = (
+        turn_scale
+        if self.low_speed_turn_entry_active
+        else 1.0
+      )
+
+      turn_target = new_desired_curvature * entry_scale
+
+      winding_up = (
+        self.low_speed_turn_curvature * turn_target >= 0.0
+        and abs(turn_target)
+            > abs(self.low_speed_turn_curvature)
+      )
+
+      if winding_up:
+        if self.low_speed_turn_entry_active:
+          ramp = min(
+            self.low_speed_turn_ramp_time
+            / LOW_SPEED_TURN_RAMP_SECONDS,
+            1.0,
+          )
+
+          curvature_rate = (
+            LOW_SPEED_TURN_RATE_START
+            + ramp
+            * (
+              LOW_SPEED_TURN_RATE_MAX
+              - LOW_SPEED_TURN_RATE_START
+            )
+          )
+        else:
+          curvature_rate = LOW_SPEED_TURN_RATE_CATCHUP
+      else:
+        curvature_rate = LOW_SPEED_TURN_RATE_OUT
+
+      max_turn_delta = curvature_rate * DT_CTRL
+
+      self.low_speed_turn_curvature = max(
+        self.low_speed_turn_curvature - max_turn_delta,
+        min(
+          self.low_speed_turn_curvature + max_turn_delta,
+          turn_target,
+        ),
+      )
+
+      new_desired_curvature = (
+        self.low_speed_turn_curvature
+      )
+
+      # Remain active through signal cancellation and the complete unwind.
+      turn_finished = (
+        abs(turn_target)
+        < LOW_SPEED_TURN_EARLY_CURVATURE
+        and abs(
+          self.low_speed_turn_curvature - turn_target
+        ) < 1e-4
+      )
+
+      if turn_finished:
+        self.low_speed_turn_smoothing_active = False
+        self.low_speed_turn_entry_active = False
+        self.low_speed_turn_ramp_time = 0.0
+    else:
+      self.low_speed_turn_curvature = (
+        new_desired_curvature
+      )
+      self.low_speed_turn_smoothing_active = False
+      self.low_speed_turn_entry_active = False
+      self.low_speed_turn_ramp_time = 0.0
+
+    # Correct the model trajectory before the existing curvature/actuator limits.
+    # The UI continues to display the original model path, not this adjustment.
+    new_desired_curvature += self.lane_centering.update(
+      model_v2, CS.vEgo, new_desired_curvature,
+      enabled=self.lane_centering_enabled and self.CP.carFingerprint == "TESLA_MODEL_S_PREAP",
+      active=CC.latActive,
+      healthy=self.sm.all_checks(['modelV2', 'liveCalibration', 'carState'])
+              and self.sm['liveCalibration'].calStatus == log.LiveCalibrationData.Status.calibrated,
+      overriding=CS.steeringPressed or CS.leftBlinker or CS.rightBlinker
+                 or CC.leftBlinker or CC.rightBlinker or self.low_speed_turn_smoothing_active,
+      strength=self.lane_centering_strength,
+      offset_setting=self.lane_centering_offset,
+      dt=DT_CTRL,
+    )
+
+    # ----------------------------------------------------------
+    # NAP LOW-SPEED TURN RATE ASSIST
+    #
+    # The stock ISO jerk-derived curvature-rate limit is too slow for
+    # some ~90-degree low-speed intersections. It can cause:
+    #
+    #   1. delayed steering on entry -> excessively wide turn
+    #   2. delayed straightening on exit -> nose continues toward curb
+    #
+    # Start only on a signaled/authorized low-speed sharp turn.
+    # Once started, latch through the unwind even if the blinker or
+    # navigation ownership disappears at the apex.
+    # ----------------------------------------------------------
+    nap_turn_rate_override = None
+
+    nap_turn_speed_mph = max(float(CS.vEgo), 0.0) * CV.MS_TO_MPH
+    nap_target_curvature = float(new_desired_curvature)
+    nap_prev_curvature = float(self.desired_curvature)
+
+    nap_turn_start_allowed = (
+      CC.latActive
+      and nap_turn_speed_mph <= NAP_TURN_RATE_ENABLE_MPH
+      and (one_blinker or city_turn_path)
+      and abs(nap_target_curvature) >= NAP_TURN_RATE_TRIGGER_CURVATURE
+    )
+
+    if nap_turn_start_allowed:
+      self.nap_turn_rate_assist_active = True
+
+    # Keep the faster rate alive through the entire steering unwind.
+    # Release only after both requested and delivered curvature are
+    # essentially straight again.
+    if self.nap_turn_rate_assist_active:
+      if (
+        not CC.latActive
+        or nap_turn_speed_mph >= NAP_TURN_RATE_RELEASE_MPH
+      ):
+        self.nap_turn_rate_assist_active = False
+
+      elif (
+        abs(nap_target_curvature) < NAP_TURN_RATE_RELEASE_CURVATURE
+        and abs(nap_prev_curvature) < NAP_TURN_RATE_RELEASE_CURVATURE
+      ):
+        self.nap_turn_rate_assist_active = False
+
+    if self.nap_turn_rate_assist_active:
+      same_direction = (
+        nap_prev_curvature == 0.0
+        or nap_target_curvature == 0.0
+        or nap_prev_curvature * nap_target_curvature > 0.0
+      )
+
+      winding_in = (
+        same_direction
+        and abs(nap_target_curvature) > abs(nap_prev_curvature)
+      )
+
+      # Enter decisively, but straighten even faster.
+      nap_turn_rate_override = (
+        NAP_TURN_RATE_IN
+        if winding_in
+        else NAP_TURN_RATE_OUT
+      )
+
+    self.desired_curvature, curvature_limited = clip_curvature(
+      CS.vEgo,
+      self.desired_curvature,
+      new_desired_curvature,
+      lp.roll,
+      max_curvature_rate_override=nap_turn_rate_override,
+    )
+    lat_delay = self.sm["liveDelay"].lateralDelay + LAT_SMOOTH_SECONDS
+
+    actuators.curvature = self.desired_curvature
+    steer, steeringAngleDeg, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
+                                                       self.steer_limited_by_safety, self.desired_curvature,
+                                                       curvature_limited, lat_delay)
+    actuators.torque = float(steer)
+    actuators.steeringAngleDeg = float(steeringAngleDeg)
+
+    # Ensure no NaNs/Infs
+    for p in ACTUATOR_FIELDS:
+      attr = getattr(actuators, p)
+      if not isinstance(attr, Number):
+        continue
+
+      if not math.isfinite(attr):
+        cloudlog.error(f"actuators.{p} not finite {actuators.to_dict()}")
+        setattr(actuators, p, 0.0)
+
+    return CC, lac_log
+
+  def publish(self, CC, lac_log):
+    CS = self.sm['carState']
+
+    # Orientation and angle rates can be useful for carcontroller
+    # Only calibrated (car) frame is relevant for the carcontroller
+    CC.currentCurvature = self.curvature
+    if self.calibrated_pose is not None:
+      CC.orientationNED = self.calibrated_pose.orientation.xyz.tolist()
+      CC.angularVelocity = self.calibrated_pose.angular_velocity.xyz.tolist()
+
+    CC.cruiseControl.override = CC.enabled and not CC.longActive and self.CP.openpilotLongitudinalControl
+    CC.cruiseControl.cancel = CS.cruiseState.enabled and (not CC.enabled or not self.CP.pcmCruise)
+    CC.cruiseControl.resume = CC.enabled and CS.cruiseState.standstill and not self.sm['longitudinalPlan'].shouldStop
+
+    hudControl = CC.hudControl
+    hudControl.setSpeed = float(CS.vCruiseCluster * CV.KPH_TO_MS)
+    hudControl.speedVisible = CC.enabled
+    hudControl.lanesVisible = CC.enabled
+    hudControl.leadVisible = self.sm['longitudinalPlan'].hasLead
+    hudControl.leadDistanceBars = self.sm['selfdriveState'].personality.raw + 1
+    hudControl.visualAlert = self.sm['selfdriveState'].alertHudVisual
+
+    hudControl.rightLaneVisible = True
+    hudControl.leftLaneVisible = True
+    if self.sm.valid['driverAssistance']:
+      hudControl.leftLaneDepart = self.sm['driverAssistance'].leftLaneDeparture
+      hudControl.rightLaneDepart = self.sm['driverAssistance'].rightLaneDeparture
+
+    if self.sm['selfdriveState'].active:
+      CO = self.sm['carOutput']
+      if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
+        self.steer_limited_by_safety = abs(CC.actuators.steeringAngleDeg - CO.actuatorsOutput.steeringAngleDeg) > \
+                                              STEER_ANGLE_SATURATION_THRESHOLD
+      else:
+        self.steer_limited_by_safety = abs(CC.actuators.torque - CO.actuatorsOutput.torque) > 1e-2
+
+    # TODO: both controlsState and carControl valids should be set by
+    #       sm.all_checks(), but this creates a circular dependency
+
+    # controlsState
+    dat = messaging.new_message('controlsState')
+    dat.valid = CS.canValid
+    cs = dat.controlsState
+
+    cs.curvature = self.curvature
+    cs.longitudinalPlanMonoTime = self.sm.logMonoTime['longitudinalPlan']
+    cs.lateralPlanMonoTime = self.sm.logMonoTime['modelV2']
+    cs.desiredCurvature = self.desired_curvature
+    cs.longControlState = self.LoC.long_control_state
+    cs.upAccelCmd = float(self.LoC.pid.p)
+    cs.uiAccelCmd = float(self.LoC.pid.i)
+    cs.ufAccelCmd = float(self.LoC.pid.f)
+    cs.forceDecel = bool((self.sm['driverMonitoringState'].awarenessStatus < 0.) or
+                         (self.sm['selfdriveState'].state == State.softDisabling))
+
+    lat_tuning = self.CP.lateralTuning.which()
+    if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
+      cs.lateralControlState.angleState = lac_log
+    elif lat_tuning == 'pid':
+      cs.lateralControlState.pidState = lac_log
+    elif lat_tuning == 'torque':
+      cs.lateralControlState.torqueState = lac_log
+
+    self.pm.send('controlsState', dat)
+
+    # carControl
+    cc_send = messaging.new_message('carControl')
+    cc_send.valid = CS.canValid
+    cc_send.carControl = CC
+    self.pm.send('carControl', cc_send)
+
+  def run(self):
+    rk = Ratekeeper(100, print_delay_threshold=None)
+    while True:
+      self.update()
+      CC, lac_log = self.state_control()
+      self.publish(CC, lac_log)
+      rk.monitor_time()
+
+
+def main():
+  config_realtime_process(4, Priority.CTRL_HIGH)
+  controls = Controls()
+  controls.run()
+
+
+if __name__ == "__main__":
+  main()

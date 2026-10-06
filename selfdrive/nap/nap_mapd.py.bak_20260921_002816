@@ -1,0 +1,684 @@
+#!/usr/bin/env python3
+
+import json
+import math
+import os
+import time
+from dataclasses import dataclass
+from typing import Optional
+
+import requests
+import cereal.messaging as messaging
+from openpilot.common.params import Params
+
+
+SNAPSHOT = "/dev/shm/nap_map_context.json"
+CACHE = "/data/nap_osm_cache.json"
+
+OVERPASS = "https://overpass-api.de/api/interpreter"
+
+EARTH_RADIUS_M = 6371000.0
+
+QUERY_RADIUS_M = 900
+REFETCH_DISTANCE_M = 350
+CACHE_MAX_AGE = 6 * 3600
+
+MATCH_MAX_DISTANCE_M = 45.0
+HEADING_WEIGHT_M = 18.0
+
+LOOKAHEAD_M = 400.0
+CURVE_MIN_DISTANCE_M = 12.0
+
+# Used only to REPORT a suggested curve speed in this first version.
+# Nothing in this daemon commands longitudinal control.
+LAT_ACCEL_TARGET = 1.8
+
+PUBLISH_HZ = 2.0
+
+
+@dataclass
+class Node:
+  id: int
+  lat: float
+  lon: float
+  tags: dict
+
+
+@dataclass
+class Way:
+  id: int
+  nodes: list
+  tags: dict
+
+
+def clamp(v, lo, hi):
+  return max(lo, min(hi, v))
+
+
+def angle_diff_deg(a, b):
+  return (a - b + 180.0) % 360.0 - 180.0
+
+
+def haversine_m(lat1, lon1, lat2, lon2):
+  p1 = math.radians(lat1)
+  p2 = math.radians(lat2)
+  dp = math.radians(lat2 - lat1)
+  dl = math.radians(lon2 - lon1)
+
+  a = (
+    math.sin(dp / 2.0) ** 2
+    + math.cos(p1) * math.cos(p2) * math.sin(dl / 2.0) ** 2
+  )
+
+  return 2.0 * EARTH_RADIUS_M * math.asin(math.sqrt(a))
+
+
+def local_xy(lat, lon, lat0, lon0):
+  lat0r = math.radians(lat0)
+  x = math.radians(lon - lon0) * EARTH_RADIUS_M * math.cos(lat0r)
+  y = math.radians(lat - lat0) * EARTH_RADIUS_M
+  return x, y
+
+
+def bearing_deg_xy(x1, y1, x2, y2):
+  # Compass bearing: 0 north, 90 east.
+  return (math.degrees(math.atan2(x2 - x1, y2 - y1)) + 360.0) % 360.0
+
+
+def point_segment_projection(px, py, ax, ay, bx, by):
+  vx = bx - ax
+  vy = by - ay
+  vv = vx * vx + vy * vy
+
+  if vv < 1e-9:
+    return ax, ay, 0.0, math.hypot(px - ax, py - ay)
+
+  t = ((px - ax) * vx + (py - ay) * vy) / vv
+  t = clamp(t, 0.0, 1.0)
+
+  qx = ax + t * vx
+  qy = ay + t * vy
+
+  return qx, qy, t, math.hypot(px - qx, py - qy)
+
+
+def parse_speed_mps(raw):
+  if not raw:
+    return None
+
+  s = str(raw).strip().lower()
+
+  # Ignore non-numeric OSM conventions for now.
+  if s in ("none", "signals", "variable", "walk", "national"):
+    return None
+
+  # Some tags contain alternatives.
+  if ";" in s:
+    s = s.split(";", 1)[0].strip()
+
+  try:
+    if "mph" in s:
+      value = float(s.replace("mph", "").strip())
+      return value * 0.44704
+
+    value = float(s.split()[0])
+    return value / 3.6
+  except Exception:
+    return None
+
+
+def road_name(tags):
+  return (
+    tags.get("name")
+    or tags.get("ref")
+    or tags.get("highway")
+    or "unnamed"
+  )
+
+
+def way_allowed(tags):
+  highway = tags.get("highway")
+
+  if not highway:
+    return False
+
+  excluded = {
+    "footway",
+    "path",
+    "cycleway",
+    "steps",
+    "pedestrian",
+    "bridleway",
+    "corridor",
+    "construction",
+    "proposed",
+  }
+
+  if highway in excluded:
+    return False
+
+  if tags.get("access") in ("private", "no"):
+    return False
+
+  return True
+
+
+def query_osm(lat, lon):
+  query = f"""
+[out:json][timeout:15];
+(
+  way(around:{QUERY_RADIUS_M},{lat},{lon})["highway"];
+  node(around:{QUERY_RADIUS_M},{lat},{lon})["highway"="stop"];
+  node(around:{QUERY_RADIUS_M},{lat},{lon})["highway"="traffic_signals"];
+);
+out body;
+>;
+out skel qt;
+"""
+
+  r = requests.post(
+    OVERPASS,
+    data={"data": query},
+    headers={"User-Agent": "NAP-MapDrivingAssist/0.1"},
+    timeout=20,
+  )
+  r.raise_for_status()
+  return r.json()
+
+
+def decode_osm(data):
+  nodes = {}
+  way_defs = []
+
+  for e in data.get("elements", []):
+    if e.get("type") == "node":
+      try:
+        nodes[int(e["id"])] = Node(
+          id=int(e["id"]),
+          lat=float(e["lat"]),
+          lon=float(e["lon"]),
+          tags=e.get("tags", {}) or {},
+        )
+      except Exception:
+        pass
+
+    elif e.get("type") == "way":
+      way_defs.append(e)
+
+  ways = []
+
+  for e in way_defs:
+    tags = e.get("tags", {}) or {}
+
+    if not way_allowed(tags):
+      continue
+
+    ns = []
+
+    for node_id in e.get("nodes", []):
+      n = nodes.get(int(node_id))
+      if n is not None:
+        ns.append(n)
+
+    if len(ns) >= 2:
+      ways.append(
+        Way(
+          id=int(e["id"]),
+          nodes=ns,
+          tags=tags,
+        )
+      )
+
+  return nodes, ways
+
+
+def load_cache():
+  try:
+    with open(CACHE) as f:
+      c = json.load(f)
+
+    if time.time() - float(c.get("wall_time", 0)) > CACHE_MAX_AGE:
+      return None
+
+    return c
+  except Exception:
+    return None
+
+
+def save_cache(lat, lon, data):
+  tmp = CACHE + ".tmp"
+
+  payload = {
+    "wall_time": time.time(),
+    "lat": lat,
+    "lon": lon,
+    "data": data,
+  }
+
+  with open(tmp, "w") as f:
+    json.dump(payload, f)
+
+  os.replace(tmp, CACHE)
+
+
+def atomic_json(path, payload):
+  tmp = path + ".tmp"
+
+  with open(tmp, "w") as f:
+    json.dump(payload, f, separators=(",", ":"))
+
+  os.replace(tmp, path)
+
+
+def match_way(lat, lon, bearing, ways):
+  best = None
+
+  for way in ways:
+    xy = [local_xy(n.lat, n.lon, lat, lon) for n in way.nodes]
+
+    for i in range(len(xy) - 1):
+      ax, ay = xy[i]
+      bx, by = xy[i + 1]
+
+      _, _, t, distance = point_segment_projection(
+        0.0, 0.0, ax, ay, bx, by
+      )
+
+      seg_bearing = bearing_deg_xy(ax, ay, bx, by)
+
+      forward_error = abs(angle_diff_deg(seg_bearing, bearing))
+      reverse_error = abs(angle_diff_deg((seg_bearing + 180.0) % 360.0, bearing))
+
+      if reverse_error < forward_error:
+        direction = -1
+        heading_error = reverse_error
+      else:
+        direction = 1
+        heading_error = forward_error
+
+      # At very low speed GPS bearing can be noisy, so distance dominates.
+      heading_penalty = HEADING_WEIGHT_M * min(heading_error, 90.0) / 90.0
+      score = distance + heading_penalty
+
+      candidate = {
+        "way": way,
+        "segment": i,
+        "t": t,
+        "direction": direction,
+        "distance": distance,
+        "heading_error": heading_error,
+        "score": score,
+      }
+
+      if best is None or score < best["score"]:
+        best = candidate
+
+  if best is None:
+    return None
+
+  if best["distance"] > MATCH_MAX_DISTANCE_M:
+    return None
+
+  return best
+
+
+def ordered_points(match):
+  way = match["way"]
+  i = match["segment"]
+  t = match["t"]
+  direction = match["direction"]
+
+  a = way.nodes[i]
+  b = way.nodes[i + 1]
+
+  lat = a.lat + (b.lat - a.lat) * t
+  lon = a.lon + (b.lon - a.lon) * t
+
+  pts = [(lat, lon, None)]
+
+  if direction > 0:
+    for n in way.nodes[i + 1:]:
+      pts.append((n.lat, n.lon, n))
+  else:
+    for n in reversed(way.nodes[:i + 1]):
+      pts.append((n.lat, n.lon, n))
+
+  return pts
+
+
+def trace_geometry(lat0, lon0, pts):
+  out = []
+  cumulative = 0.0
+  prev = None
+
+  for lat, lon, node in pts:
+    x, y = local_xy(lat, lon, lat0, lon0)
+
+    if prev is not None:
+      cumulative += math.hypot(x - prev[0], y - prev[1])
+
+    out.append({
+      "x": x,
+      "y": y,
+      "distance": cumulative,
+      "node": node,
+    })
+
+    prev = (x, y)
+
+    if cumulative >= LOOKAHEAD_M:
+      break
+
+  return out
+
+
+def curvature_events(geom):
+  events = []
+
+  if len(geom) < 3:
+    return events
+
+  for i in range(1, len(geom) - 1):
+    p0 = geom[i - 1]
+    p1 = geom[i]
+    p2 = geom[i + 1]
+
+    if p1["distance"] < CURVE_MIN_DISTANCE_M:
+      continue
+
+    a = math.hypot(p1["x"] - p0["x"], p1["y"] - p0["y"])
+    b = math.hypot(p2["x"] - p1["x"], p2["y"] - p1["y"])
+    c = math.hypot(p2["x"] - p0["x"], p2["y"] - p0["y"])
+
+    if min(a, b, c) < 3.0:
+      continue
+
+    cross = (
+      (p1["x"] - p0["x"]) * (p2["y"] - p0["y"])
+      - (p1["y"] - p0["y"]) * (p2["x"] - p0["x"])
+    )
+
+    area2 = abs(cross)
+
+    if area2 < 0.5:
+      continue
+
+    # Circumcircle curvature:
+    # k = 4A/(abc), and area2 = 2A.
+    curvature = (2.0 * area2) / (a * b * c)
+
+    if curvature <= 1e-5:
+      continue
+
+    radius = 1.0 / curvature
+    target_speed = math.sqrt(LAT_ACCEL_TARGET / curvature)
+
+    # Positive = left, negative = right in our local coordinate convention.
+    direction = "left" if cross > 0.0 else "right"
+
+    events.append({
+      "distance_m": round(p1["distance"], 1),
+      "curvature": round(curvature, 6),
+      "radius_m": round(radius, 1),
+      "direction": direction,
+      "target_speed_mps": round(target_speed, 2),
+      "target_speed_mph": round(target_speed * 2.236936, 1),
+    })
+
+  events.sort(key=lambda e: e["distance_m"])
+  return events
+
+
+def node_events(geom):
+  events = []
+
+  for p in geom:
+    n = p["node"]
+
+    if n is None:
+      continue
+
+    highway = n.tags.get("highway")
+
+    if highway == "stop":
+      events.append({
+        "type": "stop_sign",
+        "distance_m": round(p["distance"], 1),
+        "node_id": n.id,
+      })
+
+    elif highway == "traffic_signals":
+      events.append({
+        "type": "traffic_signal",
+        "distance_m": round(p["distance"], 1),
+        "node_id": n.id,
+      })
+
+  return events
+
+
+def choose_curve(events):
+  # For display/validation choose the first meaningful event.
+  # Later map_longitudinal will evaluate every event and take the
+  # most restrictive braking envelope.
+  for e in events:
+    if e["target_speed_mps"] < 30.0:
+      return e
+
+  return None
+
+
+class NapMapD:
+  def __init__(self):
+    self.params = Params()
+    self.sm = messaging.SubMaster(["gpsLocation"])
+
+    self.cache = load_cache()
+    self.nodes = {}
+    self.ways = []
+
+    self.last_fetch_attempt = 0.0
+    self.last_error = None
+
+    if self.cache is not None:
+      try:
+        self.nodes, self.ways = decode_osm(self.cache["data"])
+      except Exception:
+        self.cache = None
+        self.nodes = {}
+        self.ways = []
+
+  def need_fetch(self, lat, lon):
+    if self.cache is None:
+      return True
+
+    d = haversine_m(
+      lat,
+      lon,
+      float(self.cache["lat"]),
+      float(self.cache["lon"]),
+    )
+
+    return d >= REFETCH_DISTANCE_M
+
+  def fetch_if_needed(self, lat, lon):
+    if not self.need_fetch(lat, lon):
+      return
+
+    now = time.monotonic()
+
+    # Don't hammer Overpass after a connectivity failure.
+    if now - self.last_fetch_attempt < 20.0:
+      return
+
+    self.last_fetch_attempt = now
+
+    try:
+      data = query_osm(lat, lon)
+      nodes, ways = decode_osm(data)
+
+      if not ways:
+        raise RuntimeError("OSM query returned no usable roads")
+
+      save_cache(lat, lon, data)
+
+      self.cache = {
+        "wall_time": time.time(),
+        "lat": lat,
+        "lon": lon,
+        "data": data,
+      }
+
+      self.nodes = nodes
+      self.ways = ways
+      self.last_error = None
+
+    except Exception as e:
+      self.last_error = str(e)
+
+  def update(self):
+    self.sm.update(500)
+
+    enabled = self.params.get_bool("NAPMapDrivingAssist")
+
+    payload = {
+      "version": 1,
+      "wall_time": time.time(),
+      "mono_time": time.monotonic(),
+      "enabled": enabled,
+      "valid": False,
+      "source": "osm_overpass",
+    }
+
+    if not self.sm.alive["gpsLocation"] or not self.sm.valid["gpsLocation"]:
+      payload["status"] = "waiting_for_gps"
+      atomic_json(SNAPSHOT, payload)
+      return
+
+    gps = self.sm["gpsLocation"]
+
+    lat = float(gps.latitude)
+    lon = float(gps.longitude)
+    speed = float(gps.speed)
+    bearing = float(gps.bearingDeg)
+
+    payload["gps"] = {
+      "latitude": lat,
+      "longitude": lon,
+      "speed_mps": round(speed, 3),
+      "bearing_deg": round(bearing, 2),
+    }
+
+    # We still publish GPS/status while disabled, but do not make network
+    # requests or generate active map context.
+    if not enabled:
+      payload["status"] = "disabled"
+      atomic_json(SNAPSHOT, payload)
+      return
+
+    self.fetch_if_needed(lat, lon)
+
+    if not self.ways:
+      payload["status"] = "no_map_data"
+      payload["error"] = self.last_error
+      atomic_json(SNAPSHOT, payload)
+      return
+
+    match = match_way(lat, lon, bearing, self.ways)
+
+    if match is None:
+      payload["status"] = "no_road_match"
+      payload["error"] = self.last_error
+      atomic_json(SNAPSHOT, payload)
+      return
+
+    way = match["way"]
+    pts = ordered_points(match)
+    geom = trace_geometry(lat, lon, pts)
+
+    curves = curvature_events(geom)
+    events = node_events(geom)
+    curve = choose_curve(curves)
+
+    maxspeed = parse_speed_mps(way.tags.get("maxspeed"))
+
+    payload.update({
+      "valid": True,
+      "status": "ok",
+      "road": {
+        "way_id": way.id,
+        "name": road_name(way.tags),
+        "highway": way.tags.get("highway"),
+        "maxspeed_raw": way.tags.get("maxspeed"),
+        "speed_limit_mps": (
+          round(maxspeed, 2) if maxspeed is not None else None
+        ),
+        "speed_limit_mph": (
+          round(maxspeed * 2.236936, 1)
+          if maxspeed is not None
+          else None
+        ),
+      },
+      "match": {
+        "distance_m": round(match["distance"], 1),
+        "heading_error_deg": round(match["heading_error"], 1),
+        "direction": match["direction"],
+      },
+      "lookahead_m": (
+        round(geom[-1]["distance"], 1)
+        if geom
+        else 0.0
+      ),
+      "curve": curve,
+      "curves": curves[:12],
+      "events": events[:12],
+      "cache": {
+        "center_lat": self.cache["lat"] if self.cache else None,
+        "center_lon": self.cache["lon"] if self.cache else None,
+        "age_s": (
+          round(time.time() - float(self.cache["wall_time"]), 1)
+          if self.cache
+          else None
+        ),
+        "ways": len(self.ways),
+      },
+      "error": self.last_error,
+    })
+
+    atomic_json(SNAPSHOT, payload)
+
+  def run(self):
+    period = 1.0 / PUBLISH_HZ
+
+    while True:
+      started = time.monotonic()
+
+      try:
+        self.update()
+      except Exception as e:
+        try:
+          atomic_json(
+            SNAPSHOT,
+            {
+              "version": 1,
+              "wall_time": time.time(),
+              "mono_time": time.monotonic(),
+              "enabled": self.params.get_bool("NAPMapDrivingAssist"),
+              "valid": False,
+              "status": "exception",
+              "error": str(e),
+            },
+          )
+        except Exception:
+          pass
+
+      elapsed = time.monotonic() - started
+      time.sleep(max(0.0, period - elapsed))
+
+
+def main():
+  NapMapD().run()
+
+
+if __name__ == "__main__":
+  main()

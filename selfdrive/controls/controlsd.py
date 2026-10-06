@@ -64,8 +64,8 @@ LOW_SPEED_TURN_ENTRY_RELEASE_CURVATURE = 0.060
 #
 # These rates apply only to a latched low-speed turn. Normal/highway
 # curvature limiting is untouched.
-NAP_TURN_RATE_ENABLE_MPH = 15.0
-NAP_TURN_RATE_RELEASE_MPH = 18.0
+NAP_TURN_RATE_ENABLE_MPH = 20.0
+NAP_TURN_RATE_RELEASE_MPH = 22.0
 NAP_TURN_RATE_TRIGGER_CURVATURE = 0.020
 NAP_TURN_RATE_RELEASE_CURVATURE = 0.008
 
@@ -256,7 +256,7 @@ class Controls:
       wide_turns_enabled
       and CC.latActive
       and one_blinker
-      and speed_mph < LOW_SPEED_TURN_SMOOTH_END_MPH
+      and speed_mph < LOW_SPEED_TURN_END_MPH
       and abs(new_desired_curvature)
           >= LOW_SPEED_TURN_EARLY_CURVATURE
     )
