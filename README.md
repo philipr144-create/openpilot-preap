@@ -68,7 +68,7 @@ On the same network as the comma, open `http://<comma-address>:7070/` and select
 - Expand **Individual corners** for Driver Front, Passenger Front, Driver Rear, and Passenger Rear.
 - Selected corners vent in sequence, with the pulse cycle repeated approximately every 0.8 seconds. Release the button to stop venting.
 
-The controller uses the recovered Tesla Model S Continental EAS service and vent routines. Letting go requests vent stop and factory restoration. Select **Restore Factory Control** to run the recovered restoration sequence and return leveling to the factory controller. This restores control rather than selecting a particular suspension height. The page currently provides lowering only; inflation and a target-height command have not been established.
+The controller uses the recovered Tesla Model S Continental EAS service and vent routines. Service entry sends `10 03`, starts `0310`, waits 0.4 seconds, and finishes `0310` before venting. Explicit factory restoration reopens the extended session, stops venting when its stop has not already been acknowledged, starts `0309`, waits one second, finishes `0309`, queries its result, and returns to `10 01`. Negative responses and timeouts remain faults; routine acknowledgements do not independently prove that the physical suspension warning cleared. Unconfirmed restoration state is preserved across software reloads. Letting go requests vent stop and factory restoration. Select **Restore Factory Control** to run the recovered restoration sequence and return leveling to the factory controller. This restores control rather than selecting a particular suspension height. The page currently provides lowering only; inflation and a target-height command have not been established.
 
 ### Safety, recovery, and connection handling
 
@@ -92,7 +92,7 @@ Preserve the device's `launch_openpilot.sh` startup wrapper: it starts the MPP w
 
 The web server is a separate repository at `/data/server`, linked into openpilot as `server`. Air Ride lives in `airride.py` and `airride_page.py`, with routes in `server_v21.py`; openpilot integration is in `selfdrive/car/card.py`. The Panda safety changes and tests live in the `opendbc_repo` submodule. Preserve all three repositories when backing up or reproducing this installation.
 
-The 30 Air Ride tests pass, covering controller behavior, the local endpoint, HTTP/navigation integration, and shared CAN publication. Run them from `/data/openpilot` using the `server` symlink path:
+The 34 Air Ride tests pass, covering controller behavior, the local endpoint, HTTP/navigation integration, and shared CAN publication. Run them from `/data/openpilot` using the `server` symlink path:
 
 ```sh
 PYTHONPATH=/data/openpilot /usr/local/venv/bin/python -m unittest discover -s /data/openpilot/server/tests -q
