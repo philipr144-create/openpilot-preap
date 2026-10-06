@@ -68,13 +68,13 @@ On the same network as the comma, open `http://<comma-address>:7070/` and select
 - Expand **Individual corners** for Driver Front, Passenger Front, Driver Rear, and Passenger Rear.
 - Selected corners vent in sequence, with the pulse cycle repeated approximately every 0.8 seconds. Release the button to stop venting.
 
-The controller uses the recovered Tesla Model S Continental EAS service and vent routines. Letting go stops venting while retaining manual service state; it does not run the factory restoration routine. Select **Restore Factory Control** to run the recovered restoration sequence and return leveling to the factory controller. This restores control rather than selecting a particular suspension height. The page currently provides lowering only; inflation and a target-height command have not been established.
+The controller uses the recovered Tesla Model S Continental EAS service and vent routines. Letting go requests vent stop and factory restoration. Select **Restore Factory Control** to run the recovered restoration sequence and return leveling to the factory controller. This restores control rather than selecting a particular suspension height. The page currently provides lowering only; inflation and a target-height command have not been established.
 
 ### Safety, recovery, and connection handling
 
 Manual lowering requires fresh, valid vehicle-speed data and a speed strictly **below 40 mph**. At 40 mph or above, or when speed data becomes unavailable, manual commands are blocked and the controller attempts to stop venting and restore factory control. Restoration errors remain visible; an attempted restoration is not treated as confirmed success.
 
-The page maintains a short hold heartbeat. Pointer release/cancel, leaving the button, losing page focus, and connection loss end the hold. An expired backend hold lease triggers factory restoration. Opening the page or checking status does not move the suspension.
+The page maintains a short hold heartbeat. Pointer or touch release/cancel, leaving the button, losing page focus, and connection loss end the hold and request factory restoration. Controls suppress text selection and browser long-press menus; a new hold is blocked while the release request is pending. An expired backend hold lease triggers factory restoration. Opening the page or checking status does not move the suspension.
 
 **Reset Error** becomes available once fault cleanup has finished, speed data is valid, and the car is below the speed limit. It clears the error without sending a suspension command, so a hold button can be used to retry. Resetting an error does not confirm factory restoration or remove the speed gate. The status API retains recent requests, responses, and timeouts for diagnosis.
 
@@ -92,7 +92,7 @@ Preserve the device's `launch_openpilot.sh` startup wrapper: it starts the MPP w
 
 The web server is a separate repository at `/data/server`, linked into openpilot as `server`. Air Ride lives in `airride.py` and `airride_page.py`, with routes in `server_v21.py`; openpilot integration is in `selfdrive/car/card.py`. The Panda safety changes and tests live in the `opendbc_repo` submodule. Preserve all three repositories when backing up or reproducing this installation.
 
-The 27 Air Ride tests pass, covering controller behavior, the local endpoint, HTTP/navigation integration, and shared CAN publication. Run them from `/data/openpilot` using the `server` symlink path:
+The 30 Air Ride tests pass, covering controller behavior, the local endpoint, HTTP/navigation integration, and shared CAN publication. Run them from `/data/openpilot` using the `server` symlink path:
 
 ```sh
 PYTHONPATH=/data/openpilot /usr/local/venv/bin/python -m unittest discover -s /data/openpilot/server/tests -q
