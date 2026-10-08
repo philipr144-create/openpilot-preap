@@ -68,3 +68,52 @@ class TestNormalPlannerStops(PlannerTransitions):
     with patch.object(lp,'normal_model_stop_enabled',return_value=True):
       assert self.tick()==-.4
       assert not self.p.normal_model_stop.active
+
+
+def rolling_stop(accel=-.7, tail=1.6):
+ return N(action=N(desiredAcceleration=accel,shouldStop=False),
+          velocity=N(t=[0.,2.,5.,8.,10.],x=[10.,6.,tail,tail,tail]))
+
+
+def test_sustained_rolling_stop_acquires_without_imminent_flag():
+ s=NormalModelStop(.05)
+ for _ in range(5):assert not s.update(rolling_stop(),10.,enabled=True,valid=True,reset=False)
+ assert s.update(rolling_stop(),10.,enabled=True,valid=True,reset=False)
+ assert not s.update(rolling_stop(),10.,enabled=True,valid=True,reset=True)
+ assert s.approach_time==0.
+
+
+def test_curve_coast_partial_forecast_and_short_drop_do_not_acquire():
+ for m in [rolling_stop(tail=4.),rolling_stop(accel=-.1),rolling_stop(accel=.1)]:
+  s=NormalModelStop(.05)
+  for _ in range(20):assert not s.update(m,10.,enabled=True,valid=True,reset=False)
+ s=NormalModelStop(.05)
+ for _ in range(5):assert not s.update(rolling_stop(),10.,enabled=True,valid=True,reset=False)
+ assert not s.update(rolling_stop(tail=4.),10.,enabled=True,valid=True,reset=False)
+ for _ in range(5):assert not s.update(rolling_stop(),10.,enabled=True,valid=True,reset=False)
+ m=rolling_stop();m.velocity.t[-1]=8.1
+ s=NormalModelStop(.05)
+ for _ in range(20):assert not s.update(m,10.,enabled=True,valid=True,reset=False)
+
+
+def test_sustained_rolling_stop_can_forecast_departure_after_slow_roll():
+ m=rolling_stop();m.velocity=N(t=[0.,2.,4.,5.,6.,8.,10.],x=[10.,6.,1.8,1.6,1.8,4.,6.])
+ s=NormalModelStop(.05)
+ for _ in range(5):assert not s.update(m,10.,enabled=True,valid=True,reset=False)
+ assert s.update(m,10.,enabled=True,valid=True,reset=False)
+ m.velocity.x=[10.,6.,4.,1.6,4.,5.,6.]
+ s=NormalModelStop(.05)
+ for _ in range(20):assert not s.update(m,10.,enabled=True,valid=True,reset=False)
+
+
+def test_normal_planner_honors_sustained_rolling_approach_without_stop_flag():
+ t=TestNormalPlannerStops();t.setUp()
+ m=rolling_stop();t.sm['modelV2'].action=m.action;t.sm['modelV2'].velocity=m.velocity
+ t.plan.return_value=(.4,False)
+ with patch.object(lp,'normal_model_stop_enabled',return_value=True):
+  for _ in range(5):t.tick()
+  assert t.tick()==-.7
+  assert t.p.normal_model_stop.active
+  assert not t.p.output_should_stop
+  t.sm['carState'].gasPressed=True;t.tick()
+  assert not t.p.normal_model_stop.active

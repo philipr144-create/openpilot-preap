@@ -119,3 +119,40 @@ def test_navigation_announces_then_waits_for_actual_matching_lamp():
   c.leftBlinker=True;assert tick()=='turnLeft'
   c.steeringPressed=True;assert tick()=='none';assert n.blocked
   c.steeringPressed=False;assert tick()=='none'
+
+
+def test_highway_raw_torque_uses_five_count_filter():
+ from opendbc.car.tesla.preap import carstate as module
+ from opendbc.car.interfaces import CarStateBase
+ from opendbc.car.tesla.preap.steering_override import hands_on_override
+ tree=ast.parse(inspect.getsource(module.update_preap))
+ block=next(n for n in tree.body[0].body if isinstance(n,ast.If) and isinstance(n.test,ast.Name) and n.test.id=='ENABLE_HSO')
+ code=compile(ast.fix_missing_locations(ast.Module(body=[block],type_ignores=[])),'hso-highway','exec')
+ class State:
+  update_steering_pressed=CarStateBase.update_steering_pressed
+ c=State();c.steering_pressed_cnt=0;c.hands_on_level=1
+ ret=N(vEgo=65*.44704,steeringTorque=1.2,steeringPressed=False)
+ env=dict(cs=c,ret=ret,ENABLE_HSO=True,STEER_THRESHOLD=1.,hands_on_override=hands_on_override)
+ for _ in range(3):exec(code,env);assert not ret.steeringPressed
+ ret.steeringTorque=.5
+ for _ in range(6):exec(code,env)
+ assert not ret.steeringPressed
+ ret.steeringTorque=1.2
+ for _ in range(6):exec(code,env)
+ assert ret.steeringPressed
+ assert env['override_filter']==5
+ ret.vEgo=24*.44704;exec(code,env);assert env['override_filter']==2
+
+
+def test_highway_controller_does_not_bypass_filtered_level_one():
+ from opendbc.car.tesla import carcontroller as module
+ tree=ast.parse(inspect.getsource(module.CarController))
+ method=next(n for n in tree.body[0].body if isinstance(n,ast.FunctionDef) and n.name=='_update_preap')
+ assignment=next(n for n in method.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='hands_on_trigger' for t in n.targets))
+ from opendbc.car.tesla.preap.steering_override import hands_on_override,takeover_torque_threshold
+ env=dict(speed_mph=65.,hands_on_level=1,CS=N(out=N(vEgo=65*.44704,steeringTorque=1.2)),hands_on_override=hands_on_override,takeover_torque_threshold=takeover_torque_threshold)
+ code=compile(ast.fix_missing_locations(ast.Module(body=[assignment],type_ignores=[])),'controller-override','exec')
+ exec(code,env);assert not env['hands_on_trigger']
+ env['hands_on_level']=2;exec(code,env);assert env['hands_on_trigger']
+ env.update(speed_mph=24.,hands_on_level=1);env['CS'].out.vEgo=24*.44704
+ exec(code,env);assert env['hands_on_trigger']
