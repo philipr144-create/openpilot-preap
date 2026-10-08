@@ -106,3 +106,13 @@ def test_low_speed_epas_contact_respects_existing_torque_allowance():
   assert hands_on_override(2,0.,threshold)
   assert hands_on_override(3,0.,threshold)
  assert not hands_on_override(1,1.2,takeover_torque_threshold(2.))
+
+
+def test_established_turn_above_city_speed_adds_no_synthetic_curvature():
+ t=manual_cases.ManualTests();t.setUp();t.start()
+ t.cs.vEgo=26*.44704
+ t.curvature=0.
+ output=t.tick()
+ assert t.helper.active and not t.helper.blocked
+ assert output == 0.
+ assert t.helper.state == 'MANUAL MODEL CONTINUATION'

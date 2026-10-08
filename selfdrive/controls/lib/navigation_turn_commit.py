@@ -184,7 +184,7 @@ class NavigationTurnCommit:
         and d.get("tap_signal_active") is False
         and d.get("synthetic_indicator_request") == "none"
         and d.get("model_evaluated") is True
-        and -0.1 <= CS.vEgo <= (CONTINUE_SPEED_MPH if d.get("manual_turn_continuing") is True else COMMIT_SPEED_MPH) * CV.MPH_TO_MS
+        and -0.1 <= CS.vEgo <= COMMIT_SPEED_MPH * CV.MPH_TO_MS
         and str(CS.gearShifter) in ("drive", "low", "sport", "eco")
         and not CS.steeringPressed
         and not getattr(CS, "steeringDisengage", False)
@@ -938,6 +938,13 @@ class ManualTurnCommit:
       and now - self.intent_seed_start <= self.STOP_INTENT_GRACE_SECONDS
       and self.distance <= self.STOP_INTENT_MAX_DISTANCE_M
     )
+
+    # Above city speed, preserve established maneuver context without adding
+    # a turn seed/floor or changing the model's requested direction.
+    if cs.vEgo > COMMIT_SPEED_MPH * CV.MPH_TO_MS:
+      self.active = True
+      self.state = 'MANUAL MODEL CONTINUATION'
+      return curvature
 
     if intent_seed_grace:
       ramp = min(
