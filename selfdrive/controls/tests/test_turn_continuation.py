@@ -116,3 +116,17 @@ def test_established_turn_above_city_speed_adds_no_synthetic_curvature():
  assert t.helper.active and not t.helper.blocked
  assert output == 0.
  assert t.helper.state == 'MANUAL MODEL CONTINUATION'
+
+
+def test_city_turn_three_nm_allowance_is_confined_to_sub25_physical_turn_context():
+ from opendbc.car.tesla.preap.steering_override import takeover_torque_threshold
+ for mph in [0.,5.,13.4,15.7,20.,24.9]:
+  threshold=takeover_torque_threshold(mph/2.236936,city_turn=True)
+  assert threshold==3.
+  assert not hands_on_override(0,1.75,threshold)
+  assert not hands_on_override(1,2.99,threshold)
+  assert hands_on_override(1,3.01,threshold)
+  assert hands_on_override(2,0.,threshold)
+ for mph in [25.,26.,65.]:
+  assert takeover_torque_threshold(mph/2.236936,city_turn=True)==1.
+ assert takeover_torque_threshold(15.7/2.236936)==takeover_torque_threshold(15.7/2.236936,city_turn=False)
