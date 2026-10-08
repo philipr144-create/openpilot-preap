@@ -11,6 +11,7 @@ SNAPSHOT = '/dev/shm/nap_navigation_desire.json'
 DIAGNOSTICS = '/dev/shm/nap_navigation_decision.json'
 SIGNAL_REQUEST = '/dev/shm/nap_navigation_signal_request.json'
 TURN_SPEED_MAX = 25 * 0.44704
+TURN_CONTINUE_SPEED_MAX = 35 * 0.44704
 TURN_CONFIRM_DISTANCE = 80.0
 EXIT_SIGNAL_SECONDS = 7.0
 EXIT_SIGNAL_DISTANCE_MIN = 60.0
@@ -123,6 +124,7 @@ class NavigationDesire:
     self.prepared_navigation = None
     self.signal_cancelled_key = None
     self.previous_lat_active = False
+    self.turn_guidance_started = False
 
   def maneuvers_enabled(self):
     if not hasattr(self, 'params'):
@@ -183,6 +185,10 @@ class NavigationDesire:
     current_maneuver_id = ''
 
     def result(desire, reason, indicator_direction=0):
+      if desire in ('turnLeft', 'turnRight'):
+        self.turn_guidance_started = True
+      if self.blocked or not self.confirmed:
+        self.turn_guidance_started = False
       self.indicator_request = {0: 'none', 1: 'left', 2: 'right'}[indicator_direction]
       self._publish_signal(indicator_direction, current_maneuver_id, desire, reason, now)
       self.decision.update(desire=desire, reason=reason, confirmed=self.confirmed,
@@ -226,6 +232,7 @@ class NavigationDesire:
     key = (state['route_id'], maneuver_id)
     if key != self.key:
       self.key = key
+      self.turn_guidance_started = False
       self.confirmed = False
       self.blocked = False
       self.started = None
@@ -240,9 +247,8 @@ class NavigationDesire:
     #   * tap lane change takes signal ownership
     #   * the route no longer owns navigation signaling
     #
-    # Do NOT permanently cancel merely because the driver touches the wheel.
-    # NavigationTurnCommit handles that as a temporary driver-assist handoff
-    # and smoothly reacquires after release.
+    # Credible steering takeover cancels this maneuver. Mere level-1
+    # hand/rack contact is filtered before carState reports steeringPressed.
     #
     # Do NOT cancel merely because a physical blinker exists either. The
     # maneuver-specific code below distinguishes same-side driver signaling
@@ -360,8 +366,11 @@ class NavigationDesire:
     # by speed and vehicle control state.
     if steering_override:
       return result('none', 'Driver steering override; turn signal remains active', indicator)
-    if speed >= TURN_SPEED_MAX:
-      return result('none', 'Turn signal active; model guidance waits below 25 mph', indicator)
+    speed_max = TURN_CONTINUE_SPEED_MAX if self.turn_guidance_started else TURN_SPEED_MAX
+    if speed >= speed_max:
+      self.turn_guidance_started = False
+      return result('none', 'Turn signal active; model guidance waits below 25 mph' if speed_max == TURN_SPEED_MAX
+                    else 'Turn continuation exceeded 35 mph', indicator)
     # Longitudinal pedal intervention is independent of navigation lateral
     # guidance. The driver may control speed through the intersection while
     # openpilot remains laterally active.
@@ -373,6 +382,7 @@ class NavigationDesire:
                         else 'Turn confirmed; waiting until signal approach window')
       return result('none', waiting_reason, indicator)
     if not matching_signal(cs, 1 if side == 'left' else 2):
+      self.turn_guidance_started = False
       return result('none', 'Turn guidance waiting for matching active blinker', indicator)
     return result('turnLeft' if side == 'left' else 'turnRight',
                   'Navigation-authorized low-speed intersection turn',
@@ -401,7 +411,8 @@ class NavigationDesire:
   def record_model_selection(self, selected, source, evaluated, frame_id, *,
                              signal_owner='none', tap_enabled=False,
                              tap_status='unavailable', tap_signal_active=False,
-                             manual_turn_direction=0, city_turns_enabled=False, manual_turn_blocked=False):
+                             manual_turn_direction=0, city_turns_enabled=False, manual_turn_blocked=False,
+                             manual_turn_continuing=False):
     # Captured after model.run, before DesireHelper updates for the next frame.
     self.decision.update(selected_desire=selected, final_desire=selected if evaluated else None,
                          source=source, model_evaluated=bool(evaluated), frame_id=int(frame_id),
@@ -410,7 +421,8 @@ class NavigationDesire:
                          tap_status=tap_status, tap_signal_active=bool(tap_signal_active),
                          manual_turn_direction=manual_turn_direction,
                          city_turns_enabled=bool(city_turns_enabled),
-                         manual_turn_blocked=bool(manual_turn_blocked))
+                         manual_turn_blocked=bool(manual_turn_blocked),
+                         manual_turn_continuing=bool(manual_turn_continuing))
 
   def publish_diagnostics(self, now=None):
     now = time.monotonic() if now is None else now

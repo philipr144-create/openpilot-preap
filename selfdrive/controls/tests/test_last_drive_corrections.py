@@ -57,16 +57,20 @@ def test_relaxed_lower_launch_and_city_rise_other_profiles_unchanged():
  assert limit_positive_accel(-2.,.3,5.,2,.05)==-2.
 
 
-def test_actual_hso_yields_to_level_one_and_returns_from_measured_angle():
+def test_actual_hso_yields_to_level_one_with_torque_and_returns_from_measured_angle():
  from opendbc.car.tesla import carcontroller as module
  c=module.CarController.__new__(module.CarController)
  c.frame=2;c.CP=N(openpilotLongitudinalControl=False);c.apply_angle_last=90.;c.VM=None
  c.params=N(get_bool=lambda _:True);c.low_speed_steering_rate_enabled=True;c.tap_params=None
  c.tesla_can=MagicMock();c.stock_cc=N(update=lambda *a:[],pcc_event=None)
  c.parked_signal_test=N(update=lambda *a:[]);c.tap_lane_change=N(update=lambda *a,**k:[]);c.navigation_signal=N(update=lambda *a,**k:[])
- state=N(out=N(vEgo=2.,vEgoRaw=2.,leftBlinker=True,rightBlinker=False,steeringPressed=False,steeringAngleDeg=90.,canValid=True),hands_on_level=1,tap_stalk=N())
+ state=N(out=N(vEgo=2.,vEgoRaw=2.,leftBlinker=True,rightBlinker=False,steeringPressed=False,steeringAngleDeg=90.,steeringTorque=1.2,canValid=True),hands_on_level=1,tap_stalk=N())
  builder=car.CarControl.new_message();builder.latActive=True;builder.actuators.steeringAngleDeg=120.;cc=builder.as_reader()
  with patch.object(module,'apply_steer_angle_limits_vm',side_effect=lambda target,*args:target) as limit:
+  state.out.steeringTorque=.5
+  for _ in range(4):c._update_preap(cc,state)
+  assert c.tesla_can.create_steering_control.call_args.args[-1] is True
+  state.out.steeringTorque=1.2
   for _ in range(60):c._update_preap(cc,state)
   assert c.tesla_can.create_steering_control.call_args.args[-1] is False
   assert c.low_speed_turn_takeover_latched
@@ -88,11 +92,16 @@ def test_raw_hso_entry_is_two_frames_not_half_second():
  class State:
   update_steering_pressed=CarStateBase.update_steering_pressed
  c=State();c.steering_pressed_cnt=0;c.hands_on_level=1
- ret=N(vEgo=2.,steeringTorque=.5,steeringPressed=False)
- env=dict(cs=c,ret=ret,ENABLE_HSO=True,STEER_THRESHOLD=1.)
+ ret=N(vEgo=2.,steeringTorque=1.2,steeringPressed=False)
+ from opendbc.car.tesla.preap.steering_override import hands_on_override
+ env=dict(cs=c,ret=ret,ENABLE_HSO=True,STEER_THRESHOLD=1.,hands_on_override=hands_on_override)
+ ret.steeringTorque=.5
+ for _ in range(3):exec(code,env)
+ assert not ret.steeringPressed
+ ret.steeringTorque=1.2
  for _ in range(3):exec(code,env)
  assert ret.steeringPressed
- c.hands_on_level=0;exec(code,env)
+ c.hands_on_level=0;ret.steeringTorque=.5;exec(code,env)
  assert not ret.steeringPressed
 
 

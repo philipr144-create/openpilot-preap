@@ -298,9 +298,11 @@ class CityTurnGates(unittest.TestCase):
         (root/'nav').write_text(json.dumps(state))
         return nav.update(self.cs, cc, True, now=101., physical_direction=0)
       self.assertEqual(tick(), 'turnLeft')
-      self.cs.vEgo=25*.44704
+      self.cs.vEgo=26*.44704
+      self.assertEqual(tick(), 'turnLeft')
+      self.cs.vEgo=36*.44704
       self.assertEqual(tick(), 'none')
-      self.assertIn('25 mph', nav.decision['reason'])
+      self.assertIn('35 mph', nav.decision['reason'])
       self.cs.vEgo=10*.44704
       state['maneuver']['distance_m']=25.
       self.assertEqual(tick(), 'none')

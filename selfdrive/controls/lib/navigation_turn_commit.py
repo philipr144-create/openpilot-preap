@@ -24,6 +24,7 @@ DECISION_PATH = "/dev/shm/nap_navigation_decision.json"
 # Only intervene very near an already-authorized intersection turn.
 COMMIT_DISTANCE_M = 22.0
 COMMIT_SPEED_MPH = 25.0
+CONTINUE_SPEED_MPH = 35.0
 
 # Curvature floor ramps up as the intersection gets closer.
 # The model is always free to request MORE curvature in the correct direction.
@@ -183,7 +184,7 @@ class NavigationTurnCommit:
         and d.get("tap_signal_active") is False
         and d.get("synthetic_indicator_request") == "none"
         and d.get("model_evaluated") is True
-        and -0.1 <= CS.vEgo <= COMMIT_SPEED_MPH * CV.MPH_TO_MS
+        and -0.1 <= CS.vEgo <= (CONTINUE_SPEED_MPH if d.get("manual_turn_continuing") is True else COMMIT_SPEED_MPH) * CV.MPH_TO_MS
         and str(CS.gearShifter) in ("drive", "low", "sport", "eco")
         and not CS.steeringPressed
         and not getattr(CS, "steeringDisengage", False)
@@ -791,7 +792,7 @@ class ManualTurnCommit:
         or str(cs.gearShifter) not in ('drive', 'low', 'sport', 'eco')
         or (cs.leftBlindspot if direction == 1 else cs.rightBlindspot)
         or not all(math.isfinite(v) for v in (cs.vEgo, curvature, actual_curvature))
-        or not -0.1 <= cs.vEgo <= COMMIT_SPEED_MPH * CV.MPH_TO_MS
+        or not -0.1 <= cs.vEgo <= (CONTINUE_SPEED_MPH if self.started is not None else COMMIT_SPEED_MPH) * CV.MPH_TO_MS
         # Standstill is valid only for pre-arming a new intersection turn.
         # If an already-started maneuver falls back to essentially stopped,
         # cancel it and latch blocked until the physical signal is cleared.
@@ -1057,7 +1058,7 @@ class ManualTurnEntry:
       self.cancel()
       return False
     if (not authorized or self.blocked or not math.isfinite(speed)
-        or not -0.1 <= speed <= COMMIT_SPEED_MPH * CV.MPH_TO_MS
+        or not -0.1 <= speed <= (CONTINUE_SPEED_MPH if self.started is not None else COMMIT_SPEED_MPH) * CV.MPH_TO_MS
         or self.direction not in (0, direction)):
       self.cancel()
       return False

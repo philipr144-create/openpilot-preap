@@ -75,7 +75,8 @@ def test_future_turn_requires_speed_intent_dwell_and_fresh_geometry():
  m=model();e=ManualTurnEntry()
  for i in range(7):m.frameId+=1;value=e.update(m,1,5,True,100+i*.05)
  assert value
- assert not e.update(m,1,12,True,100.4)
+ assert e.update(m,1,12,True,100.4)
+ assert not e.update(m,1,16,True,100.45)
  e=ManualTurnEntry()
  for i in range(7):m.frameId+=1;assert not e.update(m,1,5,False,100+i*.05)
 
@@ -145,7 +146,7 @@ def test_steering_handback_does_not_wait_for_wheel_to_straighten():
  c.parked_signal_test=N(update=lambda *a:[]);c.tap_lane_change=N(update=lambda *a,**kw:[])
  c.navigation_signal=N(update=lambda *a,**kw:[]);c.tap_params=None
  c.params=N(get_bool=lambda _:True);c.low_speed_steering_rate_enabled=True
- out=N(vEgo=4.,vEgoRaw=4.,leftBlinker=True,rightBlinker=False,steeringPressed=True,steeringAngleDeg=25.,canValid=True)
+ out=N(vEgo=4.,vEgoRaw=4.,leftBlinker=True,rightBlinker=False,steeringPressed=True,steeringAngleDeg=25.,steeringTorque=0.,canValid=True)
  cs_=N(out=out,hands_on_level=2,tap_stalk=N())
  actuator=MagicMock();actuator.steeringAngleDeg=30.
  control=N(actuators=actuator,latActive=True)

@@ -125,7 +125,9 @@ class DesireHelper:
       self.manual_turn_cancelled = False
       self.manual_entry.reset()
 
-    if self.manual_turns_enabled and -0.1 <= v_ego < CITY_TURN_SPEED_MAX:
+    continuing_turn = self.manual_entry.started is not None
+    turn_speed_max = 35 * CV.MPH_TO_MS if continuing_turn else CITY_TURN_SPEED_MAX
+    if self.manual_turns_enabled and -0.1 <= v_ego < turn_speed_max:
       # A lamp is not authorization: only a fresh, classified physical hold can
       # arm. TapModel owns half-stalk requests independently above SPEED_MIN.
       self.lane_change_state = LaneChangeState.off
@@ -154,7 +156,10 @@ class DesireHelper:
         self.desire = log.Desire.turnLeft if direction == 1 else log.Desire.turnRight
       return
 
-    self.manual_entry.reset()
+    if self.manual_entry.started is not None:
+      self.manual_entry.cancel()
+    elif not self.manual_entry.blocked:
+      self.manual_entry.reset()
     self.manual_turn_command_active = False
 
     if not lateral_active or self.lane_change_timer > LANE_CHANGE_TIME_MAX:

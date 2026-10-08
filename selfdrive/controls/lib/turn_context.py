@@ -21,7 +21,8 @@ def manual_turn_intent(cs, decision, model, now, require_pair=True):
   if not paired_decision(decision, model, now, require_pair=require_pair):
     return False
   direction = decision.get('manual_turn_direction')
-  return (math.isfinite(cs.vEgo) and -.1 <= cs.vEgo < 25 * .44704
+  speed_max = (35 if decision.get("manual_turn_continuing") is True else 25) * .44704
+  return (math.isfinite(cs.vEgo) and -.1 <= cs.vEgo < speed_max
           and type(direction) is int and direction in (1, 2)
           and bool(cs.leftBlinker) != bool(cs.rightBlinker)
           and (direction == 1) == bool(cs.leftBlinker)
