@@ -21,6 +21,7 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.corner_assist import CornerAssist
 from openpilot.selfdrive.controls.lib.cruise_refinement import CruiseRefinement, model_support_weight
 from openpilot.selfdrive.controls.lib.map_stop import MapStop, read_snapshot
+from openpilot.selfdrive.controls.lib.normal_model_stop import NormalModelStop
 from openpilot.selfdrive.controls.lib.acceleration_handoff import braking_priority, handoff_acceleration
 
 A_CRUISE_MAX_VALS = [1.2, 1.0, 1.0, 0.8]
@@ -63,6 +64,15 @@ NAV_SNAPSHOT = '/dev/shm/nap_navigation_desire.json'
 STOP_SETTINGS = '/data/nap_turn_settings.json'
 ROAD_STOP_SNAPSHOT = '/dev/shm/nap_road_stop.json'
 MAP_CONTEXT_SNAPSHOT = '/dev/shm/nap_map_context.json'
+
+
+def normal_model_stop_enabled(path=STOP_SETTINGS):
+  try:
+    with open(path) as stream:
+      raw = stream.read(2049)
+    return len(raw) <= 2048 and json.loads(raw).get("normal_model_stops") is True
+  except (OSError, ValueError, TypeError, AttributeError):
+    return False
 
 
 def mapped_stop_setting_enabled(path=STOP_SETTINGS):
@@ -468,6 +478,7 @@ class LongitudinalPlanner:
 
     self.corner_assist = CornerAssist()
     self.map_stop = MapStop()
+    self.normal_model_stop = NormalModelStop(dt)
     self.cruise_refinement = CruiseRefinement(dt)
 
     self._is_preap = (CP.brand == "tesla" and CP.carFingerprint == "TESLA_MODEL_S_PREAP"
@@ -900,6 +911,11 @@ class LongitudinalPlanner:
 
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
+    normal_stop_active = self.normal_model_stop.update(
+      sm['modelV2'], v_ego, enabled=self._is_preap
+      and not sm['selfdriveState'].experimentalMode and normal_model_stop_enabled(),
+      valid=sm.all_checks(service_list=['modelV2', 'carState']),
+      reset=reset_state or sm['carState'].gasPressed)
 
     # Replace the historical constant E2E bias with bounded speed support.
     # Weak model coasting may receive bounded support; braking predictions
@@ -913,7 +929,7 @@ class LongitudinalPlanner:
         self.nap_adaptive_accel and not reset_state and not sm['carState'].gasPressed
         and effective_allow_throttle and not force_slow_decel and v_ego >= 5.0
         and not sm['radarState'].leadOne.status and not (lead_two is not None and lead_two.status)
-        and not output_should_stop_mpc and not output_should_stop_e2e and not map_should_stop
+        and not output_should_stop_mpc and not output_should_stop_e2e and not normal_stop_active and not map_should_stop
         and output_a_target_mpc >= 0.0 and model_weight > 0.0)
       if sm['selfdriveState'].experimentalMode:
         output_a_target_e2e += support * model_weight
@@ -974,6 +990,13 @@ class LongitudinalPlanner:
     else:
       output_a_target = output_a_target_mpc
       self.output_should_stop = output_should_stop_mpc
+      if normal_stop_active:
+        # Share Experimental's restrictive model/MPC selection only while
+        # a model stop is acquired; Normal cruise remains MPC-owned.
+        output_a_target = min(output_a_target_mpc, output_a_target_e2e, 0.0)
+        self.output_should_stop = output_should_stop_mpc or output_should_stop_e2e
+        if output_a_target < output_a_target_mpc:
+          self.mpc.source = LongitudinalPlanSource.e2e
 
       if self._is_preap:
         self.exp_model_brake_frames = 0
