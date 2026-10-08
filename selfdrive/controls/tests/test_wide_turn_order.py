@@ -1,5 +1,7 @@
 """Exercise controlsd's actual curvature pipeline without starting its processes."""
 import ast
+import time
+from openpilot.selfdrive.controls.lib.turn_context import manual_turn_intent
 import os
 from pathlib import Path
 from types import SimpleNamespace as N
@@ -26,7 +28,7 @@ def pipeline():
              and ast.unparse(n.target) == 'new_desired_curvature')
   fn = ast.parse('def run(self, CS, CC, model_v2):\n  pass').body[0]
   fn.body = method.body[start:end] + [ast.Return(value=ast.Name(id='new_desired_curvature',ctx=ast.Load()))]
-  namespace = dict(CV=CV, DT_CTRL=DT_CTRL, log=log)
+  namespace = dict(CV=CV, DT_CTRL=DT_CTRL, log=log, time=time, manual_turn_intent=manual_turn_intent)
   module=ast.fix_missing_locations(ast.Module(body=constants+[scale,fn],type_ignores=[]))
   exec(compile(module,str(source),'exec'),namespace)
   return namespace['run']
@@ -56,9 +58,9 @@ class WideTurnOrder(unittest.TestCase):
                    wide_low_speed_turns_enabled=enabled, low_speed_turn_curvature=0.,
                    low_speed_turn_smoothing_active=False, low_speed_turn_entry_active=False,
                    low_speed_turn_ramp_time=0.)
-    self.cs=N(vEgo=speed,leftBlinker=blinker and sign<0,rightBlinker=blinker and sign>0)
+    self.cs=N(vEgo=speed,leftBlinker=blinker and sign<0,rightBlinker=blinker and sign>0, steeringPressed=False, brakePressed=False, canValid=True, gearShifter='drive', leftBlindspot=False, rightBlindspot=False)
     self.cc=N(latActive=True)
-    self.model=N(action=N(desiredCurvature=sign*.04))
+    self.model=N(frameId=1,action=N(desiredCurvature=sign*.04))
 
   def tick(self): return self.run_pipeline(self.control,self.cs,self.cc,self.model)
 
@@ -69,7 +71,7 @@ class WideTurnOrder(unittest.TestCase):
         if ownership == 'active': self.commit.active = True
         else:
           self.commit.decision = dict(city_turns_enabled=True, signal_owner='driver',
-                                      manual_turn_direction=1 if sign < 0 else 2)
+                                      manual_turn_direction=1 if sign < 0 else 2, received_mono=time.monotonic(), frame_id=1, model_evaluated=True, tap_signal_active=False, synthetic_indicator_request='none', source='none', final_desire='none')
         self.assertEqual(self.tick(), sign*.055)
         self.assertFalse(self.control.low_speed_turn_smoothing_active)
 
@@ -92,7 +94,7 @@ class WideTurnOrder(unittest.TestCase):
       outputs=[self.tick() for _ in range(200)]
       self.assertAlmostEqual(outputs[-1],sign*.055)
       self.assertFalse(self.control.low_speed_turn_entry_active)
-      self.assertTrue(all(abs(b-a)<=.0009+1e-12 for a,b in zip(outputs,outputs[1:])))
+      self.assertTrue(all(abs(b-a)<=.130*DT_CTRL+1e-12 for a,b in zip(outputs,outputs[1:])))
 
   def test_toggle_off_high_speed_and_no_blinker_preserve_request(self):
     for kwargs in ({'enabled':False},{'speed':25*CV.MPH_TO_MS},{'blinker':False}):

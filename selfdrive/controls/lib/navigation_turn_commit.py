@@ -13,6 +13,7 @@ import math
 import time
 
 from openpilot.common.constants import CV
+from openpilot.selfdrive.controls.lib.turn_context import driver_braking, paired_decision, manual_turn_intent
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 
@@ -48,6 +49,8 @@ class NavigationTurnCommit:
     self.last_read = -1e9
     self.last_diagnostic = -1e9
     self.decision = None
+    self.manual_veto_direction = 0
+    self.manual_veto_until = -math.inf
 
     self.active = False
     self.state = "OFF"
@@ -161,7 +164,17 @@ class NavigationTurnCommit:
       direction = d.get("manual_turn_direction")
       one_blinker = bool(CS.leftBlinker) != bool(CS.rightBlinker)
 
+      paired_intent = manual_turn_intent(CS, d, model, now)
+      if paired_intent:
+        self.manual_veto_direction = direction
+        self.manual_veto_until = now + .15
+      # Retain only a previously frame-validated directional veto across
+      # brief asynchronous publication gaps. This cannot authorize a turn floor.
+      carried_veto = (direction == self.manual_veto_direction and now <= self.manual_veto_until
+                      and manual_turn_intent(CS, d, model, now, require_pair=False))
       manual_valid = (
+        (paired_intent or carried_veto)
+        and
         one_blinker
         and healthy
         and d.get("city_turns_enabled") is True
@@ -173,7 +186,7 @@ class NavigationTurnCommit:
         and str(CS.gearShifter) in ("drive", "low", "sport", "eco")
         and not CS.steeringPressed
         and not getattr(CS, "steeringDisengage", False)
-        and not CS.brakePressed
+        and not driver_braking(CS)
         and CS.canValid
       )
 
@@ -741,6 +754,12 @@ class ManualTurnCommit:
       self.blocked = False
       self.reset()
       return curvature
+    if cs.steeringPressed and not getattr(cs, "steeringDisengage", False):
+      blocked = self.blocked
+      self.reset()
+      self.blocked = blocked
+      self.state = "DRIVER ASSIST"
+      return curvature
     if not isinstance(decision, dict):
       self.cancel()
       return curvature
@@ -768,7 +787,7 @@ class ManualTurnCommit:
         or decision.get('tap_signal_active') is not False
         or decision.get('synthetic_indicator_request') != 'none'
         or cs.steeringPressed or getattr(cs, 'steeringDisengage', False)
-        or cs.brakePressed or not cs.canValid
+        or driver_braking(cs) or not cs.canValid
         or str(cs.gearShifter) not in ('drive', 'low', 'sport', 'eco')
         or (cs.leftBlindspot if direction == 1 else cs.rightBlindspot)
         or not all(math.isfinite(v) for v in (cs.vEgo, curvature, actual_curvature))
@@ -1029,11 +1048,14 @@ class ManualTurnEntry:
         for t, y in zip(model.position.t, model.position.y)
         if 0.5 <= float(t) <= 3.0
       )
-      return heading >= math.radians(20) and max_offset >= 2.0
+      return heading >= math.radians(15) and max_offset >= 1.5
     except (AttributeError, TypeError, ValueError, OverflowError):
       return False
 
-  def update(self, model, direction, speed, authorized, now):
+  def update(self, model, direction, speed, authorized, now, driver_assisting=False):
+    if driver_assisting and not self.blocked:
+      self.reset()
+      return False
     if (not authorized or self.blocked or not math.isfinite(speed)
         or not -0.1 <= speed <= COMMIT_SPEED_MPH * CV.MPH_TO_MS
         or self.direction not in (0, direction)):

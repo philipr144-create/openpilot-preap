@@ -65,9 +65,11 @@ class MapStop:
     self.consumed = {}
     self.travel = 0.0
     self.last_time = None
+    self.paused_for_event = False
 
   def clear(self):
     self.phase, self.event = 'idle', None
+    self.paused_for_event = False
 
   def update(self, nav, resume, *, enabled, active, inputs_valid, v_ego, gas, now):
     if not number(now) or not number(v_ego) or not 0 <= v_ego <= 45:
@@ -97,7 +99,11 @@ class MapStop:
                   and token[1] > self.sequence and resume.get('healthy') is True
                   and resume.get('brake') is False and resume.get('paused') is False)
       self.session, self.sequence = token
-      if accepted and self.event is not None and self.phase == 'held':
+      if self.event is not None and resume.get('paused') is True:
+        candidate = stop_candidate(nav, now)
+        if self.phase == 'held' or (candidate is not None and candidate[:2] == self.event and candidate[2] <= 30):
+          self.paused_for_event = True
+      if accepted and self.event is not None and (self.phase == 'held' or self.paused_for_event):
         self.consumed[self.event[1]] = self.travel
         self.clear()
         return None, False

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import math
+import time
 from numbers import Number
 
 from cereal import car, log
@@ -14,6 +15,7 @@ from opendbc.car.vehicle_model import VehicleModel
 from openpilot.selfdrive.controls.lib.drive_helpers import clip_curvature
 from openpilot.selfdrive.controls.lib.lane_centering import LaneCenteringAssist
 from openpilot.selfdrive.controls.lib.navigation_turn_commit import NavigationTurnCommit
+from openpilot.selfdrive.controls.lib.turn_context import manual_turn_intent
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
 from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, STEER_ANGLE_SATURATION_THRESHOLD
@@ -183,6 +185,10 @@ class Controls:
                    (not standstill or self.CP.steerAtStandstill)
     CC.longActive = CC.enabled and not any(e.overrideLongitudinal for e in self.sm['onroadEvents']) and self.CP.openpilotLongitudinalControl
 
+    if (self.CP.carFingerprint == "TESLA_MODEL_S_PREAP"
+        and self.CP.openpilotLongitudinalControl and not self.CP.pcmCruise):
+      CC.longActive = CC.longActive and bool(CS.pedalLongActive)
+
     actuators = CC.actuators
     actuators.longControlState = self.LoC.long_control_state
 
@@ -226,10 +232,7 @@ class Controls:
       self.lane_centering_offset = self.params.get("NAPLaneCenterOffset", return_default=True)
 
     decision = getattr(self.navigation_turn_commit, 'decision', None)
-    manual_city_intent = (one_blinker and isinstance(decision, dict)
-                          and decision.get('city_turns_enabled') is True
-                          and decision.get('signal_owner') == 'driver'
-                          and decision.get('manual_turn_direction') == (1 if CS.leftBlinker else 2))
+    manual_city_intent = manual_turn_intent(CS, decision, model_v2, time.monotonic())
     city_turn_path = manual_city_intent or getattr(self.navigation_turn_commit, 'active', False)
     # City turns must follow their model/commit path through the normal safety
     # limits, without an extra entrance-radius expansion or steering delay.

@@ -103,7 +103,7 @@ class PlannerReference(unittest.TestCase):
       mpc.j_solution=np.zeros(len(lp.T_IDXS_MPC)-1);mpc.crash_cnt=0
       corner.return_value.apply.side_effect=lambda a,*args:a
       planner=lp.LongitudinalPlanner(cp)
-      planner.map_stop=N(update=lambda *args,**kwargs:(None,False))
+      planner.map_stop=N(consumed={}, update=lambda *args,**kwargs:(None,False))
       state=dict(version=3,enabled=True,valid=True,control_valid=True,status='ok',mono_time=10.,expires_mono=12.,
                  match=dict(distance_m=0.,heading_error_deg=0.,confidence=1.),lookahead_m=450.)
       path=Path(tmp)/'curves.json'
@@ -116,7 +116,7 @@ class PlannerReference(unittest.TestCase):
         with patch.object(lp,'map_curve_speed_cap',side_effect=lambda **kw:real_cap(path=path,now=10.,**kw)):
           planner.update(sm)
         # Curve assistant always receives the original driver setting.
-        self.assertAlmostEqual(corner.return_value.apply.call_args.args[-1], cruise*MPH)
+        self.assertAlmostEqual(corner.return_value.apply.call_args.args[5], cruise*MPH)
         return mpc.update.call_args.args[1]/MPH
       # With the shorter map-entry buffer, the vehicle is allowed to
       # remain slightly above the final mapped curve target while still

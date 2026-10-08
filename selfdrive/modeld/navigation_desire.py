@@ -1,3 +1,4 @@
+from openpilot.selfdrive.controls.lib.turn_context import driver_braking
 """Driver-confirmed navigation desires and synthetic announcement requests."""
 import json
 import math
@@ -322,7 +323,7 @@ class NavigationDesire:
           self.started = now
       if steering_override:
         return result('none', 'Driver steering override; exit signal remains active', indicator)
-      if cs.brakePressed or not cc.latActive:
+      if driver_braking(cs) or not cc.latActive:
         return result('none', 'Exit guidance paused; brake or lateral control gate', indicator)
       return result('keepLeft' if side == 'left' else 'keepRight',
                     'Navigation-authorized bounded exit preference', indicator)
@@ -418,7 +419,7 @@ class NavigationDesire:
               and self.decision.get('city_turns_enabled') is True
               and self.decision.get('manual_turn_direction') in (1, 2))
     interval = .05 if manual or self.manual_diagnostics_active else .5
-    if now-self.last_write < interval:
+    if now-self.last_write < interval - 1e-6:
       return
     self.last_write = now
     self.manual_diagnostics_active = manual

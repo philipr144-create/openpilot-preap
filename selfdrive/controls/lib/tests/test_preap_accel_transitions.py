@@ -81,7 +81,7 @@ class PlannerTransitions(unittest.TestCase):
       modelV2=N(position=N(x=[]),meta=N(disengagePredictions=N(gasPressProbs=[])),
                 action=N(desiredAcceleration=1.,shouldStop=False)))
     self.p=lp.LongitudinalPlanner(cp)
-    self.p.map_stop=N(update=lambda *a,**kw:(None,False))
+    self.p.map_stop=N(consumed={}, update=lambda *a,**kw:(None,False))
 
   def tick(self):
     self.p.update(self.sm)

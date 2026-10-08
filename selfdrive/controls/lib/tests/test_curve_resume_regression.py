@@ -50,9 +50,9 @@ def test_brake_resume_accepts_press_release_restores_speed(duration):
   def step(t,gas=False,speed=0.):
     return e.process_brake_resume(t,speed,False,gas,True,True,True,True)
   assert not step(2100)
-  assert not step(2200,True)
-  assert not e.enableLongControl
-  assert step(2200+duration,speed=5.)
+  assert step(2200,True)
+  assert e.enableLongControl
+  assert not step(2200+duration,speed=5.)
   assert e.enableLongControl and e.pedal_speed_kph==target and e.resume_sequence==1
   assert not step(2300+duration)
   assert e.resume_sequence==1
@@ -68,7 +68,6 @@ def test_throttle_release_cannot_engage_lateral_only_without_brake_pause():
 def test_full_regen_survives_actual_engage_grace_and_negative_jerk_limiter():
   with patch.object(cc,'nap_conf') as conf, patch.object(cc,'get_zero_torque') as zero, \
        patch('opendbc.car.tesla.preap.virtual_das.get_zero_torque') as vz, \
-       patch.object(cc,'get_preap_accel_limits',return_value=(-2.5,.7)), \
        patch.object(cc,'get_preap_personality',return_value=2):
     conf.use_pedal=True;conf.pedal_factor=1.;conf.di_to_pedal.side_effect=lambda x:x
     zero.return_value.get.return_value=0.;vz.return_value.get.return_value=0.

@@ -112,7 +112,7 @@ def road_stop_speed_cap(path=ROAD_STOP_SNAPSHOT, settings=STOP_SETTINGS, now=Non
 
 
 
-def map_curve_speed_cap(path=MAP_CONTEXT_SNAPSHOT, now=None, v_ego=None):
+def map_curve_speed_cap(path=MAP_CONTEXT_SNAPSHOT, now=None, v_ego=None, consumed_stops=(), include_stops=True):
   """Fail-open map-context cruise ceiling.
 
   Uses the complete mapped curve corridor rather than one curve.
@@ -312,7 +312,7 @@ def map_curve_speed_cap(path=MAP_CONTEXT_SNAPSHOT, now=None, v_ego=None):
     # remains responsible for the actual intersection.
     # ------------------------------------------------------------
 
-    if mapped_stop_setting_enabled():
+    if include_stops and mapped_stop_setting_enabled():
       events = state.get(
         'events',
         [],
@@ -323,7 +323,7 @@ def map_curve_speed_cap(path=MAP_CONTEXT_SNAPSHOT, now=None, v_ego=None):
           if not isinstance(event, dict):
             continue
 
-          if event.get('type') != 'stop_sign':
+          if event.get('type') != 'stop_sign' or str(event.get('node_id')) in consumed_stops:
             continue
 
           distance = event.get(
@@ -372,7 +372,7 @@ def map_curve_speed_cap(path=MAP_CONTEXT_SNAPSHOT, now=None, v_ego=None):
   ):
     return None
 
-def navigation_speed_cap(path=NAV_SNAPSHOT, now=None, v_ego=None):
+def navigation_speed_cap(path=NAV_SNAPSHOT, now=None, v_ego=None, consumed_stops=()):
   """Conservative cruise cap from fresh, well-matched route geometry."""
   now = time.monotonic() if now is None else now
   try:
@@ -402,7 +402,7 @@ def navigation_speed_cap(path=NAV_SNAPSHOT, now=None, v_ego=None):
         return None
     caps = []
     stop = state.get('mapped_stop_sign')
-    if isinstance(stop, dict) and mapped_stop_setting_enabled():
+    if isinstance(stop, dict) and stop.get('id') not in consumed_stops and mapped_stop_setting_enabled():
       stop_distance = stop.get('distance_m')
       if (isinstance(stop.get('id'), str) and stop['id'] and
           type(stop_distance) in (int, float) and math.isfinite(stop_distance) and
@@ -841,14 +841,17 @@ class LongitudinalPlanner:
       # Both are speed CEILINGS only. Neither path may raise the driver's
       # cruise target or override a more restrictive planner/radar/model limit.
       if self.nap_navigation_maneuvers:
-        nav_cap = navigation_speed_cap(v_ego=v_ego)
+        nav_cap = navigation_speed_cap(v_ego=v_ego, consumed_stops=self.map_stop.consumed)
         if nav_cap is not None:
           v_cruise = min(v_cruise, nav_cap)
 
       if self.nap_map_driving_assist:
         # Curves retain their existing ceiling. Direction-matched route stops
         # use the separate driver-brake / acknowledged-resume lifecycle.
-        curve_cap = map_curve_speed_cap(v_ego=v_ego)
+        curve_cap = map_curve_speed_cap(v_ego=v_ego, include_stops=False)
+        preparation_cap = map_curve_speed_cap(v_ego=v_ego, consumed_stops=self.map_stop.consumed)
+        if preparation_cap is not None:
+          v_cruise = min(v_cruise, preparation_cap)
 
     if self._is_preap:
       curve_target = self.cruise_refinement.curve_target(
@@ -895,13 +898,6 @@ class LongitudinalPlanner:
       else:
         self.phantom_brake_counter = 0
 
-      # Phantom braking buffer
-      if output_a_target_mpc < self.output_a_target - 0.5:
-        self.phantom_brake_counter += 1
-        if self.phantom_brake_counter < 5:
-          output_a_target_mpc = max(output_a_target_mpc, self.output_a_target - 0.5)
-      else:
-        self.phantom_brake_counter = 0
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
 
@@ -992,7 +988,8 @@ class LongitudinalPlanner:
     corner_braking = False
     if self._is_preap:
       before_corner = output_a_target
-      output_a_target = self.corner_assist.apply(output_a_target, sm, self.CP, reset_state, accel_coast, driver_cruise_speed)
+      output_a_target = self.corner_assist.apply(output_a_target, sm, self.CP, reset_state, accel_coast, driver_cruise_speed,
+                                                       read_snapshot("/dev/shm/nap_navigation_decision.json"))
 
       corner_braking = output_a_target < min(0., before_corner)
 

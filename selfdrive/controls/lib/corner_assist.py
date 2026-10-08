@@ -3,6 +3,7 @@ import json
 import math
 import time
 
+from openpilot.selfdrive.controls.lib.turn_context import driver_braking, paired_decision, manual_turn_intent
 from openpilot.selfdrive.controls.lib.curve_comfort import PROFILES, DEFAULT_PROFILE, read_curve_comfort
 
 SETTINGS = '/data/nap_turn_settings.json'
@@ -121,7 +122,7 @@ class CornerAssist:
       self.reason = 'Above absolute curve target; gradual slowdown'
     return min(base, self.cap, target_cap) if target_cap >= 0. else min(base, self.cap)
 
-  def apply(self, base, sm, CP, reset, coast, cruise_speed=None):
+  def apply(self, base, sm, CP, reset, coast, cruise_speed=None, decision=None):
     now = time.monotonic()
     try:
       cs, cc, model = sm['carState'], sm['carControl'], sm['modelV2']
@@ -129,8 +130,11 @@ class CornerAssist:
                   for s in ('carState', 'carControl', 'modelV2'))
       # Exactly one reported indicator must be active; hazards do not qualify.
       signaled = bool(cs.leftBlinker) != bool(cs.rightBlinker)
-      active = (signaled and fresh and not reset and cs.canValid and cc.longActive and cc.latActive
-                and not cs.brakePressed and not cs.gasPressed and not cs.steeringPressed
+      turn_intent = manual_turn_intent(cs, decision, model, now)
+      nav_turn = (paired_decision(decision, model, now) and decision.get("source") == "navigation"
+                  and decision.get("confirmed") is True and decision.get("final_desire") in ("turnLeft", "turnRight"))
+      active = ((turn_intent or nav_turn) and signaled and fresh and not reset and cs.canValid and cc.longActive and cc.latActive
+                and not driver_braking(cs) and not cs.gasPressed and not cs.steeringPressed
                 and str(cs.gearShifter) == 'drive')
       curve = path_curve(model.position.x, model.position.y, min(40., max(12., cs.vEgo*3)))
       # Require usable model geometry even when steering indicates a curve.

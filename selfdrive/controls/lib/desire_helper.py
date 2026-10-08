@@ -2,6 +2,7 @@ import json
 import time
 
 from openpilot.selfdrive.controls.lib.navigation_turn_commit import ManualTurnEntry
+from openpilot.selfdrive.controls.lib.turn_context import driver_braking
 
 from cereal import log
 from openpilot.common.constants import CV
@@ -140,10 +141,14 @@ class DesireHelper:
                     and (direction == 1) == bool(carstate.leftBlinker)
                     and not carstate.steeringPressed
                     and not getattr(carstate, 'steeringDisengage', False)
-                    and (not carstate.brakePressed or v_ego <= 0.3) and carstate.canValid
+                    and (not driver_braking(carstate) or v_ego <= 0.3) and carstate.canValid
                     and str(carstate.gearShifter) in ('drive', 'low', 'sport', 'eco')
                     and not (carstate.leftBlindspot if direction == 1 else carstate.rightBlindspot))
-      self.manual_turn_command_active = self.manual_entry.update(model, direction, max(0.0, v_ego), authorized, now)
+      self.manual_turn_command_active = self.manual_entry.update(
+        model, direction, max(0.0, v_ego), authorized, now,
+        driver_assisting=(carstate.steeringPressed and not getattr(carstate, "steeringDisengage", False)
+                          and inputs_valid and lateral_active and one_blinker
+                          and direction in (1, 2) and not driver_braking(carstate)))
       self.manual_turn_cancelled = self.manual_entry.blocked
       if self.manual_turn_command_active:
         self.desire = log.Desire.turnLeft if direction == 1 else log.Desire.turnRight

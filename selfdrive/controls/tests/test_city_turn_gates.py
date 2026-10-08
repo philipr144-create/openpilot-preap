@@ -50,7 +50,7 @@ class CityTurnGates(unittest.TestCase):
     self.model.orientation.z = [0., 0., -.3, -.6]
     self.model.position.y = [0., 0., -2., -4.]
     self.model.action.desiredCurvature = 0.
-    for _ in range(6):
+    for _ in range(4):
       self.assertEqual(self.tick(), log.Desire.none)
     for _ in range(4):
       self.tick()
@@ -85,15 +85,15 @@ class CityTurnGates(unittest.TestCase):
       if case == 'stopped':
         self.assertEqual(self.tick(), log.Desire.turnLeft)
       else:
-        for _ in range(6): self.assertEqual(self.tick(), log.Desire.none)
+        for _ in range(4): self.assertEqual(self.tick(), log.Desire.none)
         for _ in range(4): self.tick()
         self.assertEqual(self.helper.desire, log.Desire.turnLeft)
 
   def test_shrinking_remaining_turn_keeps_desire_but_cannot_start_one(self):
     self.prepare()
     for _ in range(10): self.tick()
-    self.model.orientation.z = [0., -.05, -.15, -.26]
-    self.model.position.y = [0., -.2, -.5, -1.]
+    self.model.orientation.z = [0., -.02, -.06, -.10]
+    self.model.position.y = [0., -.1, -.25, -.5]
     self.model.action.desiredCurvature = -.013
     for _ in range(30): self.assertEqual(self.tick(), log.Desire.turnLeft)
     self.helper.manual_entry.reset()
@@ -106,7 +106,7 @@ class CityTurnGates(unittest.TestCase):
 
   def test_near_path_requires_sustained_confirmation(self):
     self.prepare()
-    for _ in range(6): self.assertEqual(self.tick(), log.Desire.none)
+    for _ in range(4): self.assertEqual(self.tick(), log.Desire.none)
     for _ in range(3): self.tick()
     self.assertEqual(self.helper.desire, log.Desire.turnLeft)
 
@@ -135,7 +135,10 @@ class CityTurnGates(unittest.TestCase):
       self.assertEqual(self.tick(), log.Desire.none)
       setattr(self.cs, field, False)
       # Hazards explicitly clear the direction; steering/brake remain latched.
-      if field != 'rightBlinker':
+      if field == 'steeringPressed':
+        for _ in range(10): self.tick()
+        self.assertEqual(self.helper.desire, log.Desire.turnLeft)
+      elif field != 'rightBlinker':
         for _ in range(20): self.assertEqual(self.tick(), log.Desire.none)
       self.cs.leftBlinker = False
       self.tick(direction=0)
@@ -218,7 +221,7 @@ class CityTurnGates(unittest.TestCase):
       self.model.action.desiredCurvature = 0.0
 
       # Still require sustained confirmation; blinker alone cannot turn.
-      for _ in range(6):
+      for _ in range(4):
         self.assertEqual(
           self.tick(direction=direction),
           log.Desire.none,

@@ -123,26 +123,25 @@ class Resume(unittest.TestCase):
   def step(self,e,t,gas=False,healthy=True,brake=False,speed=0.):
     return e.process_brake_resume(t,speed,brake,gas,healthy,True,True,True)
 
-  def test_transient_health_loss_recovers_but_requires_fresh_tap(self):
+  def test_unhealthy_press_requires_release_and_fresh_press(self):
     e=self.engagement()
-    self.step(e,2100);self.step(e,2200,True)
-    self.step(e,2250,True,False)
-    self.assertTrue(e.brake_paused_long)
+    self.step(e,2100)
+    self.assertFalse(self.step(e,2200,True,False))
+    self.assertFalse(self.step(e,2250,True,True))
     self.assertFalse(self.step(e,2320))
-    self.step(e,2400); self.step(e,2500,True)
-    self.assertTrue(self.step(e,2620))
+    self.assertTrue(self.step(e,2500,True))
+    self.assertFalse(self.step(e,2620))
     self.assertEqual(e.resume_sequence,1)
 
-  def test_tap_limits_held_gas_brake_and_speed(self):
-    for duration in (20,2501):
-      e=self.engagement();self.step(e,2100);self.step(e,2200,True)
-      self.assertFalse(self.step(e,2200+duration))
+  def test_press_interlocks_and_release_does_not_repeat_ack(self):
     e=self.engagement();self.step(e,2100,True,brake=True)
     self.step(e,2200,True);self.assertFalse(self.step(e,2320))
-    e=self.engagement();self.step(e,2100);self.step(e,2200,True,speed=5.)
+    e=self.engagement();self.step(e,2100)
+    self.assertFalse(self.step(e,2200,True,speed=5.))
     self.assertFalse(self.step(e,2320))
-    e=self.engagement();self.step(e,2100);self.step(e,2200,True,speed=4.)
-    self.assertTrue(self.step(e,2320,speed=5.))
+    e=self.engagement();self.step(e,2100)
+    self.assertTrue(self.step(e,2200,True,speed=4.))
+    self.assertFalse(self.step(e,2320,speed=5.))
 
   def test_missing_feedback_not_reported_healthy(self):
     p=PedalFeedback();p.available=True;p.timeout=False
@@ -162,7 +161,7 @@ class Resume(unittest.TestCase):
       args.update(active=False,v_ego=0.,now=10.1)
       m.update(nav(10.1,7),read_snapshot(p),**args)
       self.assertEqual(m.phase,'held')
-      self.step(e,2100);self.step(e,2200,True);self.assertTrue(self.step(e,2320))
+      self.step(e,2100);self.assertTrue(self.step(e,2200,True));self.assertFalse(self.step(e,2320))
       writer.publish(e,False,True,True,True,now=10.3)
       args.update(active=True,now=10.3)
       self.assertEqual(m.update(nav(10.3,7),read_snapshot(p),**args),(None,False))
@@ -235,7 +234,7 @@ class PlannerIntegration(unittest.TestCase):
       corner.return_value.apply.side_effect=lambda a,*args:a
       planner=lp.LongitudinalPlanner(cp)
       if map_state is not None: planner.map_stop=map_state
-      read.side_effect=[nav(10.,distance),status(10.)]
+      read.side_effect=[nav(10.,distance),status(10.),None]
       planner.update(sm)
       return planner,mpc.update.call_args.args[1],mpc.update.call_args.kwargs['max_accel']
 
