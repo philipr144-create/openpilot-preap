@@ -94,3 +94,15 @@ def test_low_epas_contact_is_not_override_strong_effort_still_wins():
  assert hands_on_override(2,.0)
  assert hands_on_override(3,.0)
  assert hands_on_override(0,float('nan'))
+
+
+def test_low_speed_epas_contact_respects_existing_torque_allowance():
+ from opendbc.car.tesla.preap.steering_override import takeover_torque_threshold
+ for mph, expected in [(0,2.5),(5,2.5),(10,2.0),(15,1.5),(20,1.0),(25,1.0),(26,1.0)]:
+  threshold=takeover_torque_threshold(mph/2.236936)
+  assert abs(threshold-expected)<1e-8
+  assert not hands_on_override(1,threshold-.01,threshold)
+  assert hands_on_override(1,threshold+.01,threshold)
+  assert hands_on_override(2,0.,threshold)
+  assert hands_on_override(3,0.,threshold)
+ assert not hands_on_override(1,1.2,takeover_torque_threshold(2.))
