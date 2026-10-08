@@ -49,7 +49,7 @@ class Policy(unittest.TestCase):
   def test_actuator_rise_and_braking(self):
     with patch('opendbc.car.tesla.preap.virtual_das.get_zero_torque') as zero:
       zero.return_value.get.return_value=0.
-      for p,rise in ((2,.3),(1,.4),(0,.6)):
+      for p,rise in ((2,.18),(1,.4),(0,.6)):
         vdas=VirtualDAS(dt=.02)
         for i in range(20):
           vdas.update(2.,10.,vdas.prev_pedal_di,personality=p)
@@ -107,7 +107,7 @@ class PlannerTransitions(unittest.TestCase):
     self.sm['modelV2'].action.desiredAcceleration=-.2
     self.assertAlmostEqual(self.tick(),-.2)
     self.sm['selfdriveState'].experimentalMode=False
-    self.assertAlmostEqual(self.tick(),.015)
+    self.assertAlmostEqual(self.tick(),.009)
 
   def test_lead_braking_bypasses_phantom_buffer(self):
     for _ in range(60):self.tick()
@@ -125,9 +125,9 @@ class PlannerTransitions(unittest.TestCase):
   def test_override_restarts_ramp(self):
     for _ in range(60):self.tick()
     self.sm['carState'].gasPressed=True
-    self.assertAlmostEqual(self.tick(),.015)
+    self.assertAlmostEqual(self.tick(),.009)
     self.sm['carState'].gasPressed=False
-    self.assertAlmostEqual(self.tick(),.03)
+    self.assertAlmostEqual(self.tick(),.018)
 
   def test_lower_personality_cap_immediate(self):
     self.sm['selfdriveState'].personality=1
@@ -139,8 +139,8 @@ class PlannerTransitions(unittest.TestCase):
   def test_standstill_launch(self):
     self.sm['carState'].vEgo=0.;self.sm['carState'].standstill=True
     for i in range(40):
-      self.assertLessEqual(self.tick(),min(.24,(i+1)*.015)+1e-9)
-    self.assertAlmostEqual(self.p.output_a_target,.24)
+      self.assertLessEqual(self.tick(),min(.14,(i+1)*.009)+1e-9)
+    self.assertAlmostEqual(self.p.output_a_target,.14)
 
 class SolverIntegration(unittest.TestCase):
   def test_real_mpc_lead_and_cruise_cap(self):
@@ -164,8 +164,7 @@ class ControllerIntegration(unittest.TestCase):
   def test_gas_override_and_recovery_keep_driver_authority(self):
     from opendbc.car.tesla.preap import carcontroller as cc
     with patch.object(cc,'nap_conf') as conf, patch.object(cc,'get_zero_torque') as zero, \
-         patch.object(cc,'get_preap_personality',return_value=2), \
-         patch.object(cc,'get_preap_accel_limits',return_value=(-2.5,.45)):
+         patch.object(cc,'get_preap_personality',return_value=2):
       conf.use_pedal=True;conf.pedal_factor=1.;conf.di_to_pedal.side_effect=lambda v:v
       zero.return_value.get.return_value=0.
       cs=N(cruiseEnabled=True,enableLongControl=True,pedal_interceptor_value=0.,
@@ -175,7 +174,7 @@ class ControllerIntegration(unittest.TestCase):
       can=MagicMock();controller=cc.PreAPLongController()
       controller.update(control,cs,0,can,0)
       for frame in range(2,100,2):controller.update(control,cs,frame,can,0)
-      self.assertLessEqual(controller.vdas.jerk_limiter.a_limited,.3)
+      self.assertAlmostEqual(controller.vdas.jerk_limiter.a_limited,.18)
       cs.out.gasPressed=True
       controller.update(control,cs,100,can,0)
       self.assertEqual(can.create_pedal_command.call_args.kwargs['enable'],0)
@@ -183,7 +182,7 @@ class ControllerIntegration(unittest.TestCase):
       cs.out.gasPressed=False
       controller.update(control,cs,102,can,0)
       self.assertEqual(can.create_pedal_command.call_args.kwargs['enable'],1)
-      self.assertAlmostEqual(controller.vdas.jerk_limiter.a_limited,.006)
+      self.assertAlmostEqual(controller.vdas.jerk_limiter.a_limited,.0036)
       cs.enableLongControl=False
       controller.update(control,cs,104,can,0)
       self.assertEqual(can.create_pedal_command.call_args.kwargs['enable'],0)

@@ -32,6 +32,8 @@ class TurnSignConventions(unittest.TestCase):
     self.nav._refresh = lambda _: None
 
   def request(self, direction, model_curvature, now=100.):
+    self.cs.leftBlinker = direction == 'left'
+    self.cs.rightBlinker = direction == 'right'
     self.nav.decision = dict(desire='turnLeft' if direction == 'left' else 'turnRight',
                              confirmed=True, distance_m=6., modifier=direction)
     return self.nav.update(model_curvature, self.cs, True, now)

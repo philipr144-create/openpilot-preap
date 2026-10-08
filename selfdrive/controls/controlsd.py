@@ -15,6 +15,7 @@ from opendbc.car.vehicle_model import VehicleModel
 from openpilot.selfdrive.controls.lib.drive_helpers import clip_curvature
 from openpilot.selfdrive.controls.lib.lane_centering import LaneCenteringAssist
 from openpilot.selfdrive.controls.lib.navigation_turn_commit import NavigationTurnCommit
+from openpilot.selfdrive.controls.lib.turn_steering_gate import TurnSteeringGate
 from openpilot.selfdrive.controls.lib.turn_context import manual_turn_intent
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
@@ -184,6 +185,12 @@ class Controls:
     CC.latActive = self.sm['selfdriveState'].active and not CS.steerFaultTemporary and not CS.steerFaultPermanent and \
                    (not standstill or self.CP.steerAtStandstill)
     CC.longActive = CC.enabled and not any(e.overrideLongitudinal for e in self.sm['onroadEvents']) and self.CP.openpilotLongitudinalControl
+    if self.CP.carFingerprint == "TESLA_MODEL_S_PREAP":
+      if not hasattr(self, 'turn_steering_gate'):
+        self.turn_steering_gate = TurnSteeringGate()
+      turn_allowed = self.turn_steering_gate.allowed(CS, model_v2)
+      CC.latActive = CC.latActive and turn_allowed
+
 
     if (self.CP.carFingerprint == "TESLA_MODEL_S_PREAP"
         and self.CP.openpilotLongitudinalControl and not self.CP.pcmCruise):
@@ -222,6 +229,12 @@ class Controls:
                and self.sm['liveCalibration'].calStatus == log.LiveCalibrationData.Status.calibrated),
       actual_curvature=self.curvature,
     )
+
+    if (self.CP.carFingerprint == "TESLA_MODEL_S_PREAP"
+        and not self.turn_steering_gate.allowed(CS, model_v2, new_desired_curvature)):
+      CC.latActive = False
+      new_desired_curvature = self.curvature
+      self.LaC.reset()
 
     one_blinker = CS.leftBlinker != CS.rightBlinker
 

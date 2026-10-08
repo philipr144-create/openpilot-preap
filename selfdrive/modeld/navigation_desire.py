@@ -1,4 +1,5 @@
 from openpilot.selfdrive.controls.lib.turn_context import driver_braking
+from openpilot.selfdrive.controls.lib.turn_steering_gate import matching_signal
 """Driver-confirmed navigation desires and synthetic announcement requests."""
 import json
 import math
@@ -253,7 +254,7 @@ class NavigationDesire:
     )
 
     if (
-      hard_takeover
+      (hard_takeover or steering_override)
       and (
         self.confirmed
         or self.started is not None
@@ -371,6 +372,8 @@ class NavigationDesire:
       waiting_reason = ('Turn signal active; waiting until model guidance window' if indicator
                         else 'Turn confirmed; waiting until signal approach window')
       return result('none', waiting_reason, indicator)
+    if not matching_signal(cs, 1 if side == 'left' else 2):
+      return result('none', 'Turn guidance waiting for matching active blinker', indicator)
     return result('turnLeft' if side == 'left' else 'turnRight',
                   'Navigation-authorized low-speed intersection turn',
                   indicator)

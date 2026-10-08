@@ -1,6 +1,7 @@
 """Exercise controlsd's actual curvature pipeline without starting its processes."""
 import ast
 import time
+from openpilot.selfdrive.controls.lib.turn_steering_gate import TurnSteeringGate
 from openpilot.selfdrive.controls.lib.turn_context import manual_turn_intent
 import os
 from pathlib import Path
@@ -53,6 +54,7 @@ class WideTurnOrder(unittest.TestCase):
   def setup_turn(self,sign=1.,speed=4.,enabled=True,blinker=True):
     self.commit=Commitment(sign*.055)
     self.control=N(navigation_turn_commit=self.commit,curvature=0.,
+                   turn_steering_gate=TurnSteeringGate(), LaC=N(reset=lambda:None),
                    CP=N(carFingerprint='TESLA_MODEL_S_PREAP'),
                    sm=SM(liveCalibration=N(calStatus=log.LiveCalibrationData.Status.calibrated)),
                    wide_low_speed_turns_enabled=enabled, low_speed_turn_curvature=0.,
@@ -60,7 +62,7 @@ class WideTurnOrder(unittest.TestCase):
                    low_speed_turn_ramp_time=0.)
     self.cs=N(vEgo=speed,leftBlinker=blinker and sign<0,rightBlinker=blinker and sign>0, steeringPressed=False, brakePressed=False, canValid=True, gearShifter='drive', leftBlindspot=False, rightBlindspot=False)
     self.cc=N(latActive=True)
-    self.model=N(frameId=1,action=N(desiredCurvature=sign*.04))
+    self.model=N(frameId=1,action=N(desiredCurvature=sign*.04),meta=N(desireState=[1.,0.,0.,0.,0.,0.,0.,0.]))
 
   def tick(self): return self.run_pipeline(self.control,self.cs,self.cc,self.model)
 
@@ -96,11 +98,16 @@ class WideTurnOrder(unittest.TestCase):
       self.assertFalse(self.control.low_speed_turn_entry_active)
       self.assertTrue(all(abs(b-a)<=.130*DT_CTRL+1e-12 for a,b in zip(outputs,outputs[1:])))
 
-  def test_toggle_off_high_speed_and_no_blinker_preserve_request(self):
-    for kwargs in ({'enabled':False},{'speed':25*CV.MPH_TO_MS},{'blinker':False}):
+  def test_toggle_off_and_high_speed_preserve_request(self):
+    for kwargs in ({'enabled':False},{'speed':25*CV.MPH_TO_MS}):
       self.setup_turn(**kwargs)
       self.assertEqual(self.tick(),.055)
       self.assertFalse(self.control.low_speed_turn_smoothing_active)
+
+  def test_no_blinker_cannot_apply_a_tight_turn_even_with_floor(self):
+    self.setup_turn(blinker=False)
+    self.assertEqual(self.tick(), 0.)
+    self.assertFalse(self.cc.latActive)
 
 
 if __name__=='__main__': unittest.main()

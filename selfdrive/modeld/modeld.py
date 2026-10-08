@@ -31,6 +31,7 @@ from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_pose_
 from openpilot.common.file_chunker import read_file_chunked
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
 from openpilot.selfdrive.modeld.navigation_desire import NavigationDesire, NavigationTurnLatch
+from openpilot.selfdrive.controls.lib.turn_steering_gate import matching_signal
 
 
 PROCESS_NAME = "selfdrive.modeld.modeld"
@@ -430,6 +431,11 @@ def main(demo=False):
       desire = getattr(log.Desire, nav_request)
     else:
       selection_source = 'driver_desire_helper'
+    if tap_model is not None and desire in (log.Desire.turnLeft, log.Desire.turnRight):
+      turn_direction = 1 if desire == log.Desire.turnLeft else 2
+      if not matching_signal(sm['carState'], turn_direction):
+        desire = log.Desire.none
+        selection_source = 'turn_blinker_gate'
     # Keep a location-free trace of intent arbitration for drive diagnosis.
     nav_decision = (selection_source, nav_request, nav_desire.decision.get('reason', ''),
                     nav_indicator_active, nav_inputs_valid)

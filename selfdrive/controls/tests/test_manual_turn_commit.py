@@ -264,11 +264,10 @@ class ManualTests(unittest.TestCase):
       setattr(self.cs, override, True)
       self.assertEqual(self.tick(), self.curvature)
       setattr(self.cs, override, False)
-      if override == "steeringPressed":
-        for _ in range(30): self.tick()
-        self.assertTrue(self.helper.active)
-      else:
-        for _ in range(30): self.assertEqual(self.tick(), self.curvature)
+      for _ in range(30):
+        self.assertEqual(self.tick(), self.curvature)
+        self.assertFalse(self.helper.active)
+        self.assertTrue(self.helper.blocked)
       self.cs.leftBlinker = False
       self.tick()
       self.cs.leftBlinker = True

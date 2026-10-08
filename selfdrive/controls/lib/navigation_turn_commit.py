@@ -13,6 +13,7 @@ import math
 import time
 
 from openpilot.common.constants import CV
+from openpilot.selfdrive.controls.lib.turn_steering_gate import matching_signal
 from openpilot.selfdrive.controls.lib.turn_context import driver_braking, paired_decision, manual_turn_intent
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
@@ -194,12 +195,12 @@ class NavigationTurnCommit:
         requested_sign = -1.0 if direction == 1 else 1.0
         expected = "turnLeft" if direction == 1 else "turnRight"
 
-        matching_signal = (
+        matching_lamp = (
           (direction == 1 and bool(CS.leftBlinker))
           or (direction == 2 and bool(CS.rightBlinker))
         )
 
-        if matching_signal and not (CS.leftBlindspot if direction == 1 else CS.rightBlindspot):
+        if matching_lamp and not (CS.leftBlindspot if direction == 1 else CS.rightBlindspot):
           signed_curvature = requested_sign * float(curvature)
           # A fresh physical hold owns direction even while the model is
           # still waiting to choose a corner. This is only a veto: no positive
@@ -314,6 +315,7 @@ class NavigationTurnCommit:
     # important actuator-side gates here so stale state cannot keep assisting.
     if (
       not confirmed
+      or not matching_signal(CS, 1 if side == "left" else 2)
       or not lat_active
       or not 0.0 < distance <= COMMIT_DISTANCE_M
       or speed_mph > COMMIT_SPEED_MPH
@@ -755,10 +757,8 @@ class ManualTurnCommit:
       self.reset()
       return curvature
     if cs.steeringPressed and not getattr(cs, "steeringDisengage", False):
-      blocked = self.blocked
-      self.reset()
-      self.blocked = blocked
-      self.state = "DRIVER ASSIST"
+      self.cancel()
+      self.state = "DRIVER ASSIST CANCELLED"
       return curvature
     if not isinstance(decision, dict):
       self.cancel()
@@ -1053,8 +1053,8 @@ class ManualTurnEntry:
       return False
 
   def update(self, model, direction, speed, authorized, now, driver_assisting=False):
-    if driver_assisting and not self.blocked:
-      self.reset()
+    if driver_assisting:
+      self.cancel()
       return False
     if (not authorized or self.blocked or not math.isfinite(speed)
         or not -0.1 <= speed <= COMMIT_SPEED_MPH * CV.MPH_TO_MS

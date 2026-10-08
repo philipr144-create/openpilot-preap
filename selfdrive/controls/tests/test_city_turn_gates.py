@@ -135,10 +135,7 @@ class CityTurnGates(unittest.TestCase):
       self.assertEqual(self.tick(), log.Desire.none)
       setattr(self.cs, field, False)
       # Hazards explicitly clear the direction; steering/brake remain latched.
-      if field == 'steeringPressed':
-        for _ in range(10): self.tick()
-        self.assertEqual(self.helper.desire, log.Desire.turnLeft)
-      elif field != 'rightBlinker':
+      if field != 'rightBlinker':
         for _ in range(20): self.assertEqual(self.tick(), log.Desire.none)
       self.cs.leftBlinker = False
       self.tick(direction=0)
@@ -308,15 +305,16 @@ class CityTurnGates(unittest.TestCase):
       state['maneuver']['distance_m']=25.
       self.assertEqual(tick(), 'none')
       state['maneuver']['distance_m']=10.
-      # Driver steering temporarily pauses navigation lateral guidance,
-      # but does not poison the still-valid route maneuver.
+      # Driver effort cancels the acquired route turn; it cannot fight
+      # the driver again on release during the same maneuver.
       self.cs.steeringPressed=True
       self.assertEqual(tick(), 'none')
-      self.assertFalse(nav.blocked)
-      self.assertEqual(nav.indicator_request, 'left')
-
-      # Releasing steering allows the same valid maneuver to resume.
+      self.assertTrue(nav.blocked)
+      self.assertEqual(nav.indicator_request, 'none')
       self.cs.steeringPressed=False
+      self.assertEqual(tick(), 'none')
+      self.assertTrue(nav.blocked)
+      state['maneuver_id']='turn2'
       self.assertEqual(tick(), 'turnLeft')
       self.assertFalse(nav.blocked)
 

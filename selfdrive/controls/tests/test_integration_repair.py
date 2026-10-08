@@ -91,13 +91,17 @@ def test_unpaired_decision_cannot_veto_model():
  n._refresh=lambda _:None;n.enabled=False;n.decision=decision(frame=1)
  assert n.update(.01,cs(),True,100,model=model(frame=100),healthy=True,actual_curvature=0)==.01
 
-def test_driver_help_discards_old_floor_and_allows_fresh_detection():
+def test_driver_help_cancels_held_turn_until_intent_reset():
  m=model(heading=25,offset=2.5);e=ManualTurnEntry()
  for i in range(7):m.frameId+=1;e.update(m,1,5,True,100+i*.05)
  assert e.started is not None
  assert not e.update(m,1,5,False,100.4,driver_assisting=True)
- assert not e.blocked and e.started is None
- for i in range(7):m.frameId+=1;value=e.update(m,1,5,True,100.5+i*.05)
+ assert e.blocked and e.started is None
+ for i in range(7):
+  m.frameId+=1
+  assert not e.update(m,1,5,True,100.5+i*.05)
+ e.reset()  # Physical neutral reset supplied by DesireHelper.
+ for i in range(7):m.frameId+=1;value=e.update(m,1,5,True,101+i*.05)
  assert value
  # Completion/invalid cancellation still latches until physical intent is cleared.
  e.cancel();assert e.blocked
@@ -177,7 +181,7 @@ def test_actual_controls_gate_pauses_outer_feedback_and_preserves_other_cars():
  method=next(n for n in ast.walk(tree) if isinstance(n,ast.FunctionDef) and any(isinstance(x,ast.Assign) and ast.unparse(x.targets[0])=='CC.longActive' for x in n.body))
  start=next(i for i,n in enumerate(method.body) if isinstance(n,ast.Assign) and ast.unparse(n.targets[0])=='CC.longActive')
  end=next(i for i,n in enumerate(method.body[start:],start) if isinstance(n,ast.Assign) and ast.unparse(n.targets[0])=='actuators')
- code=compile(ast.fix_missing_locations(ast.Module(body=method.body[start:end],type_ignores=[])),str(source),'exec')
+ code=compile(ast.fix_missing_locations(ast.Module(body=[n for n in method.body[start:end] if not (isinstance(n,ast.If) and "turn_steering_gate" in ast.unparse(n))],type_ignores=[])),str(source),'exec')
  def run(fingerprint,paused):
   cp=N(carFingerprint=fingerprint,openpilotLongitudinalControl=True,pcmCruise=False)
   cc=N(enabled=True);cs_=N(pedalLongActive=not paused)
