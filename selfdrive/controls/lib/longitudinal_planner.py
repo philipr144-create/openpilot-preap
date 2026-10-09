@@ -22,6 +22,7 @@ from openpilot.selfdrive.controls.lib.corner_assist import CornerAssist
 from openpilot.selfdrive.controls.lib.cruise_refinement import CruiseRefinement, model_support_weight
 from openpilot.selfdrive.controls.lib.map_stop import MapStop, read_snapshot
 from openpilot.selfdrive.controls.lib.normal_model_stop import NormalModelStop
+from openpilot.selfdrive.controls.lib.normal_propulsion import NormalPropulsion
 from openpilot.selfdrive.controls.lib.acceleration_handoff import braking_priority, handoff_acceleration
 
 A_CRUISE_MAX_VALS = [1.2, 1.0, 1.0, 0.8]
@@ -479,6 +480,8 @@ class LongitudinalPlanner:
     self.corner_assist = CornerAssist()
     self.map_stop = MapStop()
     self.normal_model_stop = NormalModelStop(dt)
+    self.normal_propulsion = NormalPropulsion(dt)
+    self.normal_propulsion_recovery = False
     self.cruise_refinement = CruiseRefinement(dt)
 
     self._is_preap = (CP.brand == "tesla" and CP.carFingerprint == "TESLA_MODEL_S_PREAP"
@@ -794,8 +797,21 @@ class LongitudinalPlanner:
     else:
       self._exp_allow_throttle = None
 
+    was_normal_recovery = self.normal_propulsion_recovery
+    self.normal_propulsion_recovery = self.normal_propulsion.update(
+      sm['modelV2'], v_ego, driver_cruise_speed,
+      enabled=self._is_preap and not sm['selfdriveState'].experimentalMode and self.nap_adaptive_accel,
+      valid=sm.all_checks(service_list=['modelV2', 'carState', 'radarState']),
+      blocked=reset_state or sm['carState'].gasPressed or getattr(sm['carState'], 'brakePressed', False)
+      or getattr(sm['carState'], 'brake', 0.0) > 0.0
+      or force_slow_decel or self.normal_model_stop.active)
+    effective_allow_throttle = effective_allow_throttle or self.normal_propulsion_recovery
+    self.propulsion_allowed = effective_allow_throttle
+
     if self._is_preap:
-      if experimental_preap and self.prev_accel_clip[1] < 0.0:
+      if self.normal_propulsion_recovery and not was_normal_recovery and not self.allow_throttle:
+        self.prev_accel_clip[1] = self.prev_turn_accel_max
+      elif experimental_preap and self.prev_accel_clip[1] < 0.0:
         # Entering V2 must not inherit a legacy temporary coast ceiling.
         self.prev_accel_clip[1] = self.prev_turn_accel_max
       elif not experimental_preap and self.allow_throttle and not was_allow_throttle:
@@ -819,7 +835,7 @@ class LongitudinalPlanner:
     # Prevent divergence, smooth in current v_ego
     self.v_desired_filter.x = max(0.0, self.v_desired_filter.update(v_ego))
 
-    if not self.allow_throttle and not experimental_preap:
+    if not effective_allow_throttle and not experimental_preap:
       # Legacy/Normal behavior. Experimental V2 applies coast after arbitration
       # so this temporary model permission cannot contaminate MPC/turn limits.
       clipped_accel_coast = max(accel_coast, accel_clip[0])
