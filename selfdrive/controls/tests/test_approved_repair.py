@@ -55,6 +55,9 @@ def test_city_controller_yields_and_blends_from_measured_angle_at_18_mph():
   assert c.low_speed_turn_takeover_latched
   for _ in range(3):c._update_preap(cc,state)
   assert not c.low_speed_turn_takeover_latched
+  # Above 15 mph the restored legacy hold lasts 50 ticks.
+  assert c.tesla_can.create_steering_control.call_args.args[-1] is False
+  for _ in range(30):c._update_preap(cc,state)
   assert c.tesla_can.create_steering_control.call_args.args[-1] is True
   assert c.tesla_can.create_steering_control.call_args.args[1]==90.
   c._update_preap(cc,state);c._update_preap(cc,state)

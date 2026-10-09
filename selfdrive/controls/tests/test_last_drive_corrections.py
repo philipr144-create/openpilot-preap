@@ -64,17 +64,17 @@ def test_actual_hso_yields_to_level_one_with_torque_and_returns_from_measured_an
  c.params=N(get_bool=lambda _:True);c.low_speed_steering_rate_enabled=True;c.tap_params=None
  c.tesla_can=MagicMock();c.stock_cc=N(update=lambda *a:[],pcc_event=None)
  c.parked_signal_test=N(update=lambda *a:[]);c.tap_lane_change=N(update=lambda *a,**k:[]);c.navigation_signal=N(update=lambda *a,**k:[])
- state=N(out=N(vEgo=2.,vEgoRaw=2.,leftBlinker=True,rightBlinker=False,steeringPressed=False,steeringAngleDeg=90.,steeringTorque=3.1,canValid=True),hands_on_level=1,tap_stalk=N())
+ state=N(out=N(vEgo=2.,vEgoRaw=2.,leftBlinker=True,rightBlinker=False,steeringPressed=False,steeringAngleDeg=90.,steeringTorque=5.1,canValid=True),hands_on_level=1,tap_stalk=N())
  builder=car.CarControl.new_message();builder.latActive=True;builder.actuators.steeringAngleDeg=120.;cc=builder.as_reader()
  with patch.object(module,'apply_steer_angle_limits_vm',side_effect=lambda target,*args:target) as limit:
-  state.out.steeringTorque=1.2
+  state.out.steeringTorque=4.1
   for _ in range(4):c._update_preap(cc,state)
   assert c.tesla_can.create_steering_control.call_args.args[-1] is True
-  state.out.steeringTorque=3.1
+  state.out.steeringTorque=5.1
   for _ in range(60):c._update_preap(cc,state)
   assert c.tesla_can.create_steering_control.call_args.args[-1] is False
   assert c.low_speed_turn_takeover_latched
-  state.hands_on_level=0
+  state.hands_on_level=0;state.out.steeringTorque=.1
   for _ in range(24):c._update_preap(cc,state)
   assert c.tesla_can.create_steering_control.call_args.args[-1] is True
   assert not c.low_speed_turn_takeover_latched
@@ -92,13 +92,13 @@ def test_raw_hso_entry_is_two_frames_not_half_second():
  class State:
   update_steering_pressed=CarStateBase.update_steering_pressed
  c=State();c.steering_pressed_cnt=0;c.hands_on_level=1
- ret=N(vEgo=2.,steeringTorque=3.1,steeringPressed=False,leftBlinker=True,rightBlinker=False)
+ ret=N(vEgo=2.,steeringTorque=5.1,steeringPressed=False,leftBlinker=True,rightBlinker=False)
  from opendbc.car.tesla.preap.steering_override import hands_on_override, takeover_torque_threshold
  env=dict(cs=c,ret=ret,ENABLE_HSO=True,STEER_THRESHOLD=1.,hands_on_override=hands_on_override,takeover_torque_threshold=takeover_torque_threshold)
  ret.steeringTorque=1.2
  for _ in range(3):exec(code,env)
  assert not ret.steeringPressed
- ret.steeringTorque=3.1
+ ret.steeringTorque=5.1
  for _ in range(3):exec(code,env)
  assert ret.steeringPressed
  c.hands_on_level=0;ret.steeringTorque=.5;exec(code,env)
@@ -121,7 +121,7 @@ def test_navigation_announces_then_waits_for_actual_matching_lamp():
   c.steeringPressed=False;assert tick()=='none'
 
 
-def test_highway_raw_torque_uses_five_count_filter():
+def test_highway_raw_torque_restores_fifty_count_filter():
  from opendbc.car.tesla.preap import carstate as module
  from opendbc.car.interfaces import CarStateBase
  from opendbc.car.tesla.preap.steering_override import hands_on_override, takeover_torque_threshold
@@ -130,31 +130,47 @@ def test_highway_raw_torque_uses_five_count_filter():
  code=compile(ast.fix_missing_locations(ast.Module(body=[block],type_ignores=[])),'hso-highway','exec')
  class State:
   update_steering_pressed=CarStateBase.update_steering_pressed
- c=State();c.steering_pressed_cnt=0;c.hands_on_level=1
- ret=N(vEgo=65*.44704,steeringTorque=1.2,steeringPressed=False,leftBlinker=True,rightBlinker=False)
+ c=State();c.steering_pressed_cnt=0;c.hands_on_level=0
+ ret=N(vEgo=27.5*.44704,steeringTorque=1.36,steeringPressed=False,leftBlinker=False,rightBlinker=False)
  env=dict(cs=c,ret=ret,ENABLE_HSO=True,STEER_THRESHOLD=1.,hands_on_override=hands_on_override,takeover_torque_threshold=takeover_torque_threshold)
- for _ in range(3):exec(code,env);assert not ret.steeringPressed
+ for _ in range(10):exec(code,env);assert not ret.steeringPressed
  ret.steeringTorque=.5
- for _ in range(6):exec(code,env)
+ for _ in range(10):exec(code,env)
  assert not ret.steeringPressed
  ret.steeringTorque=1.2
- for _ in range(6):exec(code,env)
- assert ret.steeringPressed
- assert env['override_filter']==5
- ret.vEgo=24*.44704;exec(code,env);assert env['override_filter']==2
+ for _ in range(50):exec(code,env);assert not ret.steeringPressed
+ exec(code,env);assert ret.steeringPressed
+ assert env['override_filter']==50
 
 
-def test_highway_controller_does_not_bypass_filtered_level_one():
+def test_controller_legacy_override_paths():
  from opendbc.car.tesla import carcontroller as module
  tree=ast.parse(inspect.getsource(module.CarController))
  method=next(n for n in tree.body[0].body if isinstance(n,ast.FunctionDef) and n.name=='_update_preap')
  assignment=next(n for n in method.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='hands_on_trigger' for t in n.targets))
  from opendbc.car.tesla.preap.steering_override import hands_on_override,takeover_torque_threshold
- env=dict(blinker_on=True,speed_mph=65.,hands_on_level=1,CS=N(out=N(vEgo=65*.44704,steeringTorque=1.2)),hands_on_override=hands_on_override,takeover_torque_threshold=takeover_torque_threshold)
  code=compile(ast.fix_missing_locations(ast.Module(body=[assignment],type_ignores=[])),'controller-override','exec')
- exec(code,env);assert not env['hands_on_trigger']
- env['hands_on_level']=2;exec(code,env);assert env['hands_on_trigger']
- env.update(speed_mph=24.,hands_on_level=1);env['CS'].out.vEgo=24*.44704
- exec(code,env);assert not env['hands_on_trigger']
- env['CS'].out.steeringTorque=3.1
- exec(code,env);assert env['hands_on_trigger']
+ for mph in [10.,14.99,15.,24.,27.5,65.]:
+  for signal in [False,True]:
+   threshold=takeover_torque_threshold(mph/2.236936,city_turn=signal)
+   env=dict(blinker_on=signal,speed_mph=mph,hands_on_level=2,CS=N(out=N(vEgo=mph/2.236936,steeringTorque=threshold-.1)),hands_on_override=hands_on_override,takeover_torque_threshold=takeover_torque_threshold)
+   exec(code,env);assert not env['hands_on_trigger']
+   env['CS'].out.steeringTorque=threshold+.1
+   exec(code,env);assert env['hands_on_trigger']==(mph<15. or signal)
+   env['CS'].out.steeringTorque=0.;env['hands_on_level']=3
+   exec(code,env);assert env['hands_on_trigger']
+
+
+def test_recorded_road_curve_is_not_an_unsignaled_city_turn():
+ c=cs();c.vEgo=22.1*.44704
+ g=TurnSteeringGate()
+ for curvature in [-.0199,-.020169148221611977,-.02549,.02017]:
+  assert g.allowed(c,model(curvature))
+  assert g.allowed(c,model(curvature),curvature)
+ assert not g.allowed(c,model(-.02017,left=1.))
+ c.leftBlinker=True
+ assert g.allowed(c,model(-.02017,left=1.))
+ assert not g.allowed(c,model(.02017,right=1.))
+ assert not g.allowed(c,model(float('nan')))
+
+

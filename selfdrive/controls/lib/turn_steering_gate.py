@@ -2,7 +2,7 @@
 import math
 
 TURN_SPEED_MAX = 25 * 0.44704
-TIGHT_TURN_CURVATURE = 0.02  # radius below 50 m requires a turn indicator
+TIGHT_TURN_CURVATURE = 0.02  # direction consistency for an explicit model turn
 
 
 def matching_signal(cs, direction):
@@ -30,7 +30,10 @@ class TurnSteeringGate:
       turn_left = len(probabilities) > 2 and probabilities[1] > 0.5
       turn_right = len(probabilities) > 2 and probabilities[2] > 0.5
       tight = abs(curvature) > TIGHT_TURN_CURVATURE
-      if not tight and not turn_left and not turn_right:
+      # Road bends can be tight without being intersection turns. Curvature
+      # alone must not disable ordinary lateral control. Added city-turn
+      # intent remains signal-gated upstream and explicit model turns below.
+      if not turn_left and not turn_right:
         return True
       if self.driver_cancelled or not one:
         return False

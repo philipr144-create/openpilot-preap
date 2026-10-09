@@ -87,25 +87,18 @@ def test_navigation_continuation_is_bound_to_actual_started_maneuver():
   c.steeringPressed=False;assert tick()=='none'
 
 
-def test_low_epas_contact_is_not_override_strong_effort_still_wins():
- for torque in [.0,.5,.78,-.97]:assert not hands_on_override(1,torque)
- assert hands_on_override(1,1.1)
- assert hands_on_override(1,-1.1)
- assert hands_on_override(2,.0)
- assert hands_on_override(3,.0)
+def test_legacy_level_three_and_low_speed_torque_allowance():
+ from opendbc.car.tesla.preap.steering_override import takeover_torque_threshold as threshold
+ for mph in [0.,5.,10.,14.99,15.,20.,25.,26.,35.,65.]:
+  for signal in [False, True]:
+   expected=5. if mph<15. else (3. if signal else 1.)
+   value=threshold(mph/2.236936,city_turn=signal)
+   assert value==expected
+   for level in [0,1,2]:
+    assert not hands_on_override(level,value-.01,value)
+    assert hands_on_override(level,value+.01,value)
+   assert hands_on_override(3,0.,value)
  assert hands_on_override(0,float('nan'))
-
-
-def test_low_speed_epas_contact_respects_existing_torque_allowance():
- from opendbc.car.tesla.preap.steering_override import takeover_torque_threshold
- for mph, expected in [(0,2.5),(5,2.5),(10,2.0),(15,1.5),(20,1.0),(25,1.0),(26,1.0)]:
-  threshold=takeover_torque_threshold(mph/2.236936)
-  assert abs(threshold-expected)<1e-8
-  assert not hands_on_override(1,threshold-.01,threshold)
-  assert hands_on_override(1,threshold+.01,threshold)
-  assert hands_on_override(2,0.,threshold)
-  assert hands_on_override(3,0.,threshold)
- assert not hands_on_override(1,1.2,takeover_torque_threshold(2.))
 
 
 def test_established_turn_above_city_speed_adds_no_synthetic_curvature():
@@ -118,15 +111,11 @@ def test_established_turn_above_city_speed_adds_no_synthetic_curvature():
  assert t.helper.state == 'MANUAL MODEL CONTINUATION'
 
 
-def test_city_turn_three_nm_allowance_is_confined_to_sub25_physical_turn_context():
+def test_recorded_sub15_effort_is_allowed_but_takeover_is_preserved():
  from opendbc.car.tesla.preap.steering_override import takeover_torque_threshold
- for mph in [0.,5.,13.4,15.7,20.,24.9]:
-  threshold=takeover_torque_threshold(mph/2.236936,city_turn=True)
-  assert threshold==3.
-  assert not hands_on_override(0,1.75,threshold)
-  assert not hands_on_override(1,2.99,threshold)
-  assert hands_on_override(1,3.01,threshold)
-  assert hands_on_override(2,0.,threshold)
- for mph in [25.,26.,65.]:
-  assert takeover_torque_threshold(mph/2.236936,city_turn=True)==1.
- assert takeover_torque_threshold(15.7/2.236936)==takeover_torque_threshold(15.7/2.236936,city_turn=False)
+ for mph, torque in [(13.3,4.1),(13.,3.89),(10.8,3.72)]:
+  for signal in [False, True]:
+   threshold=takeover_torque_threshold(mph/2.236936,city_turn=signal)
+   assert not hands_on_override(2,torque,threshold)
+   assert hands_on_override(0,5.1,threshold)
+   assert hands_on_override(3,0.,threshold)

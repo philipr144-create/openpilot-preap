@@ -104,10 +104,18 @@ class WideTurnOrder(unittest.TestCase):
       self.assertEqual(self.tick(),.055)
       self.assertFalse(self.control.low_speed_turn_smoothing_active)
 
-  def test_no_blinker_cannot_apply_a_tight_turn_even_with_floor(self):
+  def test_no_blinker_cannot_apply_an_explicit_model_turn_even_with_floor(self):
     self.setup_turn(blinker=False)
+    self.model.meta.desireState=[0.,0.,1.,0.,0.,0.,0.,0.]
     self.assertEqual(self.tick(), 0.)
     self.assertFalse(self.cc.latActive)
+
+  def test_recorded_road_curve_keeps_lateral_control(self):
+    self.setup_turn(sign=-1., speed=22.1*CV.MPH_TO_MS, enabled=False, blinker=False)
+    self.model.action.desiredCurvature=-.020169148221611977
+    self.commit.target=self.model.action.desiredCurvature
+    self.assertEqual(self.tick(), self.model.action.desiredCurvature)
+    self.assertTrue(self.cc.latActive)
 
 
 if __name__=='__main__': unittest.main()
