@@ -29,11 +29,11 @@ def test_tight_turn_and_model_memory_require_matching_indicator():
 def test_override_cancels_held_turn_but_ordinary_tracking_returns():
  g=TurnSteeringGate();c=cs(1);m=model(-.05,left=1)
  assert g.allowed(c,m)
- c.steeringPressed=True;assert not g.allowed(c,m)
+ c.steeringPressed=True;assert g.allowed(c,m)
  c.steeringPressed=False
- for _ in range(100):assert not g.allowed(c,m)
+ for _ in range(100):assert g.allowed(c,m)
  assert g.allowed(c,model(.001))
- assert not g.allowed(c,model(.001),-.05)
+ assert g.allowed(c,model(.001),-.05)
  c.leftBlinker=False;assert g.allowed(c,model())
  c.leftBlinker=True;assert g.allowed(c,m)
 

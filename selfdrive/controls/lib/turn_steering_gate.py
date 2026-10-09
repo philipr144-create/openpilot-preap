@@ -20,8 +20,8 @@ class TurnSteeringGate:
       self.driver_cancelled = False
     if cs.vEgo >= TURN_SPEED_MAX:
       return True
-    if cs.steeringPressed and one:
-      self.driver_cancelled = True
+    # HSO owns temporary yielding and quiet handback. Do not turn a brief
+    # torque event into a separate persistent model-path cancellation.
     try:
       curvature = float(model.action.desiredCurvature if requested_curvature is None else requested_curvature)
       if not math.isfinite(curvature):
