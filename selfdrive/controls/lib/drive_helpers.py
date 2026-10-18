@@ -23,7 +23,8 @@ def smooth_value(val, prev_val, tau, dt=DT_MDL):
   return alpha * val + (1 - alpha) * prev_val
 
 def clip_curvature(v_ego, prev_curvature, new_curvature, roll,
-                   max_curvature_rate_override=None) -> tuple[float, bool]:
+                   max_curvature_rate_override=None,
+                   max_lateral_accel_bonus=0.0) -> tuple[float, bool]:
   # This function respects ISO lateral jerk and acceleration limits + a max curvature.
   #
   # NAP: low-speed intersection turns may supply a bounded curvature-rate
@@ -47,8 +48,13 @@ def clip_curvature(v_ego, prev_curvature, new_curvature, roll,
   )
 
   roll_compensation = roll * ACCELERATION_DUE_TO_GRAVITY
-  max_lat_accel = MAX_LATERAL_ACCEL_NO_ROLL + roll_compensation
-  min_lat_accel = -MAX_LATERAL_ACCEL_NO_ROLL + roll_compensation
+
+  # Optional, bounded lateral headroom for offline evaluation.
+  bonus = float(np.clip(max_lateral_accel_bonus, 0.0, 0.20))
+  base_accel = MAX_LATERAL_ACCEL_NO_ROLL + bonus
+
+  max_lat_accel = base_accel + roll_compensation
+  min_lat_accel = -base_accel + roll_compensation
   new_curvature, limited_accel = clamp(new_curvature, min_lat_accel / v_ego ** 2, max_lat_accel / v_ego ** 2)
 
   new_curvature, limited_max_curv = clamp(new_curvature, -MAX_CURVATURE, MAX_CURVATURE)

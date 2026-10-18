@@ -40,7 +40,8 @@ class PersistentRecovery(unittest.TestCase):
       value=self.call(model_accel=-.18,mpc_accel=.5,v_ego=17.)
       self.assertGreaterEqual(value,0.)
       self.assertLessEqual(value,.5)
-      self.assertGreaterEqual(value,previous-.4*self.p.dt-1e-9)
+      # Selection is bounded; the final handoff/actuator owns command slew.
+      self.assertLessEqual(value - (-.18), .25 + 1e-9)
       self.p.output_a_target=previous=value
 
   def test_alternating_coast_and_accel_remain_continuous(self):

@@ -88,7 +88,8 @@ class TestPlannerRefinement(unittest.TestCase):
         self.prepare(experimental=True)
         self.plan.return_value=(.4,False)
         for _ in range(40): self.tick()
-        self.assertGreater(self.p.cruise_refinement.support,0.)
+        # Experimental now has a single arbiter recovery, no additive helper.
+        self.assertEqual(self.p.cruise_refinement.support,0.)
         if gate in ('leadOne','leadTwo'): getattr(self.sm['radarState'],gate).status=True
         elif gate=='modelBrake': self.sm['modelV2'].action.desiredAcceleration=-.3
         elif gate=='modelStop': self.sm['modelV2'].action.shouldStop=True

@@ -1,6 +1,7 @@
 """Bounded Pre-AP cruise assistance; no lead or stop authority."""
 from dataclasses import dataclass
 import math
+from openpilot.selfdrive.controls.lib.model_forecast import assess_model_forecast
 
 
 @dataclass(frozen=True)
@@ -59,19 +60,24 @@ class CruiseRefinement:
     return self.support
 
 
-def model_support_weight(model, speed, request):
+def model_support_weight(model, speed, request, forecast=None):
   """Allow bounded compensation for weak model coasting, never a planned stop.
 
   Full support at zero demand fades continuously to zero at -0.2 m/s².
   Negative requests additionally require a complete, nearly speed-holding
   three-second prediction. Missing/invalid predictions preserve the request.
   """
+  forecast = assess_model_forecast(model, speed) if forecast is None else forecast
+  if not math.isfinite(request) or forecast.planned_stop:
+    return 0.0
   if request >= 0.0:
     return 1.0
   if request <= -0.2:
     return 0.0
   try:
-    times, speeds = list(model.velocity.t), list(model.velocity.x)
+    if not forecast.valid:
+      return 0.0
+    times, speeds = list(forecast.times), list(forecast.speeds)
     if (len(times) < 3 or len(times) != len(speeds)
         or not all(math.isfinite(x) for x in times + speeds + [speed, request])
         or any(b <= a for a, b in zip(times, times[1:]))
@@ -90,6 +96,8 @@ def model_support_weight(model, speed, request):
     return 0.0
 
 
+
+# Legacy replay helpers; production uses acceleration_handoff.py.
 def mild_transition_forecast(model, speed):
   """Recognize a complete, nearly steady-speed forecast, never a planned stop."""
   try:

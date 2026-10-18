@@ -27,6 +27,14 @@ class CurveComfortTests(unittest.TestCase):
       with self.assertRaises(ValueError):write_curve_comfort('fast',path)
       self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()),['comfort'])
 
+  def test_map_range_starts_at_former_mild_and_city_tuning_is_preserved(self):
+    self.assertEqual(PROFILES['more'].map_lateral_accel,3.4)
+    for name,corner,decel in [('more',1.0,.8),('standard',1.2,.8),('mild',1.6,.6)]:
+      self.assertEqual(PROFILES[name].corner_lateral_accel,corner)
+      self.assertEqual(PROFILES[name].corner_max_decel,decel)
+    self.assertLess(PROFILES['more'].map_lateral_accel,PROFILES['standard'].map_lateral_accel)
+    self.assertLess(PROFILES['standard'].map_lateral_accel,PROFILES['mild'].map_lateral_accel)
+
   def run_corner(self, profile, speed=12., curvature=.02, base=0., cruise=25.):
     c=CornerAssist();c.config['corner_assist']=True;c.comfort=PROFILES[profile]
     for i in range(100):out=c.update(base,speed,curvature,-.3,True,100+i*.05,cruise)

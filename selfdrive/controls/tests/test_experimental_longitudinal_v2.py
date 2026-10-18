@@ -109,20 +109,18 @@ class ExperimentalLongitudinalV2(unittest.TestCase):
     self.assertAlmostEqual(value, -1.50)
     self.assertEqual(self.p.exp_long_state, "VERIFIED")
 
-  def test_normal_mode_retains_legacy_no_throttle_behavior(self):
+  def test_normal_mode_shapes_coast_without_negative_physical_ceiling(self):
     self.enable_v2()
     self.sm['selfdriveState'].experimentalMode = False
     self.set_permission(False)
     self.sm['modelV2'].action.desiredAcceleration = 0.44
     self.plan.return_value = (0.50, False)
 
-    # Normal mode intentionally keeps the existing temporary coast ceiling.
-    # Its existing prev_accel_clip/rise smoothing may leave a tiny positive
-    # command during the first few transition frames, so do not require an
-    # instantaneous sign change.
+    # Coast remains a restrictive request, shaped by the common handoff.
+    # It must not masquerade as a negative physical acceleration ceiling.
     value = self.tick()
 
-    self.assertLessEqual(
+    self.assertGreaterEqual(
       self.mpc.update.call_args.kwargs['max_accel'],
       0.0,
     )

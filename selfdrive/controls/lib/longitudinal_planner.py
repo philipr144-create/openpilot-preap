@@ -23,7 +23,8 @@ from openpilot.selfdrive.controls.lib.cruise_refinement import CruiseRefinement,
 from openpilot.selfdrive.controls.lib.map_stop import MapStop, read_snapshot
 from openpilot.selfdrive.controls.lib.normal_model_stop import NormalModelStop
 from openpilot.selfdrive.controls.lib.normal_propulsion import NormalPropulsion
-from openpilot.selfdrive.controls.lib.acceleration_handoff import braking_priority, handoff_acceleration
+from openpilot.selfdrive.controls.lib.model_forecast import assess_model_forecast
+from openpilot.selfdrive.controls.lib.acceleration_handoff import braking_priority, UnifiedCruiseSmoother, curve_recovery_accel_limit, PersonalityAccelerationLimit
 
 A_CRUISE_MAX_VALS = [1.2, 1.0, 1.0, 0.8]
 A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]
@@ -123,7 +124,7 @@ def road_stop_speed_cap(path=ROAD_STOP_SNAPSHOT, settings=STOP_SETTINGS, now=Non
 
 
 
-def map_curve_speed_cap(path=MAP_CONTEXT_SNAPSHOT, now=None, v_ego=None, consumed_stops=(), include_stops=True):
+def map_curve_speed_cap(path=MAP_CONTEXT_SNAPSHOT, now=None, v_ego=None, consumed_stops=(), include_stops=True, preview_distance=0.0):
   """Fail-open map-context cruise ceiling.
 
   Uses the complete mapped curve corridor rather than one curve.
@@ -131,6 +132,8 @@ def map_curve_speed_cap(path=MAP_CONTEXT_SNAPSHOT, now=None, v_ego=None, consume
   commands steering, or authorizes proceeding through an intersection.
   """
   now = time.monotonic() if now is None else now
+  if type(preview_distance) not in (int, float) or not math.isfinite(preview_distance) or not 0. <= preview_distance <= 200.:
+    return None
 
   try:
     with open(path) as stream:
@@ -298,7 +301,7 @@ def map_curve_speed_cap(path=MAP_CONTEXT_SNAPSHOT, now=None, v_ego=None, consume
       # feel unnecessarily slow before ordinary road curves.
       distance = max(
         0.0,
-        start - traveled - 6.0,
+        start - traveled - preview_distance - 6.0,
       )
 
       comfort_decel = 1.2
@@ -476,6 +479,9 @@ class LongitudinalPlanner:
     # True during a narrowly validated recovery even if raw gasPressProb is low.
     self.propulsion_allowed = True
     self._exp_allow_throttle = None
+    # Independent Normal-mode hysteresis. Keep the existing personality
+    # acceleration envelopes and all lead/stop braking constraints unchanged.
+    self._normal_allow_throttle = None
 
     self.corner_assist = CornerAssist()
     self.map_stop = MapStop()
@@ -483,6 +489,8 @@ class LongitudinalPlanner:
     self.normal_propulsion = NormalPropulsion(dt)
     self.normal_propulsion_recovery = False
     self.cruise_refinement = CruiseRefinement(dt)
+    self.cruise_smoother = UnifiedCruiseSmoother()
+    self.personality_accel_limit = PersonalityAccelerationLimit()
 
     self._is_preap = (CP.brand == "tesla" and CP.carFingerprint == "TESLA_MODEL_S_PREAP"
                        and CP.openpilotLongitudinalControl and not CP.pcmCruise)
@@ -670,7 +678,7 @@ class LongitudinalPlanner:
       self.propulsion_allowed = True
       target = min(
         mpc_accel,
-        model_accel + recovery_weight * max(0.0, recovery - model_accel),
+        model_accel + min(0.25, recovery_weight * max(0.0, recovery - model_accel)),
       )
 
       self.exp_long_state = (
@@ -765,12 +773,17 @@ class LongitudinalPlanner:
 
     personality = sm["selfdriveState"].personality
     accel_max = accel_ceiling(v_ego, personality) if self._is_preap else get_max_accel(v_ego)
+    if self._is_preap:
+      accel_max = self.personality_accel_limit.update(
+        accel_max, personality, self.dt,
+        reset=reset_state or sm['carState'].gasPressed or sm['carState'].standstill
+        or not self.nap_adaptive_accel)
     accel_clip = [ACCEL_MIN, accel_max]
     steer_angle_without_offset = sm['carState'].steeringAngleDeg - sm['liveParameters'].angleOffsetDeg
     accel_clip = limit_accel_in_turns(v_ego, steer_angle_without_offset, accel_clip, self.CP)
 
     _, _, _, _, throttle_prob = self.parse_model(sm['modelV2'])
-    was_allow_throttle = self.allow_throttle
+    was_effective_permission = self.propulsion_allowed
 
     # Raw model permission remains available for diagnostics and legacy modes.
     # Experimental V2 computes a separate effective propulsion decision later.
@@ -797,14 +810,39 @@ class LongitudinalPlanner:
     else:
       self._exp_allow_throttle = None
 
+    # The legacy single-threshold Normal permission can repeatedly switch
+    # between propulsion and a negative coast ceiling on winding roads.
+    # Match Experimental's narrow hysteresis; do not change allowed accel.
+    if (self._is_preap and self.nap_adaptive_accel
+        and not sm['selfdriveState'].experimentalMode
+        and not reset_state and not sm['carState'].gasPressed
+        and v_ego >= 5.0):
+      if self._normal_allow_throttle is None:
+        self._normal_allow_throttle = self.allow_throttle
+      else:
+        threshold = PREAP_EXP_THROTTLE_OFF if self._normal_allow_throttle else PREAP_EXP_THROTTLE_ON
+        self._normal_allow_throttle = math.isfinite(throttle_prob) and throttle_prob > threshold
+      effective_allow_throttle = self._normal_allow_throttle
+    else:
+      self._normal_allow_throttle = None
+
+    # One recovery-permission history across Chill/Experimental. This does
+    # not replace either mode's model/MPC/stop selection or final handoff.
     was_normal_recovery = self.normal_propulsion_recovery
     self.normal_propulsion_recovery = self.normal_propulsion.update(
       sm['modelV2'], v_ego, driver_cruise_speed,
-      enabled=self._is_preap and not sm['selfdriveState'].experimentalMode and self.nap_adaptive_accel,
+      enabled=self._is_preap and self.nap_adaptive_accel,
       valid=sm.all_checks(service_list=['modelV2', 'carState', 'radarState']),
       blocked=reset_state or sm['carState'].gasPressed or getattr(sm['carState'], 'brakePressed', False)
       or getattr(sm['carState'], 'brake', 0.0) > 0.0
-      or force_slow_decel or self.normal_model_stop.active)
+      or force_slow_decel or self.normal_model_stop.active
+      or sm['radarState'].leadOne.status
+      or bool(getattr(getattr(sm['radarState'], 'leadTwo', None), 'status', False))
+      or sm['modelV2'].action.shouldStop
+      # The preceding map release remains a real speed restriction until
+      # it unwinds; don't resurrect model-only propulsion across that handoff.
+      or (self.cruise_refinement.map_cap is not None
+          and self.cruise_refinement.map_cap < driver_cruise_speed - 0.30))
     effective_allow_throttle = effective_allow_throttle or self.normal_propulsion_recovery
     self.propulsion_allowed = effective_allow_throttle
 
@@ -814,9 +852,10 @@ class LongitudinalPlanner:
       elif experimental_preap and self.prev_accel_clip[1] < 0.0:
         # Entering V2 must not inherit a legacy temporary coast ceiling.
         self.prev_accel_clip[1] = self.prev_turn_accel_max
-      elif not experimental_preap and self.allow_throttle and not was_allow_throttle:
-        # Legacy/Normal path: retain the 817a fix. An expired coast ceiling is
-        # not a turn limit, so restore the remembered geometry/profile ceiling.
+      elif not experimental_preap and effective_allow_throttle and not was_effective_permission:
+        # A new effective Normal permission, not a raw 0.4 threshold crossing,
+        # ends a temporary coast ceiling. The downstream positive-accel ramp
+        # still controls propulsion recovery.
         self.prev_accel_clip[1] = self.prev_turn_accel_max
 
     self.prev_turn_accel_max = accel_clip[1]
@@ -835,9 +874,9 @@ class LongitudinalPlanner:
     # Prevent divergence, smooth in current v_ego
     self.v_desired_filter.x = max(0.0, self.v_desired_filter.update(v_ego))
 
-    if not effective_allow_throttle and not experimental_preap:
-      # Legacy/Normal behavior. Experimental V2 applies coast after arbitration
-      # so this temporary model permission cannot contaminate MPC/turn limits.
+    if not effective_allow_throttle and not (self._is_preap and self.nap_adaptive_accel):
+      # Legacy behavior with adaptive control disabled. Adaptive coast requests
+      # are shaped after selection, independently of physical MPC limits.
       clipped_accel_coast = max(accel_coast, accel_clip[0])
       clipped_accel_coast_interp = np.interp(v_ego, [MIN_ALLOW_THROTTLE_SPEED, MIN_ALLOW_THROTTLE_SPEED*2], [accel_clip[1], clipped_accel_coast])
       accel_clip[1] = min(accel_clip[1], clipped_accel_coast_interp)
@@ -849,13 +888,14 @@ class LongitudinalPlanner:
     if self._is_preap:
       map_cap, map_should_stop = self.map_stop.update(
         read_snapshot(NAV_SNAPSHOT), read_snapshot("/dev/shm/nap_brake_resume.json"),
-        enabled=self.nap_map_driving_assist, active=not reset_state,
+        enabled=self.nap_map_driving_assist and mapped_stop_setting_enabled(), active=not reset_state,
         inputs_valid=sm.all_checks(service_list=["carState", "controlsState", "selfdriveState"]),
         v_ego=v_ego, gas=sm["carState"].gasPressed, now=time.monotonic())
       if map_cap is not None:
         v_cruise = min(v_cruise, map_cap)
 
     curve_cap = None
+    curve_recovery_limit = None
     if self._is_preap and not reset_state:
       # Route navigation and generic map assistance are intentionally separate.
       #
@@ -876,9 +916,21 @@ class LongitudinalPlanner:
         # Curves retain their existing ceiling. Direction-matched route stops
         # use the separate driver-brake / acknowledged-resume lifecycle.
         curve_cap = map_curve_speed_cap(v_ego=v_ego, include_stops=False)
+        if self.nap_adaptive_accel and not sm['carState'].gasPressed:
+          # Evaluate geometry farther along the same fresh corridor, without
+          # changing its timestamp, quality gates, or current braking ceiling.
+          horizon = 3.0
+          preview_distance = min(200., v_ego * horizon + .5 * max(0., accel_clip[1]) * horizon**2)
+          future_cap = map_curve_speed_cap(v_ego=v_ego, include_stops=False,
+                                           preview_distance=preview_distance)
+          curve_recovery_limit = curve_recovery_accel_limit(future_cap, v_ego, horizon)
         preparation_cap = map_curve_speed_cap(v_ego=v_ego, consumed_stops=self.map_stop.consumed)
+        # The preparation snapshot includes curves and optional mapped stops.
+        # Previously its independent v_cruise assignment bypassed the release
+        # smoother for preparation-only caps (and duplicated the curve path).
+        # Tightening stays immediate; release now uses one speed-target path.
         if preparation_cap is not None:
-          v_cruise = min(v_cruise, preparation_cap)
+          curve_cap = preparation_cap if curve_cap is None else min(curve_cap, preparation_cap)
 
     if self._is_preap:
       curve_target = self.cruise_refinement.curve_target(
@@ -888,7 +940,9 @@ class LongitudinalPlanner:
 
     # Optional Pre-AP follow cap. The NAPAdaptiveAccel toggle is the master
     # gate; when disabled, personality and the normal MPC limits apply.
-    if self._is_preap and self.nap_adaptive_accel and sm['radarState'].leadOne.status:
+    if (self._is_preap and self.nap_adaptive_accel
+        and (sm['radarState'].leadOne.status
+             or bool(getattr(getattr(sm['radarState'], 'leadTwo', None), 'status', False)))):
       follow_limit = _get_preap_follow_limit(v_ego)
       if follow_limit is not None:
         accel_clip[1] = min(accel_clip[1], follow_limit)
@@ -933,23 +987,24 @@ class LongitudinalPlanner:
       valid=sm.all_checks(service_list=['modelV2', 'carState']),
       reset=reset_state or sm['carState'].gasPressed)
 
-    # Replace the historical constant E2E bias with bounded speed support.
+    # Normal retains its existing support floor. Experimental recovery is
+    # owned solely by the arbiter; never bias the model before arbitration.
     # Weak model coasting may receive bounded support; braking predictions
     # and either lead's constraints retain authority.
     # Normal cruise uses a floor, not another additive acceleration loop.
     if self._is_preap:
       lead_two = getattr(sm['radarState'], 'leadTwo', None)
-      model_weight = model_support_weight(sm['modelV2'], v_ego, output_a_target_e2e)
+      forecast = assess_model_forecast(sm['modelV2'], v_ego)
+      model_weight = model_support_weight(sm['modelV2'], v_ego, output_a_target_e2e, forecast)
       support = self.cruise_refinement.speed_support(
         v_cruise, v_ego, sm['carState'].aEgo,
-        self.nap_adaptive_accel and not reset_state and not sm['carState'].gasPressed
+        self.nap_adaptive_accel and not sm['selfdriveState'].experimentalMode
+        and not reset_state and not sm['carState'].gasPressed
         and effective_allow_throttle and not force_slow_decel and v_ego >= 5.0
         and not sm['radarState'].leadOne.status and not (lead_two is not None and lead_two.status)
         and not output_should_stop_mpc and not output_should_stop_e2e and not normal_stop_active and not map_should_stop
         and output_a_target_mpc >= 0.0 and model_weight > 0.0)
-      if sm['selfdriveState'].experimentalMode:
-        output_a_target_e2e += support * model_weight
-      elif support > 0.0:
+      if not sm['selfdriveState'].experimentalMode and support > 0.0:
         output_a_target_mpc = max(output_a_target_mpc, support)
 
     if sm['selfdriveState'].experimentalMode:
@@ -983,8 +1038,9 @@ class LongitudinalPlanner:
           # A missing lead is not evidence that visual braking is phantom.
           # Only weak coasting with a validated speed-holding forecast may
           # receive the existing bounded compensation.
-          model_braking_required=(sm['modelV2'].action.desiredAcceleration < 0.0
-                                  and model_weight <= 0.0),
+          model_braking_required=(forecast.planned_stop
+                                  or (sm['modelV2'].action.desiredAcceleration < 0.0
+                                      and model_weight <= 0.0)),
         )
 
         if (
@@ -1018,6 +1074,14 @@ class LongitudinalPlanner:
         self.exp_model_brake_frames = 0
         self.exp_long_state = "OFF"
 
+    if (self._is_preap and self.nap_adaptive_accel
+        and not sm['selfdriveState'].experimentalMode and not effective_allow_throttle):
+      # A model coast preference is a request, not a hard physical ceiling.
+      # Keep its existing speed dependence while using the shared handoff.
+      coast_cap = np.interp(v_ego, [MIN_ALLOW_THROTTLE_SPEED, MIN_ALLOW_THROTTLE_SPEED * 2],
+                            [accel_clip[1], max(experimental_coast_accel, accel_clip[0])])
+      output_a_target = min(output_a_target, coast_cap)
+
     # Release removes only map authority; model/MPC stop requests remain intact.
     self.output_should_stop = self.output_should_stop or map_should_stop
 
@@ -1038,32 +1102,59 @@ class LongitudinalPlanner:
       previous = 0.0 if reset_state or sm["carState"].gasPressed else self.output_a_target
       # Physical/profile envelopes remain hard bounds. Request selection and
       # CornerAssist are complete before this single source-independent handoff.
-      accel_clip[1] = min(accel_clip[1], accel_ceiling(v_ego, personality))
+      accel_clip[1] = min(accel_clip[1], accel_max)
       self.handoff_request = float(output_a_target)
       self.handoff_reason = 'OFF'
-      handoff_active = experimental_preap and not reset_state and not sm['carState'].gasPressed and v_ego >= 5.
+      has_lead = (bool(sm['radarState'].leadOne.status)
+                  or bool(getattr(lead_two, 'status', False)))
+      handoff_active = (self.nap_adaptive_accel and not reset_state
+                        and not sm['carState'].gasPressed
+                        and not getattr(sm['carState'], 'brakePressed', False))
       if handoff_active:
-        self.handoff_reason = braking_priority(
-          sm['modelV2'], v_ego, output_a_target, output_a_target_mpc,
-          has_lead, self.output_should_stop, force_slow_decel,
-          v_cruise, driver_cruise_speed, self.corner_assist.target_speed,
-          valid=sm.all_checks(service_list=['carState', 'modelV2', 'radarState']))
+        valid = sm.all_checks(service_list=['carState', 'modelV2', 'radarState'])
+        if sm['selfdriveState'].experimentalMode:
+          self.handoff_reason = braking_priority(
+            sm['modelV2'], v_ego, output_a_target, output_a_target_mpc,
+            has_lead, self.output_should_stop, force_slow_decel,
+            v_cruise, driver_cruise_speed, self.corner_assist.target_speed,
+            valid=valid, forecast=forecast)
+        elif self.output_should_stop or normal_stop_active:
+          self.handoff_reason = 'STOP'
+        elif force_slow_decel:
+          self.handoff_reason = 'FORCE_DECEL'
+        elif not valid:
+          self.handoff_reason = 'INVALID_INPUT'
+        elif has_lead and output_a_target < 0.:
+          self.handoff_reason = 'LEAD_BRAKING'
+        elif output_a_target_mpc <= -1.:
+          self.handoff_reason = 'STRONG_BRAKING'
+        elif output_a_target_mpc < 0. and v_ego >= v_cruise - .3:
+          self.handoff_reason = 'SPEED_CEILING'
+        else:
+          self.handoff_reason = 'ORDINARY'
+        if has_lead and self.handoff_reason == 'ORDINARY':
+          self.handoff_reason = 'LEAD_CONSTRAINT'
         if corner_braking:
-          self.handoff_reason = "CORNER_BRAKING"
-        output_a_target = handoff_acceleration(
-          output_a_target, previous, self.dt, personality,
-          accel_clip[0], accel_clip[1], self.handoff_reason)
-        # A coast preference may smoothly remove existing propulsion, but
-        # cannot create a new acceleration request. Report carried drive truthfully.
+          self.handoff_reason = 'CORNER_BRAKING'
+        # Preview restricts positive recovery only. All existing braking and
+        # stop selection has already occurred, and retains priority below.
+        if curve_recovery_limit is not None and output_a_target > 0.:
+          output_a_target = min(output_a_target, curve_recovery_limit)
+        output_a_target = self.cruise_smoother.update(
+          output_a_target, previous, self.dt, personality, v_ego, v_cruise,
+          sm['carState'].aEgo, accel_clip[0], accel_clip[1], self.handoff_reason,
+          capture=effective_allow_throttle and not has_lead and not self.output_should_stop
+          and not normal_stop_active and not force_slow_decel and not corner_braking)
         self.propulsion_allowed = self.propulsion_allowed or output_a_target > 0.
       else:
+        self.cruise_smoother.reset()
         output_a_target = limit_positive_accel(output_a_target, previous, v_ego, personality, self.dt)
       if experimental_preap and self.handoff_request < output_a_target_mpc - .01:
         self.mpc.source = LongitudinalPlanSource.e2e
     self.output_a_target = np.clip(output_a_target, accel_clip[0], accel_clip[1])
     self.prev_accel_clip = accel_clip
     if self._is_preap and not reset_state and self._frame % 20 == 0:
-      cloudlog.info('NAP long speed=%.2f driver=%.2f effective=%.2f map=%s curve=%.2f model=%.3f mpc=%.3f support=%.3f output=%.3f source=%s state=%s frames=%d throttle=%.3f raw_allow=%d prop=%d cap=%.3f turncap=%.3f model_stop=%d mpc_stop=%d final_stop=%d long_off=%d corner=%s request=%.3f handoff=%s long_active=%d gas=%d brake=%d signal=%d steer=%.2f corner_target=%s weight=%.2f aego=%.3f',
+      cloudlog.info('NAP long speed=%.2f driver=%.2f effective=%.2f map=%s curve=%.2f model=%.3f mpc=%.3f support=%.3f output=%.3f source=%s state=%s frames=%d throttle=%.3f raw_allow=%d prop=%d cap=%.3f turncap=%.3f model_stop=%d mpc_stop=%d final_stop=%d long_off=%d corner=%s request=%.3f handoff=%s long_active=%d gas=%d brake=%d signal=%d steer=%.2f corner_target=%s weight=%.2f aego=%.3f experimental=%d personality=%d forecast_stop=%d preview=%s recovery=%d recovery_reason=%s unified=5',
                     v_ego, driver_cruise_speed, v_cruise, curve_cap, curve_target,
                     sm['modelV2'].action.desiredAcceleration, output_a_target_mpc,
                     support * model_weight, self.output_a_target, self.mpc.source,
@@ -1077,23 +1168,25 @@ class LongitudinalPlanner:
                     int(bool(getattr(sm['carState'], 'leftBlinker', False)))
                     + 2 * int(bool(getattr(sm['carState'], 'rightBlinker', False))),
                     sm['carState'].steeringAngleDeg, self.corner_assist.target_speed,
-                    model_weight, sm['carState'].aEgo)
+                    model_weight, sm['carState'].aEgo, sm['selfdriveState'].experimentalMode,
+                    int(getattr(personality, 'raw', personality)), forecast.planned_stop, curve_recovery_limit, self.normal_propulsion_recovery, self.normal_propulsion.reason)
 
   def publish(self, sm, pm):
     plan_send = messaging.new_message('longitudinalPlan')
 
-    plan_send.valid = sm.all_checks(service_list=['carState', 'controlsState', 'selfdriveState', 'radarState'])
+    plan_send.valid = sm.all_checks(service_list=['carState', 'controlsState', 'selfdriveState', 'radarState', 'modelV2'])
 
     longitudinalPlan = plan_send.longitudinalPlan
     longitudinalPlan.modelMonoTime = sm.logMonoTime['modelV2']
-    longitudinalPlan.processingDelay = (plan_send.logMonoTime / 1e9) - sm.logMonoTime['modelV2']
+    longitudinalPlan.processingDelay = (plan_send.logMonoTime - sm.logMonoTime['modelV2']) / 1e9
     longitudinalPlan.solverExecutionTime = self.mpc.solve_time
 
     longitudinalPlan.speeds = self.v_desired_trajectory.tolist()
     longitudinalPlan.accels = self.a_desired_trajectory.tolist()
     longitudinalPlan.jerks = self.j_desired_trajectory.tolist()
 
-    longitudinalPlan.hasLead = sm['radarState'].leadOne.status
+    longitudinalPlan.hasLead = (sm['radarState'].leadOne.status
+                                or bool(getattr(getattr(sm['radarState'], 'leadTwo', None), 'status', False)))
     longitudinalPlan.longitudinalPlanSource = self.mpc.source
     longitudinalPlan.fcw = self.fcw
 

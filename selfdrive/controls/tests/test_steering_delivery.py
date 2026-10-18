@@ -80,7 +80,7 @@ class TeslaTakeover(unittest.TestCase):
     c.tap_lane_change = N(update=Mock(return_value=[]))
     c.navigation_signal = N(update=Mock(return_value=[]))
     self.cs = N(hands_on_level=0, tap_stalk=N(), out=N(vEgo=3., vEgoRaw=3.,
-                   leftBlinker=True, rightBlinker=False, steeringPressed=False, steeringAngleDeg=0.))
+                   leftBlinker=True, rightBlinker=False, steeringPressed=False, steeringTorque=0.0, canValid=True, steeringAngleDeg=0.))
     act = N(steeringAngleDeg=0., as_builder=lambda:N(steeringAngleDeg=0.))
     self.cc = N(latActive=True, actuators=act)
     self.limiter = self.enterContext(patch('opendbc.car.tesla.carcontroller.apply_steer_angle_limits_vm',

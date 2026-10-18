@@ -22,14 +22,12 @@ PROFILES = {
   # corner_lateral_accel controls signaled city-turn CornerAssist.
   # map_lateral_accel controls ordinary Map Driving Assist curve speed.
   #
-  # Map profiles are intentionally spread farther apart:
-  #   more     = previous standard mapped-curve target
-  #   standard = previous mild mapped-curve target
-  #   mild     = ~6% higher geometry speed than previous mild
-  # Signaled CornerAssist retains its existing tuning independently.
-  'more': CurveComfort('more', 1.0, 2.3, .8),
-  'standard': CurveComfort('standard', 1.2, 3.0, .8),
-  'mild': CurveComfort('mild', 1.6, 3.4, .6),
+  # Current More retains the former Mild mapped-curve target (3.4).
+  # Standard and Mild progressively reduce optional mapped-curve slowing.
+  # Signaled city-turn CornerAssist keeps its independent existing tuning.
+  'more': CurveComfort('more', 1.0, 3.4, .8),
+  'standard': CurveComfort('standard', 1.2, 3.8, .8),
+  'mild': CurveComfort('mild', 1.6, 4.2, .6),
 }
 
 

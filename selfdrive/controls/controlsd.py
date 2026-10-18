@@ -15,7 +15,6 @@ from opendbc.car.vehicle_model import VehicleModel
 from openpilot.selfdrive.controls.lib.drive_helpers import clip_curvature
 from openpilot.selfdrive.controls.lib.lane_centering import LaneCenteringAssist
 from openpilot.selfdrive.controls.lib.navigation_turn_commit import NavigationTurnCommit
-from openpilot.selfdrive.controls.lib.turn_steering_gate import TurnSteeringGate
 from openpilot.selfdrive.controls.lib.turn_context import manual_turn_intent
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
@@ -129,6 +128,7 @@ class Controls:
     self.lane_centering_enabled = False
     self.lane_centering_strength = 1
     self.lane_centering_offset = 0
+    self.nap_follow_distance = None
     self.low_speed_turn_curvature = 0.0
     self.low_speed_turn_smoothing_active = False
     self.low_speed_turn_entry_active = False
@@ -185,11 +185,9 @@ class Controls:
     CC.latActive = self.sm['selfdriveState'].active and not CS.steerFaultTemporary and not CS.steerFaultPermanent and \
                    (not standstill or self.CP.steerAtStandstill)
     CC.longActive = CC.enabled and not any(e.overrideLongitudinal for e in self.sm['onroadEvents']) and self.CP.openpilotLongitudinalControl
-    if self.CP.carFingerprint == "TESLA_MODEL_S_PREAP":
-      if not hasattr(self, 'turn_steering_gate'):
-        self.turn_steering_gate = TurnSteeringGate()
-      turn_allowed = self.turn_steering_gate.allowed(CS, model_v2)
-      CC.latActive = CC.latActive and turn_allowed
+    # Preserve ordinary lateral road following.
+    # Custom intersection-turn authorization remains in the
+    # turn-intent and navigation-commit logic.
 
 
     if (self.CP.carFingerprint == "TESLA_MODEL_S_PREAP"
@@ -211,7 +209,21 @@ class Controls:
 
     # accel PID loop
     pid_accel_limits = self.CI.get_pid_accel_limits(self.CP, CS.vEgo, CS.vCruise * CV.KPH_TO_MS)
-    actuators.accel = float(self.LoC.update(CC.longActive, CS, long_plan.aTarget, long_plan.shouldStop, pid_accel_limits))
+    if not hasattr(self, 'normal_cruise_smoothing_enabled') or self.sm.frame % 100 == 0:
+      self.normal_cruise_smoothing_enabled = self.params.get_bool("NAPAdaptiveAccel")
+    cruise_capture_speed = None
+    if (self.CP.carFingerprint == "TESLA_MODEL_S_PREAP"
+        and self.normal_cruise_smoothing_enabled
+        and CC.longActive and not CS.gasPressed and not CS.brakePressed
+        and long_plan.allowThrottle and not long_plan.hasLead and not long_plan.shouldStop
+        and not model_v2.action.shouldStop
+        and (self.sm['selfdriveState'].experimentalMode
+             or long_plan.longitudinalPlanSource == log.LongitudinalPlan.LongitudinalPlanSource.cruise)
+        and self.sm.all_checks(['carState', 'longitudinalPlan', 'modelV2', 'selfdriveState'])):
+      cruise_capture_speed = CS.vCruise * CV.KPH_TO_MS
+    actuators.accel = float(self.LoC.update(
+      CC.longActive, CS, long_plan.aTarget, long_plan.shouldStop, pid_accel_limits,
+      cruise_capture_speed=cruise_capture_speed))
 
     # Steering PID loop and lateral MPC
     # Reset desired curvature to current to avoid violating the limits on engage
@@ -230,11 +242,6 @@ class Controls:
       actual_curvature=self.curvature,
     )
 
-    if (self.CP.carFingerprint == "TESLA_MODEL_S_PREAP"
-        and not self.turn_steering_gate.allowed(CS, model_v2, new_desired_curvature)):
-      CC.latActive = False
-      new_desired_curvature = self.curvature
-      self.LaC.reset()
 
     one_blinker = CS.leftBlinker != CS.rightBlinker
 
@@ -243,6 +250,7 @@ class Controls:
       self.lane_centering_enabled = self.params.get_bool("NAPLaneCentering")
       self.lane_centering_strength = self.params.get("NAPLaneCenteringStrength", return_default=True)
       self.lane_centering_offset = self.params.get("NAPLaneCenterOffset", return_default=True)
+      self.nap_follow_distance = self.params.get("NAPFollowDistance", return_default=True)
 
     decision = getattr(self.navigation_turn_commit, 'decision', None)
     manual_city_intent = manual_turn_intent(CS, decision, model_v2, time.monotonic())
@@ -493,12 +501,28 @@ class Controls:
       elif CS.rightBlinker and new_desired_curvature < 0.0:
         new_desired_curvature = 0.0
 
+    # Tesla city-curve envelope experiment.
+    # Disabled in vehicle operation pending replay/safety validation.
+    city_curve_experiment_enabled = False
+    city_curve_bonus = 0.0
+
+    if city_curve_experiment_enabled and self.CP.carFingerprint == "TESLA_MODEL_S_PREAP":
+      mph = max(float(CS.vEgo), 0.0) * CV.MS_TO_MPH
+
+      if 10.0 < mph < 15.0:
+        city_curve_bonus = 0.20 * (mph - 10.0) / 5.0
+      elif 15.0 <= mph <= 20.0:
+        city_curve_bonus = 0.20
+      elif 20.0 < mph < 40.0:
+        city_curve_bonus = 0.20 * (40.0 - mph) / 20.0
+
     self.desired_curvature, curvature_limited = clip_curvature(
       CS.vEgo,
       self.desired_curvature,
       new_desired_curvature,
       lp.roll,
       max_curvature_rate_override=nap_turn_rate_override,
+      max_lateral_accel_bonus=city_curve_bonus,
     )
     lat_delay = self.sm["liveDelay"].lateralDelay + LAT_SMOOTH_SECONDS
 
@@ -541,6 +565,11 @@ class Controls:
     hudControl.lanesVisible = CC.enabled
     hudControl.leadVisible = self.sm['longitudinalPlan'].hasLead
     hudControl.leadDistanceBars = self.sm['selfdriveState'].personality.raw + 1
+    if self.CP.carFingerprint == "TESLA_MODEL_S_PREAP":
+      # The NAP selector, rather than personality, owns the actual time gap.
+      gap = self.nap_follow_distance
+      if type(gap) is int and 1 <= gap <= 7:
+        hudControl.leadDistanceBars = gap
     hudControl.visualAlert = self.sm['selfdriveState'].alertHudVisual
 
     hudControl.rightLaneVisible = True

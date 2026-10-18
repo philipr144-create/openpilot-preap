@@ -8,7 +8,7 @@ from cereal import log
 import cereal.messaging as messaging
 from opendbc.car.tesla.preap.accel_policy import accel_ceiling, limit_positive_accel
 from opendbc.car.tesla.preap import interface
-from opendbc.car.tesla.preap.nap_conf import REGEN_MAX
+from opendbc.car.tesla.preap.nap_conf import REGEN_MAX, ACCEL_MAX
 from opendbc.car.tesla.preap.virtual_das import VirtualDAS
 from openpilot.selfdrive.controls.lib import longitudinal_planner as lp
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc
@@ -19,12 +19,12 @@ class Policy(unittest.TestCase):
       self.assertLess(accel_ceiling(v,2),accel_ceiling(v,1))
       self.assertLessEqual(accel_ceiling(v,2),.70)
 
-  def test_interface_matches(self):
+  def test_interface_allows_personality_independent_tracking(self):
     with patch.object(interface,'_params') as params:
       for p in range(3):
         params.get.return_value=str(p)
         for v in (0.,1.3,7.5,15.,30.):
-          self.assertEqual(interface.get_preap_accel_limits(v),(-2.5,accel_ceiling(v,p)))
+          self.assertEqual(interface.get_preap_accel_limits(v),(-2.5,ACCEL_MAX))
     self.assertEqual(accel_ceiling(5,log.LongitudinalPersonality.relaxed),accel_ceiling(5,2))
 
   def test_should_stop_configuration_uses_full_regen_with_matching_jerk(self):
@@ -49,7 +49,7 @@ class Policy(unittest.TestCase):
   def test_actuator_rise_and_braking(self):
     with patch('opendbc.car.tesla.preap.virtual_das.get_zero_torque') as zero:
       zero.return_value.get.return_value=0.
-      for p,rise in ((2,.18),(1,.4),(0,.6)):
+      for p,rise in ((2,2.5),(1,2.5),(0,2.5)):
         vdas=VirtualDAS(dt=.02)
         for i in range(20):
           vdas.update(2.,10.,vdas.prev_pedal_di,personality=p)
@@ -139,8 +139,8 @@ class PlannerTransitions(unittest.TestCase):
   def test_standstill_launch(self):
     self.sm['carState'].vEgo=0.;self.sm['carState'].standstill=True
     for i in range(40):
-      self.assertLessEqual(self.tick(),min(.14,(i+1)*.009)+1e-9)
-    self.assertAlmostEqual(self.p.output_a_target,.14)
+      self.assertLessEqual(self.tick(),min(.24,(i+1)*.009)+1e-9)
+    self.assertAlmostEqual(self.p.output_a_target,.24)
 
 class SolverIntegration(unittest.TestCase):
   def test_real_mpc_lead_and_cruise_cap(self):
@@ -174,7 +174,7 @@ class ControllerIntegration(unittest.TestCase):
       can=MagicMock();controller=cc.PreAPLongController()
       controller.update(control,cs,0,can,0)
       for frame in range(2,100,2):controller.update(control,cs,frame,can,0)
-      self.assertAlmostEqual(controller.vdas.jerk_limiter.a_limited,.18)
+      self.assertAlmostEqual(controller.vdas.jerk_limiter.a_limited,1.)
       cs.out.gasPressed=True
       controller.update(control,cs,100,can,0)
       self.assertEqual(can.create_pedal_command.call_args.kwargs['enable'],0)
@@ -182,7 +182,7 @@ class ControllerIntegration(unittest.TestCase):
       cs.out.gasPressed=False
       controller.update(control,cs,102,can,0)
       self.assertEqual(can.create_pedal_command.call_args.kwargs['enable'],1)
-      self.assertAlmostEqual(controller.vdas.jerk_limiter.a_limited,.0036)
+      self.assertAlmostEqual(controller.vdas.jerk_limiter.a_limited,.05)
       cs.enableLongControl=False
       controller.update(control,cs,104,can,0)
       self.assertEqual(can.create_pedal_command.call_args.kwargs['enable'],0)

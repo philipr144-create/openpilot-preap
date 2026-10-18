@@ -10,6 +10,7 @@ import requests
 import cereal.messaging as messaging
 from openpilot.common.params import Params
 from openpilot.selfdrive.controls.lib.curve_comfort import read_curve_comfort
+from openpilot.selfdrive.nap.offline_roads import OfflineRoadStore
 
 
 SNAPSHOT = "/dev/shm/nap_map_context.json"
@@ -1160,6 +1161,11 @@ class NapMapD:
       ["gpsLocation", "navRoute"]
     )
 
+    self.offline_roads = OfflineRoadStore()
+    self.offline_metadata = None
+    self.offline_error = None
+    self._offline_checked_position = None
+    self.map_source = "osm_overpass"
     self.cache = load_cache()
 
     self.nodes = {}
@@ -1192,6 +1198,23 @@ class NapMapD:
     return d >= REFETCH_DISTANCE_M
 
   def fetch_if_needed(self, lat, lon):
+    # Persistent regional geometry is the first source, independent of the
+    # six-hour online cache. Existing matching/curve/control rules stay intact.
+    last = self._offline_checked_position
+    if last is None or haversine_m(lat, lon, *last) >= REFETCH_DISTANCE_M:
+      self._offline_checked_position = (lat, lon)
+      local = self.offline_roads.lookup(lat, lon, QUERY_RADIUS_M, way_filter=way_allowed)
+      self.offline_error = self.offline_roads.last_error
+      if local is not None:
+        data, metadata = local
+        nodes, ways = decode_osm(data)
+        if ways:
+          self.cache = {"wall_time": time.time(), "lat": lat, "lon": lon, "data": data}
+          self.nodes, self.ways = nodes, ways
+          self.map_source = "offline_osm"
+          self.offline_metadata = metadata
+          self.last_error = None
+          return
     if not self.need_fetch(lat, lon):
       return
 
@@ -1222,6 +1245,8 @@ class NapMapD:
 
       self.nodes = nodes
       self.ways = ways
+      self.map_source = "osm_overpass"
+      self.offline_metadata = None
       self.last_error = None
 
     except Exception as e:
@@ -1244,7 +1269,7 @@ class NapMapD:
       "enabled": enabled,
       "valid": False,
       "control_valid": False,
-      "source": "osm_overpass",
+      "source": self.map_source,
     }
 
     if (
@@ -1275,6 +1300,9 @@ class NapMapD:
       return
 
     self.fetch_if_needed(lat, lon)
+    payload["source"] = self.map_source
+    payload["offline_map"] = self.offline_metadata
+    payload["offline_map_error"] = self.offline_error
 
     if not self.ways:
       payload["status"] = "no_map_data"

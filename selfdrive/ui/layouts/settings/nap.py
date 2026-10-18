@@ -152,7 +152,8 @@ class NAPLayout(Widget):
     self._curve_comfort_buttons = multiple_button_item(
       "Curve Slowdown",
       "Adjust optional Corner Assist and mapped-curve slowing when those features are enabled. "
-      "Mild slows less; More favors lower curve speeds. Cruise speed, leads and stops still take priority. "
+      "For mapped curves, More uses the former Mild level; Standard and Mild slow progressively less. "
+      "City-turn Corner Assist keeps its existing range. Cruise speed, leads and stops still take priority. "
       "Change while parked.",
       buttons=["More", "Standard", "Mild"], button_width=180,
       selected_index=PROFILE_NAMES.index(read_curve_comfort().name),
