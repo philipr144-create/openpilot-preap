@@ -1,6 +1,6 @@
 """Pre-AP acceleration handoff with shared cruise capture and braking priority."""
 import math
-from openpilot.selfdrive.controls.lib.model_forecast import assess_model_forecast
+from openpilot.selfdrive.controls.lib.model_forecast import assess_model_forecast, assess_model_intent
 from opendbc.car.tesla.preap.accel_policy import ACCEL_RISE, REGEN_RELEASE_JERK, personality_index
 
 DECEL_JERK = {0: .8, 1: .6, 2: .4}
@@ -23,12 +23,8 @@ def braking_priority(model, speed, request, mpc, has_lead, stop, force_decel,
       or (speed > driver_speed + .5 and mpc < 0.)
       or (type(corner_speed) in (int, float) and math.isfinite(corner_speed) and speed >= corner_speed)):
     return 'SPEED_CEILING'
-  forecast = assess_model_forecast(model, speed) if forecast is None else forecast
-  if forecast.planned_stop or forecast.near_braking:
-    return 'PLANNED_MODEL_BRAKING'
-  if model.action.desiredAcceleration >= 0.:
-    return 'ORDINARY'
-  return 'ORDINARY' if forecast.valid else 'UNPROVEN_MODEL_BRAKING'
+  intent = assess_model_intent(model, speed, float(model.action.desiredAcceleration), forecast)
+  return intent.reason if intent.braking_required else 'ORDINARY'
 
 
 def handoff_acceleration(request, previous, dt, personality, lower, upper, priority='ORDINARY',

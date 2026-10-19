@@ -100,7 +100,7 @@ class DesireHelper:
     return LaneChangeDirection.left if CS.leftBlinker else LaneChangeDirection.right
 
   def update(self, carstate, lateral_active, lane_change_prob, *, manual_turn_direction=0,
-             model=None, inputs_valid=False, now=None):
+             model=None, inputs_valid=False, now=None, actual_curvature=None):
     now = time.monotonic() if now is None else now
     v_ego = carstate.vEgo
     one_blinker = carstate.leftBlinker != carstate.rightBlinker
@@ -143,14 +143,15 @@ class DesireHelper:
                     and (direction == 1) == bool(carstate.leftBlinker)
                     and not carstate.steeringPressed
                     and not getattr(carstate, 'steeringDisengage', False)
-                    and (not driver_braking(carstate) or v_ego <= 0.3) and carstate.canValid
+                    and carstate.canValid
                     and str(carstate.gearShifter) in ('drive', 'low', 'sport', 'eco')
                     and not (carstate.leftBlindspot if direction == 1 else carstate.rightBlindspot))
       self.manual_turn_command_active = self.manual_entry.update(
         model, direction, max(0.0, v_ego), authorized, now,
+        transient_unavailable=not inputs_valid, actual_curvature=actual_curvature,
         driver_assisting=(carstate.steeringPressed and not getattr(carstate, "steeringDisengage", False)
                           and inputs_valid and lateral_active and one_blinker
-                          and direction in (1, 2) and not driver_braking(carstate)))
+                          and direction in (1, 2)))
       self.manual_turn_cancelled = self.manual_entry.blocked
       if self.manual_turn_command_active:
         self.desire = log.Desire.turnLeft if direction == 1 else log.Desire.turnRight

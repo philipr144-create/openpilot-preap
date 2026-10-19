@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import math
 from openpilot.system.hardware import TICI
 os.environ['DEV'] = 'QCOM' if TICI else 'CPU'
 USBGPU = "USBGPU" in os.environ
@@ -408,7 +409,9 @@ def main(demo=False):
                 inputs_valid=(nav_inputs_valid and sm.all_checks(['liveCalibration'])
                               and sm['liveCalibration'].calStatus == log.LiveCalibrationData.Status.calibrated
                               and 0 <= now - last_manual_model_time <= .15),
-                now=now)
+                now=now,
+                actual_curvature=(-math.tan(math.radians(sm['carState'].steeringAngleDeg) / CP.steerRatio) / CP.wheelbase
+                                  if CP.steerRatio > 0 and CP.wheelbase > 0 else None))
       driver_desire = DH.desire
       desire = driver_desire
     selection_source = 'none'
@@ -431,7 +434,7 @@ def main(demo=False):
       desire = getattr(log.Desire, nav_request)
     else:
       selection_source = 'driver_desire_helper'
-    if tap_model is not None and desire in (log.Desire.turnLeft, log.Desire.turnRight):
+    if desire in (log.Desire.turnLeft, log.Desire.turnRight):
       turn_direction = 1 if desire == log.Desire.turnLeft else 2
       if not matching_signal(sm['carState'], turn_direction):
         desire = log.Desire.none
@@ -498,7 +501,9 @@ def main(demo=False):
                                       manual_turn_direction=tap_model.manual_turn_direction if tap_model is not None else 0,
                                       city_turns_enabled=DH.manual_turns_enabled,
                                       manual_turn_blocked=DH.manual_entry.blocked,
-                                      manual_turn_continuing=DH.manual_entry.started is not None)
+                                      manual_turn_continuing=DH.manual_entry.started is not None,
+                                      manual_turn_phase=DH.manual_entry.phase,
+                                      manual_turn_reason=DH.manual_entry.reason)
     nav_desire.publish_diagnostics()
     mt2 = time.perf_counter()
     model_execution_time = mt2 - mt1

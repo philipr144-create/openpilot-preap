@@ -412,7 +412,7 @@ class NavigationDesire:
                              signal_owner='none', tap_enabled=False,
                              tap_status='unavailable', tap_signal_active=False,
                              manual_turn_direction=0, city_turns_enabled=False, manual_turn_blocked=False,
-                             manual_turn_continuing=False):
+                             manual_turn_continuing=False, manual_turn_phase=None, manual_turn_reason=None):
     # Captured after model.run, before DesireHelper updates for the next frame.
     self.decision.update(selected_desire=selected, final_desire=selected if evaluated else None,
                          source=source, model_evaluated=bool(evaluated), frame_id=int(frame_id),
@@ -422,7 +422,8 @@ class NavigationDesire:
                          manual_turn_direction=manual_turn_direction,
                          city_turns_enabled=bool(city_turns_enabled),
                          manual_turn_blocked=bool(manual_turn_blocked),
-                         manual_turn_continuing=bool(manual_turn_continuing))
+                         manual_turn_continuing=bool(manual_turn_continuing),
+                         manual_turn_phase=manual_turn_phase, manual_turn_reason=manual_turn_reason)
 
   def publish_diagnostics(self, now=None):
     now = time.monotonic() if now is None else now

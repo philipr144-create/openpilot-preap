@@ -1,7 +1,7 @@
 """Bounded Pre-AP cruise assistance; no lead or stop authority."""
 from dataclasses import dataclass
 import math
-from openpilot.selfdrive.controls.lib.model_forecast import assess_model_forecast
+from openpilot.selfdrive.controls.lib.model_forecast import assess_model_forecast, assess_model_intent
 
 
 @dataclass(frozen=True)
@@ -61,40 +61,8 @@ class CruiseRefinement:
 
 
 def model_support_weight(model, speed, request, forecast=None):
-  """Allow bounded compensation for weak model coasting, never a planned stop.
-
-  Full support at zero demand fades continuously to zero at -0.2 m/s².
-  Negative requests additionally require a complete, nearly speed-holding
-  three-second prediction. Missing/invalid predictions preserve the request.
-  """
-  forecast = assess_model_forecast(model, speed) if forecast is None else forecast
-  if not math.isfinite(request) or forecast.planned_stop:
-    return 0.0
-  if request >= 0.0:
-    return 1.0
-  if request <= -0.2:
-    return 0.0
-  try:
-    if not forecast.valid:
-      return 0.0
-    times, speeds = list(forecast.times), list(forecast.speeds)
-    if (len(times) < 3 or len(times) != len(speeds)
-        or not all(math.isfinite(x) for x in times + speeds + [speed, request])
-        or any(b <= a for a, b in zip(times, times[1:]))
-        or times[0] > 0.1 or times[-1] < 3.0
-        or abs(speeds[0] - speed) > 2.0):
-      return 0.0
-    near = [v for t, v in zip(times, speeds) if 0.0 <= t <= 3.0]
-    # Model velocity has its own ego-speed estimate. Compare its predicted
-    # change with that estimate; a bounded initial offset from wheel speed
-    # is not a predicted deceleration. The 2 m/s plausibility gate above
-    # still rejects unreliable estimates.
-    if not near or min(near) < speeds[0] - 0.5:
-      return 0.0
-    return max(0.0, 1.0 + request / 0.2)
-  except (AttributeError, TypeError, ValueError):
-    return 0.0
-
+  """Use the shared intent assessment; this helper adds no acceleration."""
+  return assess_model_intent(model, speed, request, forecast).support_weight
 
 
 # Legacy replay helpers; production uses acceleration_handoff.py.

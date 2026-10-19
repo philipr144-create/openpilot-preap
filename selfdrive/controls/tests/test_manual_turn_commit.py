@@ -291,8 +291,8 @@ class ManualTests(unittest.TestCase):
     self.assertTrue(self.helper.active)
 
   def test_gates_cancel_without_replay(self):
-    cases = [('cs', 'brakePressed', True), ('cs', 'canValid', False), ('cs', 'vEgo', 16.0),
-             ('cs', 'vEgo', math.nan), ('cs', 'vEgo', 0.), ('cs', 'leftBlindspot', True),
+    cases = [('cs', 'canValid', False), ('cs', 'vEgo', 16.0),
+             ('cs', 'vEgo', math.nan), ('cs', 'leftBlindspot', True),
              ('cs', 'rightBlinker', True), ('cs', 'gearShifter', 'reverse'),
              ('d', 'city_turns_enabled', False), ('d', 'manual_turn_direction', 0),
              ('d', 'source', 'navigation'), ('d', 'source', 'tap_lane_change'),

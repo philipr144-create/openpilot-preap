@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import requests
 import cereal.messaging as messaging
 from openpilot.common.params import Params
-from openpilot.selfdrive.controls.lib.curve_comfort import read_curve_comfort
+from openpilot.selfdrive.controls.lib.curve_comfort import read_curve_comfort, road_curve_speed
 from openpilot.selfdrive.nap.offline_roads import OfflineRoadStore
 
 
@@ -730,6 +730,17 @@ def raw_geometry(lat0, lon0, points):
         y - prev[1],
       )
 
+    if prev is not None and cumulative > LOOKAHEAD_M:
+      # The last OSM edge can extend far beyond the requested corridor.
+      # Interpolate its boundary; never relocate the distant node's signs or
+      # publish its endpoint as if it were the supported control horizon.
+      start_distance = out[-1]["distance"]
+      fraction = (LOOKAHEAD_M - start_distance) / (cumulative - start_distance)
+      x = prev[0] + fraction * (x - prev[0])
+      y = prev[1] + fraction * (y - prev[1])
+      cumulative = LOOKAHEAD_M
+      node = None
+
     out.append({
       "x": x,
       "y": y,
@@ -954,9 +965,9 @@ def curve_events(samples, comfort=None):
     if k <= 1e-6:
       continue
 
-    target = math.sqrt(
-      comfort.map_lateral_accel / k
-    )
+    target = road_curve_speed(k, comfort)
+    if target is None:
+      continue
 
     apex_sample = max(
       seg["samples"],

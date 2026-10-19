@@ -491,7 +491,6 @@ class Controls:
       and self.navigation_turn_commit.side == ('left' if CS.leftBlinker else 'right')
       and not CS.steeringPressed
       and not getattr(CS, "steeringDisengage", False)
-      and not CS.brakePressed
       and CS.canValid
     )
 

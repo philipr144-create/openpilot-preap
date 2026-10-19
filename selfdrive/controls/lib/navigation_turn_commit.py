@@ -125,9 +125,10 @@ class NavigationTurnCommit:
       decision = self.decision or {}
       stamp = decision.get('received_mono')
       age = now - stamp if type(stamp) in (int, float) else -1.0
-      cloudlog.info('NAP turn state=%s side=%s speed=%.2f model=%.5f request=%.5f age=%.3f source=%s blocked=%s',
+      cloudlog.info('NAP turn state=%s side=%s speed=%.2f model=%.5f request=%.5f age=%.3f source=%s blocked=%s phase=%s reason=%s',
                     self.state, self.side, CS.vEgo, curvature, output, age,
-                    decision.get('source'), decision.get('manual_turn_blocked'))
+                    decision.get('source'), decision.get('manual_turn_blocked'),
+                    decision.get('manual_turn_phase'), decision.get('manual_turn_reason'))
     return output
 
   def _update(self, curvature, CS, lat_active, now, *, model, healthy, actual_curvature):
@@ -188,7 +189,6 @@ class NavigationTurnCommit:
         and str(CS.gearShifter) in ("drive", "low", "sport", "eco")
         and not CS.steeringPressed
         and not getattr(CS, "steeringDisengage", False)
-        and not driver_braking(CS)
         and CS.canValid
       )
 
@@ -459,6 +459,12 @@ class ManualTurnCommit:
     self.stop_intent_frames = 0
     self.stop_intent_armed = False
     self.intent_seed_start = None
+
+  def suspend(self):
+    """Yield all added authority; require fresh evidence without a signal reset."""
+    blocked = self.blocked
+    self.reset()
+    self.blocked = blocked
 
   def cancel(self):
     self.blocked = self.blocked or self.started is not None
@@ -762,7 +768,8 @@ class ManualTurnCommit:
       self.state = "DRIVER ASSIST CANCELLED"
       return curvature
     if not isinstance(decision, dict):
-      self.cancel()
+      self.suspend()
+      self.state = "MANUAL WAIT DECISION"
       return curvature
     direction = decision.get('manual_turn_direction')
     sign = -1.0 if direction == 1 else 1.0
@@ -773,6 +780,22 @@ class ManualTurnCommit:
              and 0 <= now - stamp <= MAX_DECISION_AGE_S)
     model_frame = getattr(model, 'frameId', None)
     paired = type(frame) is int and type(model_frame) is int and abs(frame - model_frame) <= 2
+    if not fresh or not paired or not 0 <= dt <= 0.1:
+      self.suspend()
+      self.state = "MANUAL WAIT FRESH DATA"
+      return curvature
+    phase = decision.get('manual_turn_phase')
+    if phase is not None and phase not in ('TURN', 'EXIT'):
+      if phase in ('COMPLETE', 'CANCELLED'):
+        self.cancel()
+      else:
+        self.suspend()
+      self.state = 'MANUAL LIFECYCLE ' + str(phase)
+      return curvature
+    if self.started is not None and cs.vEgo <= 0.3:
+      self.suspend()
+      self.state = "MANUAL STOP WAIT"
+      return curvature
     if (not healthy or not lat_active or not one or not fresh or not paired
         or not 0 <= dt <= 0.1 or self.blocked
         or type(direction) is not int or direction not in (1, 2)
@@ -788,15 +811,12 @@ class ManualTurnCommit:
         or decision.get('tap_signal_active') is not False
         or decision.get('synthetic_indicator_request') != 'none'
         or cs.steeringPressed or getattr(cs, 'steeringDisengage', False)
-        or driver_braking(cs) or not cs.canValid
+        or not cs.canValid
         or str(cs.gearShifter) not in ('drive', 'low', 'sport', 'eco')
         or (cs.leftBlindspot if direction == 1 else cs.rightBlindspot)
         or not all(math.isfinite(v) for v in (cs.vEgo, curvature, actual_curvature))
         or not -0.1 <= cs.vEgo <= (CONTINUE_SPEED_MPH if self.started is not None else COMMIT_SPEED_MPH) * CV.MPH_TO_MS
-        # Standstill is valid only for pre-arming a new intersection turn.
-        # If an already-started maneuver falls back to essentially stopped,
-        # cancel it and latch blocked until the physical signal is cleared.
-        or (self.started is not None and cs.vEgo <= 0.3)):
+):
       self.cancel()
       return curvature
     if self.direction and self.direction != direction:
@@ -861,7 +881,7 @@ class ManualTurnCommit:
       continuing=self.started is not None,
     )
     if evidence is None:
-      self.cancel()
+      self.suspend()
       return curvature
     credible, remaining_heading, raw = evidence
 
@@ -877,7 +897,7 @@ class ManualTurnCommit:
     self.direction = direction
     self.side = 'left' if direction == 1 else 'right'
     if self.last_model_time is not None and now - self.last_model_time > 0.15:
-      self.cancel()
+      self.suspend()
       return curvature
     if model_frame != self.last_frame:
       self.last_frame = model_frame
@@ -1013,6 +1033,11 @@ class ManualTurnEntry:
 
   def reset(self):
     self.direction = 0
+    self.phase = 'IDLE'
+    self.reason = 'NO_SIGNAL'
+    self.heading = 0.0
+    self.motion_time = None
+    self.exit_since = None
     self.blocked = False
     self.frame = None
     self.last_frame_time = None
@@ -1027,12 +1052,28 @@ class ManualTurnEntry:
     self.stop_intent_frames = 0
     self.started_from_stop = False
 
+  def suspend(self):
+    """Yield all added authority; require fresh evidence without a signal reset."""
+    blocked = self.blocked
+    self.reset()
+    self.blocked = blocked
+    self.phase = 'CANCELLED' if blocked else 'WAIT'
+    self.reason = 'FRESH_EVIDENCE_REQUIRED'
+
   def cancel(self):
     # An interrupted approach is not a completed/cancelled turn. Discard its
     # evidence and require a full fresh dwell, but permit early signaling.
     blocked = self.blocked or self.started is not None
     self.reset()
     self.blocked = blocked
+    self.phase = 'CANCELLED' if blocked else 'WAIT'
+    self.reason = 'AUTHORIZATION_OR_PATH_LOST'
+
+  def complete(self):
+    self.reset()
+    self.blocked = True
+    self.phase = 'COMPLETE'
+    self.reason = 'NEAR_PATH_STRAIGHT'
 
   @staticmethod
   def obvious_future_corner(model, sign):
@@ -1060,10 +1101,20 @@ class ManualTurnEntry:
     except (AttributeError, TypeError, ValueError, OverflowError):
       return False
 
-  def update(self, model, direction, speed, authorized, now, driver_assisting=False):
+  def update(self, model, direction, speed, authorized, now, driver_assisting=False, transient_unavailable=False, actual_curvature=None):
+    if self.blocked:
+      return False
     if driver_assisting:
       self.cancel()
       return False
+    if transient_unavailable:
+      self.suspend()
+      return False
+    # Lateral may naturally become inactive at standstill. Drop the motion
+    # commitment before checking authorization, so a normal stop cannot latch
+    # the signal out. Rollout still requires engagement and fresh evidence.
+    if self.started is not None and math.isfinite(speed) and speed <= 0.3:
+      self.suspend()
     if (not authorized or self.blocked or not math.isfinite(speed)
         or not -0.1 <= speed <= (CONTINUE_SPEED_MPH if self.started is not None else COMMIT_SPEED_MPH) * CV.MPH_TO_MS
         or self.direction not in (0, direction)):
@@ -1077,19 +1128,41 @@ class ManualTurnEntry:
       continuing=self.started is not None,
     )
     if evidence is None:
-      self.cancel()
+      self.suspend()
       return False
     frame = getattr(model, 'frameId', None)
     if type(frame) is not int:
       self.cancel()
       return False
     if self.last_frame_time is not None and not 0 <= now - self.last_frame_time <= 0.15:
-      self.cancel()
+      self.suspend()
       return False
     if frame != self.frame:
       if self.frame is not None and frame < self.frame:
         self.cancel()
         return False
+      dt = 0.0 if self.motion_time is None else now - self.motion_time
+      self.motion_time = now
+      if (self.started is not None and actual_curvature is not None
+          and math.isfinite(actual_curvature) and 0 <= dt <= .15):
+        self.heading += sign * actual_curvature * max(0.0, speed) * dt
+      # Clear model conditioning as well as added steering when the near path
+      # straightens after observed turning. A distant next bend must not retain
+      # the completed city-turn desire while the stalk remains held.
+      if (self.started is not None and self.heading >= ManualTurnCommit.EXIT_MIN_HEADING
+          and ManualTurnCommit.turn_exit_evidence(model, getattr(getattr(model, 'action', None), 'desiredCurvature', float('nan')))):
+        if self.exit_since is None:
+          self.exit_since = now
+        self.phase = 'EXIT'
+        if now - self.exit_since >= .20:
+          self.complete()
+          return False
+      else:
+        self.exit_since = None
+        self.phase = 'TURN' if self.started is not None else 'ARMED'
+      if self.phase != 'EXIT':
+        self.phase = 'TURN' if self.started is not None else 'ARMED'
+      self.reason = 'QUALIFYING_GEOMETRY' if self.started is None else 'TURN_IN_PROGRESS'
       self.frame, self.last_frame_time = frame, now
       credible, _, raw = evidence
 
@@ -1114,7 +1187,7 @@ class ManualTurnEntry:
       # Normally loss of turn shape revokes City Turns immediately. A turn
       # started from a complete stop receives a short acquisition grace period
       # so modeld can react to the newly supplied turn desire.
-      if self.started is not None and not credible:
+      if self.started is not None and not credible and self.exit_since is None:
         stop_grace = (
           self.started_from_stop
           and now - self.started <= ManualTurnCommit.STOP_INTENT_GRACE_SECONDS
@@ -1165,4 +1238,6 @@ class ManualTurnEntry:
     if now - self.started >= ManualTurnCommit.MAX_SECONDS or now - self.last_evidence > ManualTurnCommit.HOLD_SECONDS:
       self.cancel()
       return False
+    if self.phase != 'EXIT':
+      self.phase = 'TURN'
     return True

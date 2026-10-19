@@ -61,7 +61,7 @@ class CityTurnGates(unittest.TestCase):
       self.setUp(); self.prepare()
       for _ in range(3): self.assertEqual(self.tick(), log.Desire.none)
       saved_speed, saved_yaw = self.cs.vEgo, self.model.orientation.z
-      if case == 'stopped': self.cs.vEgo = 0.
+      if case in ('stopped', 'brake'): self.cs.vEgo = 0.
       if case == 'brake': self.cs.brakePressed = True
       if case == 'missing': self.model.orientation.z = []
 
@@ -70,7 +70,7 @@ class CityTurnGates(unittest.TestCase):
         for _ in range(10)
       ]
 
-      if case == 'stopped':
+      if case in ('stopped', 'brake'):
         # A genuine sustained corner may condition the model while stopped.
         # Actuator-side ManualTurnCommit still requires vehicle motion.
         self.assertEqual(desires[-1], log.Desire.turnLeft)
@@ -82,7 +82,7 @@ class CityTurnGates(unittest.TestCase):
       self.cs.brakePressed = False
       self.model.orientation.z = saved_yaw
 
-      if case == 'stopped':
+      if case in ('stopped', 'brake'):
         self.assertEqual(self.tick(), log.Desire.turnLeft)
       else:
         for _ in range(4): self.assertEqual(self.tick(), log.Desire.none)
@@ -127,14 +127,14 @@ class CityTurnGates(unittest.TestCase):
       )
 
   def test_override_cancel_and_opposite_do_not_rearm_until_neutral(self):
-    for field in ('steeringPressed', 'brakePressed', 'rightBlinker'):
+    for field in ('steeringPressed', 'rightBlinker'):
       self.setUp(); self.prepare()
       for _ in range(10): self.tick()
       self.assertEqual(self.helper.desire, log.Desire.turnLeft)
       setattr(self.cs, field, True)
       self.assertEqual(self.tick(), log.Desire.none)
       setattr(self.cs, field, False)
-      # Hazards explicitly clear the direction; steering/brake remain latched.
+      # Hazards explicitly clear the direction; steering takeover remains latched.
       if field != 'rightBlinker':
         for _ in range(20): self.assertEqual(self.tick(), log.Desire.none)
       self.cs.leftBlinker = False
@@ -195,7 +195,7 @@ class CityTurnGates(unittest.TestCase):
         self.model.action.desiredCurvature = 0.
 
       self.assertEqual(self.tick(), log.Desire.none)
-      self.assertTrue(self.helper.manual_entry.blocked)
+      self.assertEqual(self.helper.manual_entry.blocked, case == 'straight')
 
   def test_obvious_near_corner_can_start_with_zero_instantaneous_curvature(self):
     """Physical blinker owns side when future path clearly shows a nearby corner.

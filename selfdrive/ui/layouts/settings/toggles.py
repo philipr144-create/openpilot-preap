@@ -102,6 +102,16 @@ class TogglesLayout(Widget):
       icon="speed_limit.png"
     )
 
+    self._pitch_assist_setting = multiple_button_item(
+      lambda: tr("Pitch Hill Assist"),
+      lambda: tr("OFF disables grade compensation. MONITOR records grade estimates without changing acceleration. ON requires pitch-sign validation and open-road conditions."),
+      buttons=[lambda: tr("OFF"), lambda: tr("MONITOR"), lambda: tr("ON")],
+      button_width=235,
+      callback=self._set_pitch_assist_mode,
+      selected_index=self._read_pitch_assist_mode(),
+      icon="speed_limit.png"
+    )
+
     self._toggles = {}
     self._locked_toggles = set()
     for param, (title, desc, icon, needs_restart) in self._toggle_defs.items():
@@ -134,6 +144,7 @@ class TogglesLayout(Widget):
       # insert longitudinal personality after NDOG toggle
       if param == "DisengageOnAccelerator":
         self._toggles["LongitudinalPersonality"] = self._long_personality_setting
+        self._toggles["NAPPitchAssistMode"] = self._pitch_assist_setting
 
     self._update_experimental_mode_icon()
     self._scroller = Scroller(list(self._toggles.values()), line_separator=True, spacing=0)
@@ -195,6 +206,10 @@ class TogglesLayout(Widget):
 
     self._update_experimental_mode_icon()
 
+    # Mirror changes made from the MCU2 web UI, including while this page is open.
+    pitch_mode = self._read_pitch_assist_mode()
+    self._pitch_assist_setting.action_item.set_selected_button(pitch_mode)
+
     # TODO: make a param control list item so we don't need to manage internal state as much here
     # refresh toggles from params to mirror external changes
     for param in self._toggle_defs:
@@ -243,3 +258,14 @@ class TogglesLayout(Widget):
 
   def _set_longitudinal_personality(self, button_index: int):
     self._params.put("LongitudinalPersonality", button_index)
+
+  def _read_pitch_assist_mode(self):
+    try:
+      value = int(self._params.get("NAPPitchAssistMode", return_default=True) or 0)
+      return value if value in (0, 1, 2) else 0
+    except (TypeError, ValueError, OSError, KeyError):
+      return 0
+
+  def _set_pitch_assist_mode(self, button_index: int):
+    if button_index in (0, 1, 2):
+      self._params.put("NAPPitchAssistMode", button_index)

@@ -6,6 +6,8 @@ import time
 from openpilot.selfdrive.controls.lib.turn_context import driver_braking, paired_decision, manual_turn_intent
 from openpilot.selfdrive.controls.lib.curve_comfort import PROFILES, DEFAULT_PROFILE, read_curve_comfort
 
+from openpilot.selfdrive.controls.lib.turn_speed_plan import TurnSpeedPlan, path_turn_target
+
 SETTINGS = '/data/nap_turn_settings.json'
 
 LAT_ACCEL_TARGET = PROFILES[DEFAULT_PROFILE].corner_lateral_accel
@@ -56,6 +58,7 @@ class CornerAssist:
     self.reason = 'Corner assistance off'
     self.target_speed = None
     self.comfort = PROFILES[DEFAULT_PROFILE]
+    self.turn_plan = TurnSpeedPlan()
 
   def refresh(self, now=None):
     now = time.monotonic() if now is None else now
@@ -70,18 +73,19 @@ class CornerAssist:
         self.config['corner_assist'] = (param_val is True)
       self.last_config = now
 
-  def update(self, base, speed, curvature, coast, active, now, cruise_speed=None):
+  def update(self, base, speed, curvature, coast, active, now, cruise_speed=None, target_override=None):
     """City-speed experiment, with limited additional deceleration and jerk.
 
     This caps acceleration, not braking authority. A lead/stop/model request
     below the cap passes through unchanged. It cannot guarantee a safe speed.
     """
+    previous_target = self.target_speed
     self.target_speed = None
     valid_cruise = (cruise_speed is None or
                     (math.isfinite(cruise_speed) and cruise_speed >= 0.))
     valid = (valid_cruise and self.config['corner_assist'] and active and curvature is not None
              and all(math.isfinite(v) for v in (base, speed, curvature, coast, now))
-             and 2.5 <= speed <= 15.65 and 0 <= curvature <= .25)
+             and .3 <= speed <= 15.65 and 0 <= curvature <= .25)
     dt = now-self.last_time if self.last_time is not None else .05
     self.last_time = now
     if not valid or not 0 < dt <= .25:
@@ -100,6 +104,13 @@ class CornerAssist:
     self.target_speed = math.sqrt(self.comfort.corner_lateral_accel / curvature)
     if cruise_speed is not None:
       self.target_speed = min(self.target_speed, cruise_speed)
+    if target_override is not None:
+      self.target_speed = min(self.target_speed, target_override) if cruise_speed is None else min(cruise_speed, target_override)
+    if target_override is None and previous_target is not None and self.target_speed > previous_target:
+      # Release only curve-owned authority progressively. Do not preserve an
+      # obsolete target below current speed once geometry permits recovery.
+      self.target_speed = min(self.target_speed,
+                              max(previous_target, min(speed, self.target_speed)) + .6 * dt)
     approach_distance = max(8., speed * 2.5)
     target_cap = min(max(0., base), max(-self.comfort.corner_max_decel,
                      (self.target_speed**2 - speed**2) / (2 * approach_distance)))
@@ -122,27 +133,58 @@ class CornerAssist:
       self.reason = 'Above absolute curve target; gradual slowdown'
     return min(base, self.cap, target_cap) if target_cap >= 0. else min(base, self.cap)
 
-  def apply(self, base, sm, CP, reset, coast, cruise_speed=None, decision=None):
+  def prepare(self, sm, CP, reset, cruise_speed, decision=None):
+    """Prepare the same geometry ceiling for MPC and the final corner cap.
+
+    Pedals change longitudinal ownership, not lateral turn intent. No speed
+    authority is granted while either pedal is touched or long is disengaged.
+    """
     now = time.monotonic()
     try:
       cs, cc, model = sm['carState'], sm['carControl'], sm['modelV2']
-      fresh = all(sm.valid[s] and sm.alive[s] and 0 <= now-sm.logMonoTime[s]/1e9 <= .5
-                  for s in ('carState', 'carControl', 'modelV2'))
-      # Exactly one reported indicator must be active; hazards do not qualify.
+      fresh = all(sm.valid[k] and sm.alive[k] and 0 <= now-sm.logMonoTime[k]/1e9 <= .5
+                  for k in ('carState', 'carControl', 'modelV2'))
       signaled = bool(cs.leftBlinker) != bool(cs.rightBlinker)
-      turn_intent = manual_turn_intent(cs, decision, model, now)
+      turn_intent = (manual_turn_intent(cs, decision, model, now)
+                     and decision.get('manual_turn_phase') in (None, 'TURN', 'EXIT'))
+      # Completion clears steering/model intent immediately, while the already
+      # active speed ceiling releases through the same bounded speed planner.
+      if (paired_decision(decision, model, now) and decision.get('manual_turn_phase') == 'COMPLETE'
+          and self.turn_plan.target is not None and self.config['corner_assist']
+          and fresh and cs.canValid and cc.latActive and not cs.steeringPressed
+          and str(cs.gearShifter) == 'drive' and .3 <= cs.vEgo <= 15.65):
+        return self.turn_plan.update(cruise_speed, cs.vEgo, 0., cruise_speed, now, True,
+                                     driver_braking(cs) or cs.gasPressed, cc.longActive and not reset)
       nav_turn = (paired_decision(decision, model, now) and decision.get("source") == "navigation"
                   and decision.get("confirmed") is True and decision.get("final_desire") in ("turnLeft", "turnRight"))
-      active = ((turn_intent or nav_turn) and signaled and fresh and not reset and cs.canValid and cc.longActive and cc.latActive
-                and not driver_braking(cs) and not cs.gasPressed and not cs.steeringPressed
-                and str(cs.gearShifter) == 'drive')
-      curve = path_curve(model.position.x, model.position.y, min(40., max(12., cs.vEgo*3)))
-      # Require usable model geometry even when steering indicates a curve.
-      if curve is not None and CP.steerRatio > 0 and CP.wheelbase > 0:
-        actual = abs(math.tan(math.radians(cs.steeringAngleDeg)/CP.steerRatio)/CP.wheelbase)
-        curve = max(curve, actual)
-      return self.update(base, cs.vEgo, curve, coast, active, now, cruise_speed)
+      eligible = (self.config['corner_assist'] and (turn_intent or nav_turn) and signaled and fresh
+                  and cs.canValid and cc.latActive and not cs.steeringPressed
+                  and str(cs.gearShifter) == 'drive' and .3 <= cs.vEgo <= 15.65
+                  and CP.steerRatio > 0 and CP.wheelbase > 0)
+      if not eligible:
+        self.turn_plan.reset()
+        return None
+      actual = abs(math.tan(math.radians(cs.steeringAngleDeg)/CP.steerRatio)/CP.wheelbase)
+      target = path_turn_target(model.position.x, model.position.y,
+                               self.comfort.corner_lateral_accel, self.comfort.corner_max_decel, cruise_speed)
+      if target is not None and actual >= MIN_CURVATURE:
+        target = min(target, math.sqrt(self.comfort.corner_lateral_accel/actual))
+      return self.turn_plan.update(target, cs.vEgo, actual, cruise_speed, now, eligible,
+                                   driver_braking(cs) or cs.gasPressed, cc.longActive and not reset)
     except (AttributeError, ValueError, TypeError, KeyError, OverflowError):
-      self.cap = None
-      self.reason = 'Invalid input; normal planner'
+      self.turn_plan.reset()
+      return None
+
+  def apply(self, base, sm, CP, reset, coast, cruise_speed=None, decision=None, prepared=False):
+    now=time.monotonic()
+    target=(self.turn_plan.target if self.turn_plan.owner == 'PLANNER' else None) if prepared else self.prepare(sm,CP,reset,cruise_speed,decision)
+    if target is None:
+      self.cap=None
+      self.target_speed=None
+      self.last_time=now
+      self.reason='Turn speed '+self.turn_plan.owner.lower()+'; normal planner'
       return base
+    # The speed planner already owns target release. Keep the existing optional
+    # corner deceleration envelope and the single final longitudinal handoff.
+    curvature=max(MIN_CURVATURE,min(.25,self.comfort.corner_lateral_accel/max(target*target,.01)))
+    return self.update(base,sm['carState'].vEgo,curvature,coast,True,now,cruise_speed,target_override=target)

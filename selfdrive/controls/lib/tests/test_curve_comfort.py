@@ -80,7 +80,9 @@ class CurveComfortTests(unittest.TestCase):
       for name in ('more','standard','mild'):
         events=curve_events(samples,comfort=PROFILES[name])
         self.assertEqual(len(events),1)
-        self.assertAlmostEqual(events[0]['target_speed_mps'],math.sqrt(PROFILES[name].map_lateral_accel*radius),places=2)
+        # Independent roots of v^2/100 = the piecewise lateral budget(v).
+        expected = {'more': 12.6519384688, 'standard': 13.4969160446, 'mild': 14.9915098228}
+        self.assertAlmostEqual(events[0]['target_speed_mps'],expected[name],places=2)
         self.assertEqual(events[0]['comfort_profile'],name)
         controls=build_control_curves(events)
         state=dict(version=3,enabled=True,valid=True,control_valid=True,status='ok',mono_time=100.,expires_mono=102.,
