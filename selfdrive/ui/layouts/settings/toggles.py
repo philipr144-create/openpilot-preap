@@ -8,6 +8,7 @@ from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.lib.multilang import tr, tr_noop
 from openpilot.system.ui.widgets import DialogResult
 from openpilot.selfdrive.ui.ui_state import ui_state
+from openpilot.selfdrive.nap.grade_toggle_ui import read_grade_enabled, write_grade_enabled
 
 PERSONALITY_TO_INT = log.LongitudinalPersonality.schema.enumerants
 
@@ -111,6 +112,15 @@ class TogglesLayout(Widget):
       selected_index=self._read_pitch_assist_mode(),
       icon="speed_limit.png"
     )
+    # NAP_V9E_PREDICTIVE_GRADE_UI_V1: same file-backed state as the V9e controller/CLI.
+    self._predictive_grade_setting = toggle_item(
+      lambda: tr("Predictive Hill Assist (V9e)"),
+      tr("Small uphill anticipation below 55 mph (maximum +0.08 m/s²). "
+         "No extra braking. Enable while parked; disable at any time."),
+      read_grade_enabled(),
+      callback=self._set_predictive_grade_assist,
+      icon="speed_limit.png",
+    )
 
     self._toggles = {}
     self._locked_toggles = set()
@@ -145,6 +155,7 @@ class TogglesLayout(Widget):
       if param == "DisengageOnAccelerator":
         self._toggles["LongitudinalPersonality"] = self._long_personality_setting
         self._toggles["NAPPitchAssistMode"] = self._pitch_assist_setting
+        self._toggles["NAPPredictiveGradeAssist"] = self._predictive_grade_setting
 
     self._update_experimental_mode_icon()
     self._scroller = Scroller(list(self._toggles.values()), line_separator=True, spacing=0)
@@ -209,6 +220,10 @@ class TogglesLayout(Widget):
     # Mirror changes made from the MCU2 web UI, including while this page is open.
     pitch_mode = self._read_pitch_assist_mode()
     self._pitch_assist_setting.action_item.set_selected_button(pitch_mode)
+    # Refresh UI from the same V9e JSON file the planner polls.
+    v9e_on = read_grade_enabled()
+    self._predictive_grade_setting.action_item.set_state(v9e_on)
+    self._predictive_grade_setting.action_item.set_enabled(not ui_state.started or v9e_on)
 
     # TODO: make a param control list item so we don't need to manage internal state as much here
     # refresh toggles from params to mirror external changes
@@ -269,3 +284,10 @@ class TogglesLayout(Widget):
   def _set_pitch_assist_mode(self, button_index: int):
     if button_index in (0, 1, 2):
       self._params.put("NAPPitchAssistMode", button_index)
+
+  def _set_predictive_grade_assist(self, enabled: bool):
+    # Enable only offroad; onroad disabling is always permitted.
+    write_grade_enabled(enabled, offroad=not ui_state.started)
+    actual = read_grade_enabled()
+    self._predictive_grade_setting.action_item.set_state(actual)
+    self._predictive_grade_setting.action_item.set_enabled(not ui_state.started or actual)
