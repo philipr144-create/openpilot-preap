@@ -21,9 +21,12 @@ def sentry_camera(started: bool, params: Params, CP: car.CarParams) -> bool:
   return driverview(started, params, CP) or sentry_enabled(started)
 
 def sentry_stream(started: bool, params: Params, CP: car.CarParams) -> bool:
-  return notcar(started, params, CP) or sentry_enabled(started)
+  return sentry_enabled(started, 'encoder')
 
 def sentry_only(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return sentry_enabled(started, 'live')
+
+def sentry_monitor(started: bool, params: Params, CP: car.CarParams) -> bool:
   return sentry_enabled(started)
 
 
@@ -78,7 +81,7 @@ procs = [
 
   NativeProcess("loggerd", "system/loggerd", ["./loggerd"], logging),
   NativeProcess("encoderd", "system/loggerd", ["./encoderd"], only_onroad),
-  NativeProcess("stream_encoderd", "system/loggerd", ["./encoderd", "--stream"], sentry_stream),
+  NativeProcess("stream_encoderd", "system/loggerd", ["./encoderd", "--stream"], notcar),
   PythonProcess("logmessaged", "system.logmessaged", always_run),
 
   NativeProcess("camerad", "system/camerad", ["./camerad"], sentry_camera, enabled=not WEBCAM),
@@ -122,6 +125,8 @@ procs = [
   PythonProcess("feedbackd", "selfdrive.ui.feedback.feedbackd", only_onroad),
   PythonProcess("server_v21", "server.server_v21", always_run, restart_if_crash=True),
   PythonProcess("nap_tailscaled", "server.tailscaled_daemon", always_run),
+  PythonProcess("nap_sentry_monitor", "server.sentry_worker", sentry_monitor),
+  PythonProcess("nap_sentry_encoder", "server.sentry_encoder", sentry_stream),
   PythonProcess("nap_sentry_webrtc", "server.nap_sentry", sentry_only),
   # debug procs
   NativeProcess("bridge", "cereal/messaging", ["./bridge"], notcar),
