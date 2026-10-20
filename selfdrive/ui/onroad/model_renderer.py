@@ -1,4 +1,6 @@
 import colorsys
+import time
+from openpilot.selfdrive.ui.onroad.visual_theme import read_settings, theme_colors, acceleration_color
 import numpy as np
 import pyray as rl
 from cereal import messaging, car
@@ -44,6 +46,8 @@ class LeadVehicle:
 class ModelRenderer(Widget):
   def __init__(self):
     super().__init__()
+    self._visuals = read_settings()
+    self._visual_check = 0.0
     self._longitudinal_control = False
     self._experimental_mode = False
     self._blend_filter = FirstOrderFilter(1.0, 0.25, 1 / gui_app.target_fps)
@@ -82,6 +86,17 @@ class ModelRenderer(Widget):
 
   def _render(self, rect: rl.Rectangle):
     sm = ui_state.sm
+    now = time.monotonic()
+    if now - self._visual_check > 1.0:
+      visuals = read_settings()
+      self._transform_dirty |= visuals != self._visuals
+      self._visuals = visuals
+      self._visual_check = now
+
+    # Hide stale geometry instead of keeping a convincing old path/lead image.
+    if not (sm.valid['modelV2'] and sm.alive['modelV2'] and
+            sm.valid['liveCalibration'] and sm.alive['liveCalibration']):
+      return
 
     # Check if data is up-to-date
     if (sm.recv_frame["liveCalibration"] < ui_state.started_frame or
@@ -103,9 +118,11 @@ class ModelRenderer(Widget):
       self._longitudinal_control = sm['carParams'].openpilotLongitudinalControl
 
     model = sm['modelV2']
-    radar_state = sm['radarState'] if sm.valid['radarState'] else None
+    radar_fresh = (sm.valid['radarState'] and sm.alive['radarState'] and
+                   sm.recv_frame['radarState'] >= ui_state.started_frame)
+    radar_state = sm['radarState'] if radar_fresh else None
     lead_one = radar_state.leadOne if radar_state else None
-    render_lead_indicator = self._longitudinal_control and radar_state is not None
+    render_lead_indicator = self._visuals["leads"] and self._longitudinal_control and radar_state is not None
 
     # Update model data when needed
     model_updated = sm.updated['modelV2']
@@ -181,7 +198,7 @@ class ModelRenderer(Widget):
 
     max_idx = self._get_path_length_idx(path_x_array, max_distance)
     self._path.projected_points = self._map_line_to_polygon(
-      self._path.raw_points, 0.9, self._path_offset_z, max_idx, max_distance, allow_invert=False
+      self._path.raw_points, (1.0 if self._visuals["wider"] else 0.9), self._path_offset_z, max_idx, max_distance, allow_invert=False
     )
 
     self._update_experimental_gradient()
@@ -276,6 +293,31 @@ class ModelRenderer(Widget):
   def _draw_path(self, sm):
     """Draw path with dynamic coloring based on mode and throttle state."""
     if not self._path.projected_points.size:
+      return
+
+    theme = self._visuals['theme']
+    if theme:
+      fresh = (sm.valid['modelV2'] and sm.alive['modelV2'] and
+               sm.recv_frame['modelV2'] >= ui_state.started_frame)
+      accel = float(self._acceleration_x[0]) if fresh and len(self._acceleration_x) else float('nan')
+      colors = [rl.Color(*c) for c in theme_colors(theme, accel, time.monotonic())]
+      draw_polygon(self._rect, self._path.projected_points,
+                   gradient=Gradient(start=(0., 1.), end=(0., 0.), colors=colors,
+                                     stops=[i / 8 for i in range(9)]))
+      # Rainbow stays decorative; a separate center ribbon retains an unambiguous
+      # acceleration cue: green accelerate, red slow, white coast/unavailable.
+      if theme == 2:
+        points = self._path.projected_points.copy()
+        n = len(points) // 2
+        left, right = points[:n].copy(), points[n:][::-1].copy()
+        middle = (left + right) / 2
+        points[:n] = middle + (left - middle) * .18
+        points[n:] = (middle + (right - middle) * .18)[::-1]
+        cue = acceleration_color(accel)
+        draw_polygon(self._rect, points, gradient=Gradient(
+          start=(0., 1.), end=(0., 0.),
+          colors=[rl.Color(*cue, 190), rl.Color(*cue, 130), rl.Color(*cue, 0)],
+          stops=[0., .4, .85]))
       return
 
     allow_throttle = sm['longitudinalPlan'].allowThrottle or not self._longitudinal_control

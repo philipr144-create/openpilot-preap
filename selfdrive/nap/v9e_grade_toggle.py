@@ -45,7 +45,7 @@ def main():
     enabled=isinstance(cfg,dict) and cfg.get('enabled') is True
     print('Predictive grade assistance:', 'ON' if enabled else 'OFF')
     print('Config:', PATH)
-    print('Max +0.08 m/s², sub-55 mph, 50–55 mph fade, lead-MPC bounded.')
+    print('Hill preview/load tracking: 20–80 mph; max +0.35 m/s², tapering to +0.20 at 80; lead-MPC bounded.')
   except (FileNotFoundError,ValueError,OSError):
     print('Predictive grade assistance: OFF (not installed or malformed)')
 

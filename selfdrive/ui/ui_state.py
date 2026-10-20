@@ -9,6 +9,7 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.ui.lib.prime_state import PrimeState
+from openpilot.selfdrive.ui.engagement_stats import EngagementStats
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.hardware import HARDWARE, PC
 
@@ -59,6 +60,8 @@ class UIState:
     )
 
     self.prime_state = PrimeState()
+    self.engagement_stats = EngagementStats()
+    self._stats_trip_id = None
 
     # UI Status tracking
     self.status: UIStatus = UIStatus.DISENGAGED
@@ -108,9 +111,36 @@ class UIState:
     self.sm.update(0)
     self._update_state()
     self._update_status()
+    self._update_engagement_stats()
     if time.monotonic() - self._param_update_time > 5.0:
       self.update_params()
     device.update()
+
+  def _update_engagement_stats(self) -> None:
+    now = time.monotonic()
+    stats = self.engagement_stats
+    try:
+      stats.start()  # after manager fork; no disk writes on the UI sampling path
+      sm = self.sm
+      if not (sm.alive['deviceState'] and sm.valid['deviceState']):
+        stats.pause(now)
+        return
+      # UI sampling is slower than the 100 Hz publishers; use message validity
+      # and bounded age rather than their publisher-frequency checks.
+      fresh = all(sm.alive[name] and sm.valid[name] and 0. <= now-sm.recv_time[name] <= .5
+                  for name in ('carState', 'carControl'))
+      if not self.started:
+        self._stats_trip_id = None
+      elif fresh and not self._stats_trip_id:
+        route = self.params.get('CurrentRoute')
+        self._stats_trip_id = route.decode() if isinstance(route, bytes) else route
+      cs, cc = sm['carState'], sm['carControl']
+      stats.sample(now=now, started=self.started, fresh=fresh,
+                   in_drive=str(cs.gearShifter) == 'drive',
+                   lat_active=bool(cc.latActive), long_active=bool(cc.longActive),
+                   trip_id=self._stats_trip_id or '')
+    except (OSError, AttributeError, KeyError, TypeError, ValueError, RuntimeError):
+      stats.pause(now)
 
   def _update_state(self) -> None:
     # Handle panda states updates

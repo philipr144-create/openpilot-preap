@@ -4,6 +4,7 @@ import math
 import time
 import numpy as np
 from openpilot.selfdrive.controls.lib.predictive_grade_assist import PredictiveGradeAssist, FileGradeToggle
+from openpilot.selfdrive.controls.lib.grade_diagnostics import GradeDiagnostics
 
 import cereal.messaging as messaging
 from opendbc.car.interfaces import ACCEL_MIN, ACCEL_MAX
@@ -63,6 +64,9 @@ PREAP_EXP_COAST_ENTRY_RATE = 0.40         # m/s^3, gentle neutral -> coast entry
 PREAP_EXP_NEUTRAL_TARGET = 0.05            # suppress tiny +/- accel chatter
 PREAP_EXP_NEUTRAL_PREVIOUS = 0.12
 MAPPED_STOP_APPROACH_SPEED = 5.0 * CV.MPH_TO_MS
+# Optional map preparation reaches crawl speed near the sign; full-stop
+# authority remains with the existing model/MPC and route-stop state machine.
+MAPPED_STOP_APPROACH_BUFFER_M = 5.0
 NAV_SNAPSHOT = '/dev/shm/nap_navigation_desire.json'
 STOP_SETTINGS = '/data/nap_turn_settings.json'
 ROAD_STOP_SNAPSHOT = '/dev/shm/nap_road_stop.json'
@@ -119,7 +123,7 @@ def road_stop_speed_cap(path=ROAD_STOP_SNAPSHOT, settings=STOP_SETTINGS, now=Non
         or not -8 <= distance <= 200 or type(v_ego) not in (int, float)
         or not math.isfinite(v_ego) or not 0 <= v_ego <= 25):
       return None
-    return math.sqrt(MAPPED_STOP_APPROACH_SPEED**2 + 2*.8*max(0.0, distance-15))
+    return math.sqrt(MAPPED_STOP_APPROACH_SPEED**2 + 2*.8*max(0.0, distance-MAPPED_STOP_APPROACH_BUFFER_M))
   except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
     return None
 
@@ -368,7 +372,7 @@ def map_curve_speed_cap(path=MAP_CONTEXT_SNAPSHOT, now=None, v_ego=None, consume
             * 0.8
             * max(
               0.0,
-              distance - 15.0,
+              distance - MAPPED_STOP_APPROACH_BUFFER_M,
             )
           )
 
@@ -433,7 +437,7 @@ def navigation_speed_cap(path=NAV_SNAPSHOT, now=None, v_ego=None, consumed_stops
           type(v_ego) in (int, float) and math.isfinite(v_ego) and 0 <= v_ego <= 25):
         # Advance hint only: roll toward the mapped point, never command a
         # stop or set shouldStop from map data alone.
-        caps.append(math.sqrt(MAPPED_STOP_APPROACH_SPEED**2 + 2 * .8 * max(0.0, stop_distance-15)))
+        caps.append(math.sqrt(MAPPED_STOP_APPROACH_SPEED**2 + 2 * .8 * max(0.0, stop_distance-MAPPED_STOP_APPROACH_BUFFER_M)))
     maneuver = state['maneuver']
     kind, distance = maneuver['type'], maneuver['distance_m']
     if type(distance) not in (int, float) or not math.isfinite(distance) or distance < -8 or distance > 300:
@@ -518,6 +522,8 @@ class LongitudinalPlanner:
     # NAP_PREDICTIVE_GRADE_V9E: disabled by default.
     self.nap_v9e_grade = PredictiveGradeAssist(dt=self.dt)
     self.nap_v9e_toggle = FileGradeToggle(dt=self.dt)
+    self.nap_grade_applied_last = 0.0
+    self.nap_grade_diagnostics = GradeDiagnostics()
     self.phantom_brake_counter = 0
     self.output_should_stop = False
 
@@ -1131,17 +1137,21 @@ class LongitudinalPlanner:
     # behavior. Do not apply the old blinker-only -2.5 m/s^2 override: it
     # ignored path geometry and remained active when Corner Assist was off.
     corner_braking = False
+    corner_accel_limit = None
     if self._is_preap:
       before_corner = output_a_target
       output_a_target = self.corner_assist.apply(output_a_target, sm, self.CP, reset_state, accel_coast, driver_cruise_speed,
                                                        turn_decision, True)
 
       corner_braking = output_a_target < min(0., before_corner)
+      if output_a_target < before_corner:
+        corner_accel_limit = float(output_a_target)
 
     for idx in range(2):
       accel_clip[idx] = np.clip(accel_clip[idx], self.prev_accel_clip[idx] - 0.05, self.prev_accel_clip[idx] + 0.05)
     if self._is_preap:
-      previous = 0.0 if reset_state or sm["carState"].gasPressed else self.output_a_target
+      previous = (0.0 if reset_state or sm["carState"].gasPressed else
+                  self.output_a_target - self.nap_grade_applied_last)
       # Physical/profile envelopes remain hard bounds. Request selection and
       # CornerAssist are complete before this single source-independent handoff.
       accel_clip[1] = min(accel_clip[1], accel_max)
@@ -1193,19 +1203,23 @@ class LongitudinalPlanner:
         output_a_target = limit_positive_accel(output_a_target, previous, v_ego, personality, self.dt)
       if experimental_preap and self.handoff_request < output_a_target_mpc - .01:
         self.mpc.source = LongitudinalPlanSource.e2e
-    # NAP_PREDICTIVE_GRADE_V9E: optional, tiny uphill-only feedforward.
+    # Optional hill preview/load tracking; retain every prior acceleration ceiling.
     # Runs after existing planner smoothing and corner arbitration, BEFORE
     # the original final accel_clip. Never moves a limit or speed target.
     # The code below is inert when toggle is OFF (default).
-    if self.nap_v9e_toggle.read():
+    grade_base_accel = float(output_a_target)
+    grade_enabled = self._is_preap and self.nap_v9e_toggle.read()
+    if grade_enabled:
       radar = sm['radarState']
-      grade_lead = next((candidate for candidate in
-                         (radar.leadOne, radar.leadTwo)
-                         if bool(getattr(candidate, 'status', False))), None)
+      grade_upper_accel = float(accel_clip[1])
+      for limit in (curve_recovery_limit, corner_accel_limit):
+        if limit is not None:
+          grade_upper_accel = min(grade_upper_accel, float(limit))
       output_a_target += self.nap_v9e_grade.update(
         model=sm['modelV2'],
         enabled=True,
-        engaged=bool(getattr(sm['selfdriveState'], 'enabled', False)) and not reset_state,
+        engaged=(bool(getattr(sm['selfdriveState'], 'enabled', False)) and not reset_state
+                 and bool(getattr(sm['carControl'], 'longActive', False))),
         v_ego=v_ego,
         a_ego=sm['carState'].aEgo,
         effective_speed=v_cruise,
@@ -1214,17 +1228,32 @@ class LongitudinalPlanner:
         mpc_accel=output_a_target_mpc,
         model_accel=output_a_target_e2e,
         brake_reason=getattr(self, 'handoff_reason', 'OFF'),
-        model_stop=bool(sm['modelV2'].action.shouldStop),
+        model_stop=bool(self.output_should_stop or forecast.planned_stop),
         mpc_stop=bool(output_should_stop_mpc),
         corner_braking=bool(corner_braking),
         force_decel=bool(sm['controlsState'].forceDecel),
         gas_pressed=bool(sm['carState'].gasPressed),
         brake_pressed=bool(sm['carState'].brakePressed),
-        lead=grade_lead,
+        leads=(radar.leadOne, radar.leadTwo),
+        inputs_valid=sm.all_checks(service_list=['carState', 'modelV2', 'radarState']),
+        forecast_valid=forecast.valid,
+        model_braking_required=model_intent.braking_required,
+        max_accel=grade_upper_accel,
       )
     else:
       self.nap_v9e_grade.reset()
     self.output_a_target = np.clip(output_a_target, accel_clip[0], accel_clip[1])
+    # Keep feedforward out of the base handoff history: it is added once,
+    # not incorporated into the next base request and added a second time.
+    self.nap_grade_applied_last = self.output_a_target - float(np.clip(grade_base_accel, accel_clip[0], accel_clip[1]))
+    if self.nap_grade_applied_last > 0.:
+      self.propulsion_allowed = True
+    self.nap_grade_diagnostics.publish(
+      self.nap_v9e_grade, assist_enabled=grade_enabled, base=grade_base_accel,
+      added=self.nap_grade_applied_last,
+      final=self.output_a_target, speed=v_ego, target=v_cruise, mpc=output_a_target_mpc,
+      model=output_a_target_e2e, throttle=throttle_prob, propulsion=self.propulsion_allowed,
+      recovery_reason=self.normal_propulsion.reason, handoff=self.handoff_reason, personality=personality)
     self.prev_accel_clip = accel_clip
     if self._is_preap and not reset_state and self._frame % 20 == 0:
       cloudlog.info('NAP long speed=%.2f driver=%.2f effective=%.2f map=%s curve=%.2f model=%.3f mpc=%.3f support=%.3f output=%.3f source=%s state=%s frames=%d throttle=%.3f raw_allow=%d prop=%d cap=%.3f turncap=%.3f model_stop=%d mpc_stop=%d final_stop=%d long_off=%d corner=%s request=%.3f handoff=%s long_active=%d gas=%d brake=%d signal=%d steer=%.2f corner_target=%s weight=%.2f aego=%.3f experimental=%d personality=%d forecast_stop=%d preview=%s recovery=%d recovery_reason=%s map_reason=%s map_status=%s map_source=%s turn_phase=%s turn_owner=%s turn_ceiling=%s model_intent=%s unified=9',

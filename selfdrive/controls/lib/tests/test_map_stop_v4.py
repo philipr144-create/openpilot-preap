@@ -213,9 +213,9 @@ class PlannerIntegration(unittest.TestCase):
           pcmCruise=False, steerRatio=15.,wheelbase=2.96,longitudinalActuatorDelay=.4,vEgoStopping=.1)
     class SM(dict):
       def all_checks(self,service_list=None): return True
-    sm=SM(carState=NS(vEgo=speed,vCruise=cruise,standstill=speed==0.,aEgo=0.,steeringAngleDeg=0.,gasPressed=False),
-          carControl=NS(orientationNED=[]),controlsState=NS(longControlState=lp.LongCtrlState.pid,forceDecel=False),
-          liveParameters=NS(angleOffsetDeg=0.),radarState=NS(leadOne=NS(status=False)),
+    sm=SM(carState=NS(vEgo=speed,vCruise=cruise,standstill=speed==0.,aEgo=0.,steeringAngleDeg=0.,gasPressed=False,brakePressed=False),
+          carControl=NS(orientationNED=[],longActive=False),controlsState=NS(longControlState=lp.LongCtrlState.pid,forceDecel=False),
+          liveParameters=NS(angleOffsetDeg=0.),radarState=NS(leadOne=NS(status=False),leadTwo=NS(status=False)),
           selfdriveState=NS(enabled=True,personality=2,experimentalMode=experimental),
           modelV2=NS(position=NS(x=[]),meta=NS(disengagePredictions=NS(gasPressProbs=[])),
                      action=NS(desiredAcceleration=-1.5,shouldStop=model_stop)))
@@ -252,7 +252,7 @@ class PlannerIntegration(unittest.TestCase):
     from openpilot.selfdrive.controls.lib import longitudinal_planner as lp
     with tempfile.TemporaryDirectory() as directory:
       path = Path(directory) / 'nav'
-      path.write_text(json.dumps(nav(10., 15.)))
+      path.write_text(json.dumps(nav(10., 5.)))
       with patch.object(lp, 'mapped_stop_setting_enabled', return_value=True):
         cap = lp.navigation_speed_cap(path, now=10.1, v_ego=10.)
     self.assertAlmostEqual(cap, 5.0 * 0.44704)

@@ -46,6 +46,7 @@ class Direction(unittest.TestCase):
   tick=gates.CityTurnGates.tick
   def test_left_signal_never_selects_right_when_model_predicts_right(self):
     self.prepare()
+    self.cs.vEgo=1.  # Unsupported-path requests may initiate only below 5 mph.
     self.model.position.y=[-v for v in self.model.position.y]
     self.model.orientation.z=[-v for v in self.model.orientation.z]
     self.model.action.desiredCurvature=.03

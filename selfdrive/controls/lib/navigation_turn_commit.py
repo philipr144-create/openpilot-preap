@@ -167,16 +167,17 @@ class NavigationTurnCommit:
       direction = d.get("manual_turn_direction")
       one_blinker = bool(CS.leftBlinker) != bool(CS.rightBlinker)
 
-      paired_intent = manual_turn_intent(CS, d, model, now)
-      if paired_intent:
-        self.manual_veto_direction = direction
-        self.manual_veto_until = now + .15
-      # Retain only a previously frame-validated directional veto across
-      # brief asynchronous publication gaps. This cannot authorize a turn floor.
-      carried_veto = (direction == self.manual_veto_direction and now <= self.manual_veto_until
-                      and manual_turn_intent(CS, d, model, now, require_pair=False))
+      # Direction veto adds no turn curvature. Accept a bounded publication
+      # skew for fresh, classified driver intent; positive turn seeding above
+      # still requires its original <=2-frame pairing and geometry checks.
+      decision_frame = d.get('frame_id')
+      model_frame = getattr(model, 'frameId', None)
+      bounded_skew = (type(decision_frame) is int and type(model_frame) is int
+                      and abs(decision_frame - model_frame) <= 6)
+      fresh_direction = (bounded_skew
+                         and manual_turn_intent(CS, d, model, now, require_pair=False))
       manual_valid = (
-        (paired_intent or carried_veto)
+        fresh_direction
         and
         one_blinker
         and healthy
@@ -1021,12 +1022,15 @@ class ManualTurnCommit:
 
 
 class ManualTurnEntry:
-  """Pre-inference authorization; signaling alone never creates a desire.
+  """Bounded model conditioning from qualified physical driver intent.
 
-  Fresh consecutive model frames must show either near turn entry or an
-  unmistakable future intersection corner before a physical blinker can
-  condition the model. Steering authority keeps its stricter near-path gate.
+  Below 5 mph, a sustained classified hold may request a direction before
+  matching geometry exists. This conditions the model only. Positive added
+  steering retains ManualTurnCommit's independent near-path checks.
   """
+
+  LOW_INTENT_START_SPEED = 5.0 * CV.MPH_TO_MS
+  LOW_INTENT_MAX_DISTANCE = 25.0
 
   def __init__(self):
     self.reset()
@@ -1051,6 +1055,8 @@ class ManualTurnEntry:
     self.stop_intent_since = None
     self.stop_intent_frames = 0
     self.started_from_stop = False
+    self.intent_distance = 0.0
+    self.intent_path_acquired = False
 
   def suspend(self):
     """Yield all added authority; require fresh evidence without a signal reset."""
@@ -1122,9 +1128,10 @@ class ManualTurnEntry:
       return False
     self.direction = direction
     sign = -1 if direction == 1 else 1
-    evidence = ManualTurnCommit.turn_shape_evidence(
+    evidence = ManualTurnCommit.path_evidence(
       model,
       sign,
+      require_raw_direction=False,
       continuing=self.started is not None,
     )
     if evidence is None:
@@ -1143,9 +1150,15 @@ class ManualTurnEntry:
         return False
       dt = 0.0 if self.motion_time is None else now - self.motion_time
       self.motion_time = now
-      if (self.started is not None and actual_curvature is not None
-          and math.isfinite(actual_curvature) and 0 <= dt <= .15):
-        self.heading += sign * actual_curvature * max(0.0, speed) * dt
+      if self.started is not None and 0 <= dt <= .15:
+        self.intent_distance += max(0.0, speed) * dt
+        if actual_curvature is not None and math.isfinite(actual_curvature):
+          self.heading += sign * actual_curvature * max(0.0, speed) * dt
+      if (self.started_from_stop and
+          (self.heading < -math.radians(5) or
+           not self.intent_path_acquired and self.intent_distance > self.LOW_INTENT_MAX_DISTANCE)):
+        self.cancel()
+        return False
       # Clear model conditioning as well as added steering when the near path
       # straightens after observed turning. A distant next bend must not retain
       # the completed city-turn desire while the stalk remains held.
@@ -1166,10 +1179,9 @@ class ManualTurnEntry:
       self.frame, self.last_frame_time = frame, now
       credible, _, raw = evidence
 
-      # A classified full-stalk hold while stopped may establish intent
-      # before the model has drawn the corner. This authorizes model
-      # conditioning only; actuator steering still remains zero at standstill.
-      if speed <= 0.3 and self.started is None:
+      # Intent can begin while stopped/creeping, after six fresh frames.
+      # Requesting a model direction never arms a blind actuator turn floor.
+      if speed <= self.LOW_INTENT_START_SPEED and self.started is None:
         if self.stop_intent_since is None:
           self.stop_intent_since = now
         self.stop_intent_frames += 1
@@ -1184,19 +1196,24 @@ class ManualTurnEntry:
         self.stop_intent_since = None
         self.stop_intent_frames = 0
 
-      # Normally loss of turn shape revokes City Turns immediately. A turn
-      # started from a complete stop receives a short acquisition grace period
-      # so modeld can react to the newly supplied turn desire.
+      # Low-speed model intent may search within its time/distance budget.
+      # An acquired turn retains input briefly across an opposite prediction,
+      # but positive steering still requires its independent matching path.
       if self.started is not None and not credible and self.exit_since is None:
         stop_grace = (
-          self.started_from_stop
-          and now - self.started <= ManualTurnCommit.STOP_INTENT_GRACE_SECONDS
+          self.started_from_stop and not self.intent_path_acquired
+          and now - self.started < ManualTurnCommit.MAX_SECONDS
+          and self.intent_distance <= self.LOW_INTENT_MAX_DISTANCE
         )
-        if not stop_grace:
+        scene_evidence = ManualTurnCommit.turn_shape_evidence(model, sign, continuing=True)
+        brief_geometry_gap = (scene_evidence is not None and scene_evidence[0]
+                              and self.last_evidence is not None
+                              and now - self.last_evidence <= ManualTurnCommit.HOLD_SECONDS)
+        if not (stop_grace or brief_geometry_gap):
           self.cancel()
           return False
-
-        self.last_evidence = now
+        if stop_grace:
+          self.last_evidence = now
 
       entry_ok = (
         self.started is not None
@@ -1209,14 +1226,16 @@ class ManualTurnEntry:
           self.evidence_since = now
         self.frames += 1
         if self.frames >= 5 and now - self.evidence_since >= ManualTurnCommit.EVIDENCE_SECONDS:
+          if self.started is not None:
+            self.intent_path_acquired = True
           if speed <= 0.3:
             self.stop_armed = True
           elif self.started is None:
             self.started = now
-      elif self.started is None:
+      else:
         self.evidence_since = None
         self.frames = 0
-    if self.stop_armed and speed > 0.3:
+    if self.stop_armed and speed > 0.3 and self.started is None:
       self.started = now
       self.started_from_stop = True
       self.last_evidence = now

@@ -53,7 +53,7 @@ class CornerReference(unittest.TestCase):
     self.tick(8., cruise=5.)
     self.assertEqual(self.corner.target_speed, 5.)
     self.tick(8., cruise=30.)
-    self.assertAlmostEqual(self.corner.target_speed, math.sqrt(1.2/.02))
+    self.assertAlmostEqual(self.corner.target_speed, min(math.sqrt(LAT_ACCEL_TARGET/.02), 8.03))
 
   def test_tighter_bend_has_lower_absolute_target(self):
     for _ in range(60): self.tick(8., curvature=.01)
@@ -83,9 +83,9 @@ class PlannerReference(unittest.TestCase):
          pcmCruise=False,steerRatio=15.,wheelbase=2.96,longitudinalActuatorDelay=.4,vEgoStopping=.1)
     class SM(dict):
       def all_checks(self, service_list=None): return True
-    sm=SM(carState=N(vEgo=55*MPH,vCruise=55*MPH*3.6,standstill=False,aEgo=0.,steeringAngleDeg=0.,gasPressed=False),
-          carControl=N(orientationNED=[]),controlsState=N(longControlState=lp.LongCtrlState.pid,forceDecel=False),
-          liveParameters=N(angleOffsetDeg=0.),radarState=N(leadOne=N(status=False)),
+    sm=SM(carState=N(vEgo=55*MPH,vCruise=55*MPH*3.6,standstill=False,aEgo=0.,steeringAngleDeg=0.,gasPressed=False,brakePressed=False),
+          carControl=N(orientationNED=[],longActive=False),controlsState=N(longControlState=lp.LongCtrlState.pid,forceDecel=False),
+          liveParameters=N(angleOffsetDeg=0.),radarState=N(leadOne=N(status=False),leadTwo=N(status=False)),
           selfdriveState=N(enabled=True,personality=2,experimentalMode=False),
           modelV2=N(position=N(x=[]),meta=N(disengagePredictions=N(gasPressProbs=[])),
                     action=N(desiredAcceleration=0.,shouldStop=False)))

@@ -27,9 +27,9 @@ class CurveComfortTests(unittest.TestCase):
       with self.assertRaises(ValueError):write_curve_comfort('fast',path)
       self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()),['comfort'])
 
-  def test_map_range_starts_at_former_mild_and_city_tuning_is_preserved(self):
-    self.assertEqual(PROFILES['more'].map_lateral_accel,3.4)
-    for name,corner,decel in [('more',1.0,.8),('standard',1.2,.8),('mild',1.6,.6)]:
+  def test_range_starts_at_previous_mild_and_gets_gentler(self):
+    self.assertEqual(PROFILES['more'].map_lateral_accel,4.2)
+    for name,corner,decel in [('more',1.6,.6),('standard',1.76,.45),('mild',1.92,.3)]:
       self.assertEqual(PROFILES[name].corner_lateral_accel,corner)
       self.assertEqual(PROFILES[name].corner_max_decel,decel)
     self.assertLess(PROFILES['more'].map_lateral_accel,PROFILES['standard'].map_lateral_accel)
@@ -43,10 +43,10 @@ class CurveComfortTests(unittest.TestCase):
   def test_mild_has_higher_absolute_target_and_less_extra_deceleration(self):
     standard,a_standard=self.run_corner('standard')
     mild,a_mild=self.run_corner('mild')
-    self.assertAlmostEqual(mild.target_speed/standard.target_speed,math.sqrt(1.6/1.2))
+    self.assertAlmostEqual(mild.target_speed/standard.target_speed,math.sqrt(1.92/1.76))
     self.assertGreater(a_mild,a_standard)
     self.assertGreaterEqual(a_mild,-.6)
-    self.assertAlmostEqual(a_standard,-.8)
+    self.assertAlmostEqual(a_standard,-.45)
 
   def test_all_profiles_release_at_target_and_preserve_stronger_braking(self):
     for name,p in PROFILES.items():
@@ -81,7 +81,7 @@ class CurveComfortTests(unittest.TestCase):
         events=curve_events(samples,comfort=PROFILES[name])
         self.assertEqual(len(events),1)
         # Independent roots of v^2/100 = the piecewise lateral budget(v).
-        expected = {'more': 12.6519384688, 'standard': 13.4969160446, 'mild': 14.9915098228}
+        expected = {'more': 14.9915098228, 'standard': 16.5601648536, 'mild': 18.1283170298}
         self.assertAlmostEqual(events[0]['target_speed_mps'],expected[name],places=2)
         self.assertEqual(events[0]['comfort_profile'],name)
         controls=build_control_curves(events)

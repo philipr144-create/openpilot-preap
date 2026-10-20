@@ -2,6 +2,7 @@ import os
 import subprocess
 import pyray as rl
 from openpilot.common.params import Params
+from openpilot.selfdrive.ui.engagement_stats import duration, summary_text, summarize
 from openpilot.selfdrive.controls.lib.curve_comfort import (
   PROFILE_NAMES, DEFAULT_PROFILE, read_curve_comfort, write_curve_comfort,
 )
@@ -152,8 +153,8 @@ class NAPLayout(Widget):
     self._curve_comfort_buttons = multiple_button_item(
       "Curve Slowdown",
       "Adjust optional Corner Assist and mapped-curve slowing when those features are enabled. "
-      "For mapped curves, More uses the former Mild level; Standard and Mild slow progressively less. "
-      "City-turn Corner Assist keeps its existing range. Cruise speed, leads and stops still take priority. "
+      "More matches the previous Mild setting; Standard and Mild slow progressively less. "
+      "Applies to mapped curves and Corner Assist. Cruise speed, leads and stops still take priority. "
       "Change while parked.",
       buttons=["More", "Standard", "Mild"], button_width=180,
       selected_index=PROFILE_NAMES.index(read_curve_comfort().name),
@@ -161,6 +162,30 @@ class NAPLayout(Widget):
     )
     self._curve_comfort_buttons.action_item.set_enabled(ui_state.is_offroad)
     self._all_items.append(self._curve_comfort_buttons)
+
+    self._all_items.append(section_header_item("Engagement Statistics"))
+    stats = ui_state.engagement_stats
+    self._stats_strip_toggle = toggle_item(
+      "Show Engagement Stats On Road",
+      "Compact trip and tracked-total percentages with engaged hours. Display only; does not affect driving.",
+      stats.show_onroad, callback=stats.set_show_onroad,
+    )
+    self._all_items.append(self._stats_strip_toggle)
+    for key, title in (("trip", "This Drive"), ("total", "Tracked Total")):
+      self._all_items.append(text_item(
+        title, lambda key=key: summary_text(stats.snapshot()[key]),
+        description=lambda key=key: self._engagement_description(key),
+      ))
+    for mode, title in (("both", "Steering + Speed"), ("steering", "Steering Only"),
+                        ("speed", "Speed Only"), ("manual", "Manual Driving")):
+      self._all_items.append(text_item(
+        title, lambda mode=mode: duration(stats.snapshot()['total'][mode]),
+        description="Total time since this tracker was enabled.",
+      ))
+    self._all_items.append(text_item(
+      "Existing Mileage History", self._engagement_mileage,
+      description="Distance-based percentage and engaged miles; separate from time totals.",
+    ))
 
     # ── Section 2: Longitudinal Control ──
     self._all_items.append(section_header_item("Longitudinal Control"))
@@ -572,8 +597,26 @@ class NAPLayout(Widget):
     self._scroller.show_event()
     self._refresh_toggles()
 
+  def _engagement_description(self, key):
+    snap = ui_state.engagement_stats.snapshot()
+    if snap['storage_error']:
+      return snap['storage_error']
+    data = summarize(snap[key])
+    prefix = "This trip" if key == 'trip' else "Since time tracking was enabled"
+    return (f"{prefix}: {duration(data['drive'])} driving. "
+            "Engaged = steering or speed assistance active. Traffic stops in Drive count; parked time does not.")
+
+  def _engagement_mileage(self):
+    value = ui_state.engagement_stats.snapshot()['mileage']
+    if value is None:
+      return 'Unavailable'
+    total = value['manual'] + value['engaged']
+    pct = 100. * value['engaged'] / total if total else 0.
+    return f"{pct:.1f}% · {value['engaged']:,.0f} mi"
+
   def _refresh_toggles(self):
     """Sync all toggle states from params (handles external changes)."""
+    self._stats_strip_toggle.action_item.set_state(ui_state.engagement_stats.show_onroad)
     for key, item in self._toggle_map.items():
       item.action_item.set_state(self._params.get_bool(key))
 

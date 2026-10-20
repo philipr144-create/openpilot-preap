@@ -16,7 +16,7 @@ class RoadGeometry(unittest.TestCase):
       for k,v in zip([.002,.004,.008,.0113,.02,.08],targets):
         self.assertLessEqual(v*v*k,profile.map_lateral_accel+1e-8)
     # The observed bend's model-path radius is illustrative, not ground truth.
-    self.assertTrue(29 < road_curve_speed(.0113,PROFILES['mild'])*2.236936 < 34)
+    self.assertTrue(29 < road_curve_speed(.0113,PROFILES['more'])*2.236936 < 34)
   def test_high_speed_and_profile_order(self):
     for name,p in PROFILES.items():
       self.assertAlmostEqual(road_curve_speed(.002,p),math.sqrt(p.map_lateral_accel/.002),places=7)
@@ -53,13 +53,13 @@ class FollowingRecovery(unittest.TestCase):
 class CityRelease(unittest.TestCase):
   def test_tightening_preserved_recovery_bounded(self):
     c=CornerAssist();c.config['corner_assist']=True;c.comfort=PROFILES['standard']
-    c.update(.5,5.,.06,-.3,True,1.,12.)
-    self.assertAlmostEqual(c.target_speed,math.sqrt(1.2/.06))
-    c.update(.5,5.,.012,-.3,True,1.05,12.)
-    self.assertAlmostEqual(c.target_speed,5.03)
+    c.update(.5,6.,.06,-.3,True,1.,12.)
+    self.assertAlmostEqual(c.target_speed,math.sqrt(1.76/.06))
+    c.update(.5,6.,.012,-.3,True,1.05,12.)
+    self.assertAlmostEqual(c.target_speed,6.03)
     self.assertGreaterEqual(c.cap,0.)
     c.update(-1.5,5.,.10,-.3,True,1.10,12.)
-    self.assertLess(c.target_speed,4.)
+    self.assertLess(c.target_speed,4.3)
     self.assertLessEqual(c.update(-1.5,5.,.10,-.3,True,1.15,12.),-1.5)
     c.update(.5,5.,.01,-.3,False,1.20,12.)
     self.assertIsNone(c.target_speed)

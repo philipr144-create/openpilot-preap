@@ -4,6 +4,7 @@ import os
 import time
 from dataclasses import dataclass
 from openpilot.common.constants import CV
+from openpilot.selfdrive.ui.engagement_stats import hud_text
 from openpilot.selfdrive.ui.onroad.exp_button import ExpButton
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.system.ui.lib.application import gui_app, FontWeight
@@ -247,15 +248,15 @@ class HudRenderer(Widget):
       height,
     )
 
-    rl.draw_rectangle_rounded(box, .12, 8, COLORS.BLACK_TRANSLUCENT)
+    rl.draw_rectangle_rounded(box, .12, 8, rl.Color(0, 0, 0, 220))
     rl.draw_rectangle_rounded_lines_ex(
-      box, .12, 8, 4, COLORS.BORDER_TRANSLUCENT
+      box, .12, 8, 5, COLORS.BTN_ACTIVE
     )
 
     # Large direction and distance are the two glance-readable elements.
     rl.draw_text_ex(
       self._font_bold,
-      direction[:12],
+      ({'LEFT': '<  LEFT', 'RIGHT': 'RIGHT  >'}.get(direction, direction))[:12],
       rl.Vector2(box.x + 24, box.y + 14),
       58, 0, COLORS.WHITE,
     )
@@ -446,15 +447,15 @@ class HudRenderer(Widget):
     # Driving intentions occupy the driver's visible left-hand position.
     box = rl.Rectangle(rect.x + 60, rect.y + 235, width, height)
 
-    rl.draw_rectangle_rounded(box, .10, 10, COLORS.BLACK_TRANSLUCENT)
-    rl.draw_rectangle_rounded_lines_ex(box, .10, 10, 4, COLORS.BORDER_TRANSLUCENT)
+    rl.draw_rectangle_rounded(box, .10, 10, rl.Color(0, 0, 0, 220))
+    rl.draw_rectangle_rounded_lines_ex(box, .10, 10, 5, accent)
     rl.draw_rectangle_rounded(
       rl.Rectangle(box.x + 16, box.y + 18, 10, box.height - 36),
       .8, 8, accent,
     )
 
     rl.draw_text_ex(self._font_bold, self._intent_title[:24],
-                    rl.Vector2(box.x + 48, box.y + 20), 58, 0, COLORS.WHITE)
+                    rl.Vector2(box.x + 48, box.y + 20), 64, 0, accent)
 
     source_text = self._intent_source[:22]
     source_w = measure_text_cached(self._font_semi_bold, source_text, 28).x + 34
@@ -471,8 +472,7 @@ class HudRenderer(Widget):
       unit = 'KM/H' if ui_state.is_metric else 'MPH'
       metrics.append(f'PLAN {round(self._intent_target):.0f} {unit}')
     if self._intent_accel <= -0.05:
-      pct = min(100, round(-self._intent_accel / 2.5 * 100))
-      metrics.append(f'REGEN REQUEST {pct}%')
+      metrics.append(f'DECEL REQUEST {self._intent_accel:.1f} m/s²')
     elif self._intent_accel >= 0.05:
       metrics.append(f'ACCEL {self._intent_accel:.1f} m/s²')
     else:
@@ -481,6 +481,26 @@ class HudRenderer(Widget):
       metrics.append(f'LEAD {self._intent_lead:.0f} FT')
     rl.draw_text_ex(self._font_semi_bold, '   ·   '.join(metrics)[:64],
                     rl.Vector2(box.x + 48, box.y + 199), 27, 0, COLORS.WHITE)
+
+  def _draw_engagement_stats(self, rect: rl.Rectangle) -> None:
+    stats = ui_state.engagement_stats
+    if not stats.show_onroad:
+      return
+    snapshot = stats.snapshot()
+    text = hud_text(snapshot)
+    width = min(1040., rect.width - 330.)
+    if width < 400.:
+      return
+    box = rl.Rectangle(rect.x + 60., rect.y + rect.height - 82., width, 58.)
+    rl.draw_rectangle_rounded(box, .25, 8, rl.Color(0, 0, 0, 185))
+    size = 30
+    extent = measure_text_cached(self._font_medium, text, size)
+    if extent.x > width - 36.:
+      size = max(18, int(size * (width - 36.) / extent.x))
+      extent = measure_text_cached(self._font_medium, text, size)
+    rl.draw_text_ex(self._font_medium, text,
+                    rl.Vector2(box.x + 18., box.y + (box.height - extent.y) / 2.),
+                    size, 0, COLORS.WHITE_TRANSLUCENT)
 
   def _render(self, rect: rl.Rectangle) -> None:
     self._handle_touch_input()
@@ -497,6 +517,7 @@ class HudRenderer(Widget):
     self._draw_onscreen_controls(rect)
     self._draw_nav_view(rect)
     self._draw_intent_view(rect)
+    self._draw_engagement_stats(rect)
 
   def _handle_touch_input(self) -> None:
     mouse_pos = rl.get_mouse_position()

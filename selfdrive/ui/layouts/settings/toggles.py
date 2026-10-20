@@ -8,7 +8,10 @@ from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.lib.multilang import tr, tr_noop
 from openpilot.system.ui.widgets import DialogResult
 from openpilot.selfdrive.ui.ui_state import ui_state
-from openpilot.selfdrive.nap.grade_toggle_ui import read_grade_enabled, write_grade_enabled
+from openpilot.selfdrive.nap.grade_toggle_ui import (read_grade_enabled, write_grade_enabled,
+  read_grade_diagnostics, write_grade_diagnostics, grade_diagnostic_description)
+
+from openpilot.selfdrive.ui.onroad.visual_theme import read_settings, write_setting
 
 PERSONALITY_TO_INT = log.LongitudinalPersonality.schema.enumerants
 
@@ -114,13 +117,34 @@ class TogglesLayout(Widget):
     )
     # NAP_V9E_PREDICTIVE_GRADE_UI_V1: same file-backed state as the V9e controller/CLI.
     self._predictive_grade_setting = toggle_item(
-      lambda: tr("Predictive Hill Assist (V9e)"),
-      tr("Small uphill anticipation below 55 mph (maximum +0.08 m/s²). "
-         "No extra braking. Enable while parked; disable at any time."),
+      lambda: tr("Predictive Hill Assist (V10)"),
+      tr("Model hill preview and sustained speed support from 20 to 80 mph. "
+         "Support tapers above 65 mph; leads, curves and stops retain priority. "
+         "Enable while parked; disable at any time."),
       read_grade_enabled(),
       callback=self._set_predictive_grade_assist,
       icon="speed_limit.png",
     )
+
+    self._grade_diag_frames = 0
+    self._grade_diagnostics_setting = toggle_item(
+      lambda: tr("Pitch / Speed Diagnostics"),
+      grade_diagnostic_description(), read_grade_diagnostics(),
+      callback=self._set_grade_diagnostics, icon="speed_limit.png")
+
+    visuals = read_settings()
+    self._visual_theme = multiple_button_item(
+      lambda: tr("Path colors"),
+      lambda: tr("Display only. Rainbow animates with a separate model acceleration ribbon: green accelerate, red slow, white coast or unavailable. Dynamic uses the same cue across the path. Predictions are not actual pedal commands."),
+      buttons=[lambda: tr("Classic"), lambda: tr("Blue"), lambda: tr("Rainbow"), lambda: tr("Dynamic")],
+      button_width=170, selected_index=visuals['theme'],
+      callback=lambda index: self._set_visual('theme', index), icon="speed_limit.png")
+    self._visual_wider = toggle_item(
+      lambda: tr("Wider predicted path"), tr("Display path 11% wider. Does not change steering or lane boundaries."),
+      visuals['wider'], callback=lambda value: self._set_visual('wider', value), icon="speed_limit.png")
+    self._visual_leads = toggle_item(
+      lambda: tr("Lead vehicle markers"), tr("Show existing supported lead estimates when fresh. Does not detect all nearby vehicles or blind spots."),
+      visuals['leads'], callback=lambda value: self._set_visual('leads', value), icon="speed_limit.png")
 
     self._toggles = {}
     self._locked_toggles = set()
@@ -156,13 +180,19 @@ class TogglesLayout(Widget):
         self._toggles["LongitudinalPersonality"] = self._long_personality_setting
         self._toggles["NAPPitchAssistMode"] = self._pitch_assist_setting
         self._toggles["NAPPredictiveGradeAssist"] = self._predictive_grade_setting
+        self._toggles["NAPGradeDiagnostics"] = self._grade_diagnostics_setting
 
+    self._toggles.update(NAPVisualTheme=self._visual_theme, NAPVisualWider=self._visual_wider,
+                         NAPVisualLeads=self._visual_leads)
     self._update_experimental_mode_icon()
     self._scroller = Scroller(list(self._toggles.values()), line_separator=True, spacing=0)
 
     ui_state.add_engaged_transition_callback(self._update_toggles)
 
   def _update_state(self):
+    self._grade_diag_frames += 1
+    if self._grade_diag_frames % 20 == 0:
+      self._grade_diagnostics_setting.set_description(grade_diagnostic_description())
     if ui_state.sm.updated["selfdriveState"]:
       personality = PERSONALITY_TO_INT[ui_state.sm["selfdriveState"].personality]
       if personality != ui_state.personality and ui_state.started:
@@ -176,6 +206,11 @@ class TogglesLayout(Widget):
 
   def _update_toggles(self):
     ui_state.update_params()
+    self._refresh_visuals()
+    diag_on = read_grade_diagnostics()
+    self._grade_diagnostics_setting.action_item.set_state(diag_on)
+    self._grade_diagnostics_setting.action_item.set_enabled(not ui_state.started or diag_on)
+    self._grade_diagnostics_setting.set_description(grade_diagnostic_description())
 
     e2e_description = tr(
       "openpilot defaults to driving in chill mode. Experimental mode enables alpha-level features that aren't ready for chill mode. " +
@@ -235,6 +270,18 @@ class TogglesLayout(Widget):
       if self._toggle_defs[toggle_def][3] and toggle_def not in self._locked_toggles:
         self._toggles[toggle_def].action_item.set_enabled(not ui_state.engaged)
 
+  def _set_visual(self, key, value):
+    write_setting(key, value, offroad=not ui_state.started)
+    self._refresh_visuals()
+
+  def _refresh_visuals(self):
+    data = read_settings()
+    self._visual_theme.action_item.set_selected_button(data['theme'])
+    self._visual_wider.action_item.set_state(data['wider'])
+    self._visual_leads.action_item.set_state(data['leads'])
+    for item in (self._visual_theme, self._visual_wider, self._visual_leads):
+      item.action_item.set_enabled(not ui_state.started)
+
   def _render(self, rect):
     self._scroller.render(rect)
 
@@ -291,3 +338,9 @@ class TogglesLayout(Widget):
     actual = read_grade_enabled()
     self._predictive_grade_setting.action_item.set_state(actual)
     self._predictive_grade_setting.action_item.set_enabled(not ui_state.started or actual)
+
+  def _set_grade_diagnostics(self, enabled: bool):
+    write_grade_diagnostics(enabled, offroad=not ui_state.started)
+    actual = read_grade_diagnostics()
+    self._grade_diagnostics_setting.action_item.set_state(actual)
+    self._grade_diagnostics_setting.action_item.set_enabled(not ui_state.started or actual)
