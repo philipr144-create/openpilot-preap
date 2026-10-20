@@ -104,13 +104,28 @@ def _read_stdin():
 
 def main():
   gui_app.init_window("Spinner")
-  spinner = Spinner()
+  # PHILLYFORK_STARTUP_ONLY_V2: startup presentation only; stock spinner remains fallback.
+  try:
+    from openpilot.system.ui.phillyfork_spinner import PhillyForkSpinner
+    spinner = PhillyForkSpinner()
+  except Exception as exc:
+    print(f"PhillyFork startup unavailable: {exc}", file=sys.stderr)
+    spinner = Spinner()
   for _ in gui_app.render():
     text_list = _read_stdin()
     if text_list:
       spinner.set_text(text_list[-1])
 
-    spinner.render(rl.Rectangle(0, 0, gui_app.width, gui_app.height))
+    try:
+      spinner.render(rl.Rectangle(0, 0, gui_app.width, gui_app.height))
+    except Exception as exc:
+      if isinstance(spinner, Spinner):
+        raise
+      print(f"PhillyFork drawing failed, using stock spinner: {exc}", file=sys.stderr)
+      spinner = Spinner()
+      if text_list:
+        spinner.set_text(text_list[-1])
+      spinner.render(rl.Rectangle(0, 0, gui_app.width, gui_app.height))
 
 
 if __name__ == "__main__":
