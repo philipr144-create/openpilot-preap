@@ -210,6 +210,10 @@ class NavigationTurnCommit:
           # leave the model free to make its exit alignment corrections.
           guard_allowed = (d.get('manual_turn_blocked') is not True and not self.manual.blocked)
           if guard_allowed and signed_curvature < 0.0:
+            if ManualTurnCommit.alignment_correction(model, curvature):
+              self.state = "MANUAL ALIGNMENT"
+              self.side = "left" if direction == 1 else "right"
+              return curvature
             self.active = True
             self.state = "MANUAL VETO"
             self.side = "left" if direction == 1 else "right"
@@ -513,6 +517,40 @@ class ManualTurnCommit:
       return credible, heading, sign * raw
     except (AttributeError, TypeError, ValueError, OverflowError):
       return None
+
+  @staticmethod
+  def alignment_correction(model, curvature):
+    """Allow a small road-alignment correction in either signal direction.
+
+    A blinker identifies maneuver intent, not the sign of every steering
+    correction. Use a straight near path and bounded three-second heading
+    to distinguish countersteering from an opposite corner. This only lets
+    the existing model request through; it never adds steering authority.
+    Invalid/incomplete geometry cannot exempt a request from the veto.
+    """
+    try:
+      ts = list(model.position.t)
+      xs, ys = list(model.position.x), list(model.position.y)
+      yaw = list(model.orientation.z)
+      raw = float(model.action.desiredCurvature)
+      if (len(ts) < 3 or not len(ts) == len(xs) == len(ys) == len(yaw)
+          or not all(math.isfinite(v) for v in ts + xs + ys + yaw + [raw, curvature])
+          or any(b <= a for a, b in zip(ts, ts[1:]))
+          or ts[0] > 0.0 or ts[-1] < 3.0
+          or max(abs(raw), abs(curvature)) > ManualTurnCommit.EXIT_PLANNER_CURVATURE):
+        return False
+      near = [i for i, t in enumerate(ts) if 0.0 < t <= 1.0]
+      horizon = [i for i, t in enumerate(ts) if 0.0 < t <= 3.0]
+      if not near or len(horizon) < 2 or xs[horizon[-1]] <= xs[0]:
+        return False
+      return (
+        max(abs(yaw[i] - yaw[0]) for i in near) <= ManualTurnCommit.EXIT_NEAR_HEADING
+        and max(abs(ys[i] - ys[0]) for i in near) <= ManualTurnCommit.EXIT_NEAR_OFFSET_M
+        # Below the existing 10-degree corner-entry heading threshold.
+        and max(abs(yaw[i] - yaw[0]) for i in horizon) < math.radians(10)
+      )
+    except (AttributeError, TypeError, ValueError, OverflowError):
+      return False
 
   @staticmethod
   def turn_shape_evidence(model, sign, *, continuing=False):

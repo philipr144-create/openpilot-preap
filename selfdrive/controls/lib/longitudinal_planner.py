@@ -809,7 +809,7 @@ class LongitudinalPlanner:
     accel_max = accel_ceiling(v_ego, personality) if self._is_preap else get_max_accel(v_ego)
     if self._is_preap:
       accel_max = self.personality_accel_limit.update(
-        accel_max, personality, self.dt,
+        accel_max, personality, self.dt, speed=v_ego,
         reset=reset_state or sm['carState'].gasPressed or sm['carState'].standstill
         or not self.nap_adaptive_accel)
     accel_clip = [ACCEL_MIN, accel_max]

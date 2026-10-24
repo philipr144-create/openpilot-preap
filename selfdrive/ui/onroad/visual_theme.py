@@ -24,8 +24,8 @@ def read_settings(path=CONFIG):
   except (OSError, ValueError, TypeError):
     return DEFAULTS.copy()
 
-def write_setting(key, value, *, offroad, path=CONFIG):
-  if not offroad or key not in DEFAULTS:
+def write_setting(key, value, *, offroad, path=CONFIG, allow_live=False):
+  if (not offroad and not allow_live) or key not in DEFAULTS:
     return False
   if key == 'theme':
     if type(value) is not int or value not in range(4):

@@ -22,6 +22,8 @@ SPEED_TOLERANCE_MPS = 0.20  # avoid state chatter on small overshoot at 80 mph
 MAX_CLIMB_SECONDS = 60.0
 LOAD_FILTER_SECONDS = 1.0
 PREVIEW_SUPPORT_MPS2 = 0.12
+# Same horizon as the model preview. Terrain memory never authorizes output.
+PREVIEW_MEMORY_SECONDS = 2.5
 
 
 def _finite(value):
@@ -84,6 +86,7 @@ class PredictiveGradeAssist:
     self.climb_remaining = self.load_estimate = self.clear_seconds = 0.0
     self.block_reasons = []
     self.reason = 'OFF'
+    self.preview_hold = self.preview_remaining = self.preview_climb_remaining = 0.0
 
   def update(self, *, model, enabled, engaged, v_ego, a_ego,
              effective_speed, driver_speed, base_accel, mpc_accel,
@@ -134,9 +137,47 @@ class PredictiveGradeAssist:
       checks.append(('LEAD_NEAR_OR_CLOSING', distance is None or relative is None or
                      distance < max(12., 1.25 * speed) or relative < -.25))
     self.block_reasons = list(dict.fromkeys(name for name, blocked in checks if blocked))
+    # Observe terrain separately from permission to accelerate. Cruise capture
+    # can legitimately request slight braking while a hill approaches. Erasing
+    # that preview on every denied output misses the hill once the car reaches
+    # it and relative model pitch becomes flat. Keep only a short confirmation;
+    # output, carried climb state and load trim still clear immediately below.
+    memory_blocks = {'ABOVE_TARGET', 'NEGATIVE_BASE_REQUEST', 'MPC_BRAKING',
+                     'ACCEL_CEILING', 'LEAD_NEAR_OR_CLOSING', 'BRAKING_OWNER'}
+    # A raw model coast request still vetoes output, but need not erase an
+    # already confirmed climb. Only bridge the existing short memory window;
+    # never arm from coast, carry output/load trim, or relax explicit braking.
+    # Keep lead-present behavior unchanged until separately replay-validated.
+    coast_pause = (model_a <= -.20 and not model_braking_required
+                   and not active_leads and self.preview_climb_remaining > 0.)
+    if coast_pause:
+      memory_blocks.add('MODEL_BRAKING')
+    memory_owner = str(brake_reason).upper() in permissions + ('SPEED_CEILING',)
+    observe = memory_owner and not any(b not in memory_blocks for b in self.block_reasons)
+    if observe:
+      self.preview_remaining = max(0., self.preview_remaining - self.dt)
+      self.preview_climb_remaining = max(0., self.preview_climb_remaining - self.dt)
+      if not coast_pause and delta >= TRIGGER_DEG:
+        self.preview_hold = min(1., self.preview_hold + self.dt)
+      elif delta < RELEASE_DEG:
+        self.preview_hold = 0.
+      if not coast_pause and self.preview_hold >= MIN_HOLD_SEC:
+        self.preview_remaining = PREVIEW_MEMORY_SECONDS
+        self.preview_climb_remaining = MAX_CLIMB_SECONDS
+      if self.block_reasons and self.climb_active and delta >= 0. and self.preview_climb_remaining > 0.:
+        self.preview_remaining = max(self.preview_remaining, PREVIEW_MEMORY_SECONDS)
+      if coast_pause and self.climb_active and delta > -RELEASE_DEG:
+        self.preview_remaining = max(self.preview_remaining, PREVIEW_MEMORY_SECONDS)
+      if delta <= -RELEASE_DEG:
+        self.preview_hold = self.preview_remaining = self.preview_climb_remaining = 0.
+    else:
+      self.preview_hold = self.preview_remaining = self.preview_climb_remaining = 0.
+
     if self.block_reasons:
       blocks = self.block_reasons
+      preview = (self.preview_hold, self.preview_remaining, self.preview_climb_remaining)
       self.reset()
+      self.preview_hold, self.preview_remaining, self.preview_climb_remaining = preview
       self.last_pitch_rise_deg = delta
       self.block_reasons = blocks
       self.reason = blocks[0]
@@ -150,6 +191,10 @@ class PredictiveGradeAssist:
     if self.hold >= MIN_HOLD_SEC:
       self.climb_active = True
       self.climb_remaining = MAX_CLIMB_SECONDS
+      self.triggered = True
+    elif self.preview_remaining > 0. and self.preview_climb_remaining > 0. and not self.climb_active:
+      self.climb_active = True
+      self.climb_remaining = min(MAX_CLIMB_SECONDS, self.preview_climb_remaining)
       self.triggered = True
     elif self.climb_active:
       self.climb_remaining = max(0., self.climb_remaining - self.dt)

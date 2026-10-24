@@ -70,6 +70,7 @@ class Car:
 
     self.can_rcv_cum_timeout_counter = 0
 
+    self.nap_spoken_snapshot = None
     self.CC_prev = car.CarControl.new_message()
     self.CS_prev = car.CarState.new_message()
     self.initialized_prev = False
@@ -281,6 +282,14 @@ class Car:
         self.airride_sends = []
       self.pm.send('sendcan', can_list_to_can_capnp(can_sends, msgtype='sendcan', valid=valid))
 
+      # Only copy immutable telemetry after the existing CAN publication.
+      # Optional serialization/publication runs in params_thread, not here.
+      state = getattr(self.CI.CC, 'nap_spoken_control_state', None)
+      if self.CP.carFingerprint == 'TESLA_MODEL_S_PREAP' and state is not None:
+        healthy = CS.canValid and self.sm.all_checks(['carControl'])
+        self.nap_spoken_snapshot = (time.monotonic(), bool(CC.enabled and healthy),
+                                    bool(state[0]), bool(state[1] and healthy),
+                                    bool(CC.longActive and healthy))
       self.CC_prev = CC
 
   def step(self):
@@ -302,9 +311,21 @@ class Car:
     self.CS_prev = CS
 
   def params_thread(self, evt):
+    # This existing non-control thread owns all optional transport and config I/O.
+    speech = None
+    try:
+      from openpilot.selfdrive.nap.spoken_status_v2 import StatusPublisher, read_enabled
+      speech = StatusPublisher()
+    except Exception:
+      pass
     while not evt.is_set():
       self.is_metric = self.params.get_bool("IsMetric")
       self.experimental_mode = self.params.get_bool("ExperimentalMode") and self.CP.openpilotLongitudinalControl
+      if speech is not None:
+        try:
+          speech.update(self.nap_spoken_snapshot, read_enabled())
+        except Exception:
+          speech = None
       time.sleep(0.1)
 
   def card_thread(self):

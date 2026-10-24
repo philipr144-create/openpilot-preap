@@ -1,7 +1,7 @@
 """Pre-AP acceleration handoff with shared cruise capture and braking priority."""
 import math
 from openpilot.selfdrive.controls.lib.model_forecast import assess_model_forecast, assess_model_intent
-from opendbc.car.tesla.preap.accel_policy import ACCEL_RISE, REGEN_RELEASE_JERK, personality_index
+from opendbc.car.tesla.preap.accel_policy import ACCEL_RISE, REGEN_RELEASE_JERK, personality_index, positive_accel_rise
 
 DECEL_JERK = {0: .8, 1: .6, 2: .4}
 
@@ -93,7 +93,7 @@ class NormalCruiseSmoother:
     p = personality_index(personality)
     # Standard sits between its old rise/entry rates and Relaxed. Relaxed
     # retains its speed-dependent positive rise policy in the actuator.
-    rise = .35 if p == 1 else ACCEL_RISE.get(p, .4)
+    rise = positive_accel_rise(speed, personality)
     decel = .50 if p == 1 else DECEL_JERK.get(p, .6)
     history = min(0., previous) if request < 0. else previous
     value = handoff_acceleration(request, history, dt, personality, lower, upper,
@@ -160,7 +160,7 @@ class UnifiedCruiseSmoother:
     else:
       self.filtered_accel += dt / (.25 + dt) * (accel - self.filtered_accel)
     p = personality_index(personality)
-    rise = .35 if p == 1 else ACCEL_RISE.get(p, .4)
+    rise = positive_accel_rise(speed, personality)
     decel = .50 if p == 1 else DECEL_JERK.get(p, .6)
     if capture and priority == 'ORDINARY':
       # Anticipate the speed gained during delay and the remaining ordinary
@@ -195,7 +195,7 @@ class PersonalityAccelerationLimit:
     self.personality = None
     self.transition = False
 
-  def update(self, target, personality, dt, reset=False):
+  def update(self, target, personality, dt, reset=False, speed=0.):
     p = personality_index(personality)
     if reset or self.value is None:
       self.value, self.personality, self.transition = target, p, False
@@ -204,7 +204,7 @@ class PersonalityAccelerationLimit:
       self.transition = True
     self.personality = p
     if self.transition:
-      rise = .35 if p == 1 else ACCEL_RISE.get(p, .4)
+      rise = positive_accel_rise(speed, personality)
       fall = .50 if p == 1 else DECEL_JERK.get(p, .6)
       self.value = max(self.value - fall * dt, min(self.value + rise * dt, target))
       self.transition = abs(self.value - target) > 1e-9

@@ -361,16 +361,17 @@ class ManualTests(unittest.TestCase):
                                   model=self.model, healthy=True,
                                   actual_curvature=0.), sign*.01)
 
-      # Waiting intent remains a continuous direction veto, without a
-      # positive blinker-side seed until sustained corner geometry qualifies.
+      # A straight predicted path permits bounded countersteering even with
+      # a held signal; a sign-only veto must not hold the wheel straight.
       self.model.position.y = [0.] * 4
       self.model.orientation.z = [0.] * 4
       self.model.action.desiredCurvature = 0.
       nav.decision = copy.deepcopy(self.d)
       self.assertEqual(nav.update(-sign*.01, self.cs, True, self.now+.02,
                                   model=self.model, healthy=True,
-                                  actual_curvature=0.), 0.)
-      self.assertEqual(nav.state, 'MANUAL VETO')
+                                  actual_curvature=0.), -sign*.01)
+      self.assertEqual(nav.state, 'MANUAL ALIGNMENT')
+      self.assertFalse(nav.active)
 
   def test_navigation_wrapper_manual_independent_of_navigation_toggle(self):
     with patch('openpilot.selfdrive.controls.lib.navigation_turn_commit.Params'):

@@ -41,16 +41,17 @@ def _driving_process_running():
   return False
 
 
-def write_grade_enabled(enabled, *, offroad, path=GRADE_FILE, process_checker=None):
+def write_grade_enabled(enabled, *, offroad, path=GRADE_FILE, process_checker=None, allow_live=False):
   """Atomically update the existing V9e switch, or return False if unsafe.
 
-  Enable only while offroad AND without control processes. Disabling is
-  always allowed. Do not silently create a missing config or follow symlinks.
+  The legacy CLI path remains offroad-only. The live UI opts in explicitly
+  for the existing polled, ramped controller; its internal gates are unchanged.
+  Disabling is always allowed. Never create a missing config or follow symlinks.
   """
   if not isinstance(enabled, bool):
     return False
   path = Path(path)
-  if enabled:
+  if enabled and not allow_live:
     if not offroad:
       return False
     check = process_checker or _driving_process_running
@@ -90,8 +91,8 @@ STATUS_FILE = Path('/dev/shm/nap_predictive_grade_status.json')
 def read_grade_diagnostics():
   return read_grade_enabled(DIAG_FILE)
 
-def write_grade_diagnostics(enabled, *, offroad):
-  return write_grade_enabled(enabled, offroad=offroad, path=DIAG_FILE)
+def write_grade_diagnostics(enabled, *, offroad, allow_live=False):
+  return write_grade_enabled(enabled, offroad=offroad, path=DIAG_FILE, allow_live=allow_live)
 
 def grade_diagnostic_description():
   import time

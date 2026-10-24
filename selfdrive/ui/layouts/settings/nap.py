@@ -29,6 +29,7 @@ from openpilot.selfdrive.ui.layouts.settings.nap_content import (
 )
 from opendbc.car.tesla.preap.nap_params import NAPParamKeys, DEFAULTS
 from openpilot.selfdrive.ui.ui_state import ui_state
+from openpilot.selfdrive.nap.spoken_status_v2 import read_enabled as read_spoken_enabled, write_enabled as write_spoken_enabled
 
 
 class SectionHeader(Widget):
@@ -122,7 +123,24 @@ class NAPLayout(Widget):
       "Lane Centering Assist (Experimental)",
       "Gently correct toward the detected lane center on clearly marked roads above 20 mph. "
       "Yields during signaling and driver steering. Off restores normal model steering. "
-      "The green path still shows the original model prediction. Change settings while parked.",
+      "The green path still shows the original model prediction. Changes apply during a trip.",
+    )
+    self._spoken_status_toggle = toggle_item(
+      "Spoken Control Status",
+      "Optional voice messages for driver steering, steering assistance resuming, and speed control enabling. "
+      "Standard alerts take priority. Off by default. Changes apply during a trip.",
+      read_spoken_enabled(), callback=self._on_spoken_status,
+    )
+    self._spoken_status_toggle.action_item.set_enabled(True)
+    self._all_items.append(self._spoken_status_toggle)
+
+    self._add_toggle(
+      NAPParamKeys.LANE_CLEARANCE_GUARD,
+      "Lane Clearance Guard (Experimental)",
+      "Adds bounded steering correction when the predicted path leaves too little space to a detected lane line. "
+      "For clearly marked roads above 20 mph. Yields to driver steering and signaling. "
+      "Replaces the older lane-position adjustment while enabled. Can be switched on or off during a trip; correction ramps in. "
+      "Cannot guarantee lane containment. The green path remains the original model prediction.",
     )
     strength = self._params.get(NAPParamKeys.LANE_CENTERING_STRENGTH, return_default=True)
     self._centering_buttons = multiple_button_item(
@@ -133,7 +151,7 @@ class NAPLayout(Widget):
       selected_index=max(0, min(2, int(strength) - 1)),
       callback=self._on_centering_strength,
     )
-    self._centering_buttons.action_item.set_enabled(ui_state.is_offroad)
+    self._centering_buttons.action_item.set_enabled(True)
     self._all_items.append(self._centering_buttons)
 
     lane_offset = int(self._params.get("NAPLaneCenterOffset", return_default=True))
@@ -141,13 +159,13 @@ class NAPLayout(Widget):
       "Lane Position",
       "Shifts the lane-centering target left or right without changing steering strength. "
       "Center uses the geometric midpoint between the detected lane lines. "
-      "Change settings while parked.",
+      "Changes apply during a trip.",
       buttons=['Left 12"', 'Left 9"', 'Left 6"', "Center", 'Right 6"', 'Right 9"', 'Right 12"'],
       button_width=115,
       selected_index=max(0, min(6, lane_offset + 3)),
       callback=self._on_lane_position,
     )
-    self._lane_position_buttons.action_item.set_enabled(ui_state.is_offroad)
+    self._lane_position_buttons.action_item.set_enabled(True)
     self._all_items.append(self._lane_position_buttons)
 
     self._curve_comfort_buttons = multiple_button_item(
@@ -155,12 +173,12 @@ class NAPLayout(Widget):
       "Adjust optional Corner Assist and mapped-curve slowing when those features are enabled. "
       "More matches the previous Mild setting; Standard and Mild slow progressively less. "
       "Applies to mapped curves and Corner Assist. Cruise speed, leads and stops still take priority. "
-      "Change while parked.",
+      "Changes apply during a trip.",
       buttons=["More", "Standard", "Mild"], button_width=180,
       selected_index=PROFILE_NAMES.index(read_curve_comfort().name),
       callback=self._on_curve_comfort,
     )
-    self._curve_comfort_buttons.action_item.set_enabled(ui_state.is_offroad)
+    self._curve_comfort_buttons.action_item.set_enabled(True)
     self._all_items.append(self._curve_comfort_buttons)
 
     self._all_items.append(section_header_item("Engagement Statistics"))
@@ -413,7 +431,7 @@ class NAPLayout(Widget):
   # ── Multiple-button callbacks ──
 
   def _on_curve_comfort(self, index: int):
-    if not ui_state.is_offroad or not 0 <= index < len(PROFILE_NAMES):
+    if not 0 <= index < len(PROFILE_NAMES):
       return
     try:
       write_curve_comfort(PROFILE_NAMES[index])
@@ -614,25 +632,31 @@ class NAPLayout(Widget):
     pct = 100. * value['engaged'] / total if total else 0.
     return f"{pct:.1f}% · {value['engaged']:,.0f} mi"
 
+  def _on_spoken_status(self, enabled):
+    write_spoken_enabled(enabled)
+    self._spoken_status_toggle.action_item.set_state(read_spoken_enabled())
+
   def _refresh_toggles(self):
     """Sync all toggle states from params (handles external changes)."""
+    self._spoken_status_toggle.action_item.set_state(read_spoken_enabled())
+    self._spoken_status_toggle.action_item.set_enabled(True)
     self._stats_strip_toggle.action_item.set_state(ui_state.engagement_stats.show_onroad)
     for key, item in self._toggle_map.items():
       item.action_item.set_state(self._params.get_bool(key))
 
     self._centering_buttons.action_item.set_selected_button(max(0, min(2,
       int(self._params.get(NAPParamKeys.LANE_CENTERING_STRENGTH, return_default=True)) - 1)))
-    self._centering_buttons.action_item.set_enabled(ui_state.is_offroad)
+    self._centering_buttons.action_item.set_enabled(True)
 
     lane_offset = int(self._params.get("NAPLaneCenterOffset", return_default=True))
     self._lane_position_buttons.action_item.set_selected_button(
       max(0, min(6, lane_offset + 3))
     )
-    self._lane_position_buttons.action_item.set_enabled(ui_state.is_offroad)
+    self._lane_position_buttons.action_item.set_enabled(True)
 
     self._curve_comfort_buttons.action_item.set_selected_button(
       PROFILE_NAMES.index(read_curve_comfort().name))
-    self._curve_comfort_buttons.action_item.set_enabled(ui_state.is_offroad)
+    self._curve_comfort_buttons.action_item.set_enabled(True)
 
     # Refresh multiple-button selections
     follow_dist = self._params.get(NAPParamKeys.FOLLOW_DISTANCE, return_default=True)

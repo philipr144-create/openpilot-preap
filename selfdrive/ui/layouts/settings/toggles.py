@@ -120,7 +120,7 @@ class TogglesLayout(Widget):
       lambda: tr("Predictive Hill Assist (V10)"),
       tr("Model hill preview and sustained speed support from 20 to 80 mph. "
          "Support tapers above 65 mph; leads, curves and stops retain priority. "
-         "Enable while parked; disable at any time."),
+         "Can be enabled or disabled during a trip; existing validity checks and acceleration ramp remain active."),
       read_grade_enabled(),
       callback=self._set_predictive_grade_assist,
       icon="speed_limit.png",
@@ -258,7 +258,7 @@ class TogglesLayout(Widget):
     # Refresh UI from the same V9e JSON file the planner polls.
     v9e_on = read_grade_enabled()
     self._predictive_grade_setting.action_item.set_state(v9e_on)
-    self._predictive_grade_setting.action_item.set_enabled(not ui_state.started or v9e_on)
+    self._predictive_grade_setting.action_item.set_enabled(True)
 
     # TODO: make a param control list item so we don't need to manage internal state as much here
     # refresh toggles from params to mirror external changes
@@ -271,7 +271,7 @@ class TogglesLayout(Widget):
         self._toggles[toggle_def].action_item.set_enabled(not ui_state.engaged)
 
   def _set_visual(self, key, value):
-    write_setting(key, value, offroad=not ui_state.started)
+    write_setting(key, value, offroad=not ui_state.started, allow_live=True)
     self._refresh_visuals()
 
   def _refresh_visuals(self):
@@ -280,7 +280,7 @@ class TogglesLayout(Widget):
     self._visual_wider.action_item.set_state(data['wider'])
     self._visual_leads.action_item.set_state(data['leads'])
     for item in (self._visual_theme, self._visual_wider, self._visual_leads):
-      item.action_item.set_enabled(not ui_state.started)
+      item.action_item.set_enabled(True)
 
   def _render(self, rect):
     self._scroller.render(rect)
@@ -333,14 +333,14 @@ class TogglesLayout(Widget):
       self._params.put("NAPPitchAssistMode", button_index)
 
   def _set_predictive_grade_assist(self, enabled: bool):
-    # Enable only offroad; onroad disabling is always permitted.
-    write_grade_enabled(enabled, offroad=not ui_state.started)
+    # The existing controller polls this switch and ramps added support.
+    write_grade_enabled(enabled, offroad=not ui_state.started, allow_live=True)
     actual = read_grade_enabled()
     self._predictive_grade_setting.action_item.set_state(actual)
-    self._predictive_grade_setting.action_item.set_enabled(not ui_state.started or actual)
+    self._predictive_grade_setting.action_item.set_enabled(True)
 
   def _set_grade_diagnostics(self, enabled: bool):
-    write_grade_diagnostics(enabled, offroad=not ui_state.started)
+    write_grade_diagnostics(enabled, offroad=not ui_state.started, allow_live=True)
     actual = read_grade_diagnostics()
     self._grade_diagnostics_setting.action_item.set_state(actual)
-    self._grade_diagnostics_setting.action_item.set_enabled(not ui_state.started or actual)
+    self._grade_diagnostics_setting.action_item.set_enabled(True)

@@ -1,5 +1,6 @@
 import numpy as np
 from cereal import car
+from opendbc.car.tesla.preap.accel_policy import limit_positive_output_rise
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N
 from openpilot.common.pid import PIDController
@@ -11,6 +12,8 @@ LongCtrlState = car.CarControl.Actuators.LongControlState
 
 # Acceleration-domain motor compensation, independent of personality.
 MAX_POSITIVE_TRACKING_TRIM = 0.60
+PREAP_MEASURED_ACCEL_RC = .10
+PREAP_TRACKING_KP = .25
 STOP_RELEASE_CONFIRM_TIME = 0.30
 STOP_RELEASE_MIN_ACCEL = 0.0
 STOP_HOLD_SPEED = 0.50
@@ -52,14 +55,23 @@ class StopRelease:
     return True
 
 
-def update_preap_feedback(pid, error, speed, target, *, freeze_integrator=False):
+def preap_overshoot_error(target, measured):
+  """Damp excess actual acceleration without a step when target crosses zero.
+
+  A new target alone cannot amplify the feedforward: measured magnitude must
+  exceed requested magnitude. Opposite-direction motion is damped as well.
+  """
+  return -float(np.copysign(max(0., abs(measured)-abs(target)), measured))
+
+
+def update_preap_feedback(pid, error, speed, target, *, freeze_integrator=False, proportional_error=None, tracking_gain=None):
   """Acceleration feedback with separate correction and total-output bounds.
 
   Conditional integration prevents windup; output limits never overwrite the
   stored correction. The generic PID used by lateral/other cars is untouched.
   """
   pid.speed = speed
-  pid.p = pid.k_p * float(error)
+  pid.p = (pid.k_p if tracking_gain is None else tracking_gain) * float(error if proportional_error is None else proportional_error)
   pid.d = 0.0
   pid.f = target
   if not freeze_integrator:
@@ -118,16 +130,20 @@ class LongControl:
                              rate=1 / DT_CTRL)
     self.last_output_accel = 0.0
     self.capture_accel = None
+    self.feedback_accel = None
+    self.previous_feedforward = 0.
     self.stop_release = StopRelease()
     self.releasing_stop = False
 
   def reset(self):
     self.pid.reset()
     self.capture_accel = None
+    self.feedback_accel = None
+    self.previous_feedforward = 0.
     self.stop_release.reset()
     self.releasing_stop = False
 
-  def update(self, active, CS, a_target, should_stop, accel_limits, cruise_capture_speed=None):
+  def update(self, active, CS, a_target, should_stop, accel_limits, cruise_capture_speed=None, personality=None):
     """Update longitudinal control. This updates the state machine and runs a PID loop"""
     self.pid.neg_limit = accel_limits[0]
     self.pid.pos_limit = accel_limits[1]
@@ -153,6 +169,8 @@ class LongControl:
         output_accel = min(output_accel, 0.0)
         output_accel -= self.CP.stoppingDecelRate * DT_CTRL
       self.pid.reset()
+      self.feedback_accel = None
+      self.previous_feedforward = 0.
       self.capture_accel = None
       self.releasing_stop = False
 
@@ -215,9 +233,23 @@ class LongControl:
           )
 
       if is_preap:
+        # One measured-acceleration history for bounded overshoot damping.
+        # Only over-response is damped: do not amplify a new target while
+        # the physical actuator is still responding to the planned ramp.
+        if self.feedback_accel is None:
+          self.feedback_accel = CS.aEgo
+        else:
+          self.feedback_accel += DT_CTRL/(PREAP_MEASURED_ACCEL_RC+DT_CTRL)*(CS.aEgo-self.feedback_accel)
+      feedback_i_before = self.pid.i
+      stop_release_active = self.releasing_stop
+      if is_preap:
         output_accel = update_preap_feedback(
           self.pid, error, CS.vEgo, a_target,
-          freeze_integrator=freeze_capture or self.releasing_stop)
+          freeze_integrator=(freeze_capture or self.releasing_stop
+                             or (a_target > self.previous_feedforward+1e-8 and error > 0.)),
+          proportional_error=preap_overshoot_error(a_target, self.feedback_accel),
+          tracking_gain=(0. if self.releasing_stop else
+                         PREAP_TRACKING_KP*float(np.interp(CS.vEgo,[3.,6.],[0.,1.]))))
       else:
         output_accel = self.pid.update(error, speed=CS.vEgo, feedforward=a_target,
                                        freeze_integrator=freeze_capture)
@@ -230,7 +262,23 @@ class LongControl:
             output_accel = release_ceiling
           else:
             self.releasing_stop = False
+        # The planner owns the reference trajectory. Bound only extra
+        # positive correction here so a second limiter cannot delay it.
+        # Stops and stop release keep their established ramps.
+        if personality is not None and not stop_release_active:
+          # Planned acceleration already has the unified handoff. Pass its
+          # changes through; rate-limit only additional positive feedback trim.
+          previous_trim = self.last_output_accel-self.previous_feedforward
+          trim = output_accel-a_target
+          if output_accel > 0. and output_accel > self.last_output_accel:
+            trim = limit_positive_output_rise(
+              trim, previous_trim, CS.vEgo, personality, DT_CTRL)
+          shaped = min(output_accel, a_target+trim)
+          if shaped < output_accel and self.pid.i > feedback_i_before:
+            self.pid.i = feedback_i_before  # no positive windup behind this cap
+          output_accel = shaped
         self.pid.control = output_accel
 
+    self.previous_feedforward = a_target if self.long_control_state == LongCtrlState.pid else 0.
     self.last_output_accel = np.clip(output_accel, accel_limits[0], accel_limits[1])
     return self.last_output_accel

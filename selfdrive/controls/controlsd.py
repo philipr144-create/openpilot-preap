@@ -14,6 +14,7 @@ from opendbc.car.car_helpers import interfaces
 from opendbc.car.vehicle_model import VehicleModel
 from openpilot.selfdrive.controls.lib.drive_helpers import clip_curvature
 from openpilot.selfdrive.controls.lib.lane_centering import LaneCenteringAssist
+from openpilot.selfdrive.controls.lib.lane_clearance_guard import LaneClearanceGuard
 from openpilot.selfdrive.controls.lib.navigation_turn_commit import NavigationTurnCommit
 from openpilot.selfdrive.controls.lib.turn_context import manual_turn_intent
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
@@ -122,6 +123,8 @@ class Controls:
     self.curvature = 0.0
     self.desired_curvature = 0.0
     self.lane_centering = LaneCenteringAssist()
+    self.lane_clearance_guard = LaneClearanceGuard()
+    self.lane_clearance_guard_enabled = False
     # NAP_NAVIGATION_TURN_COMMIT_V1
     self.navigation_turn_commit = NavigationTurnCommit()
     self.nap_turn_rate_assist_active = False
@@ -223,7 +226,8 @@ class Controls:
       cruise_capture_speed = CS.vCruise * CV.KPH_TO_MS
     actuators.accel = float(self.LoC.update(
       CC.longActive, CS, long_plan.aTarget, long_plan.shouldStop, pid_accel_limits,
-      cruise_capture_speed=cruise_capture_speed))
+      cruise_capture_speed=cruise_capture_speed,
+      personality=self.sm['selfdriveState'].personality))
 
     # Steering PID loop and lateral MPC
     # Reset desired curvature to current to avoid violating the limits on engage
@@ -244,6 +248,10 @@ class Controls:
 
 
     one_blinker = CS.leftBlinker != CS.rightBlinker
+
+    # Existing subscriber only; no diagnostic readers or extra process.
+    if self.sm.frame % 10 == 0:
+      self.lane_clearance_guard_enabled = self.params.get_bool("NAPLaneClearanceGuard")
 
     if self.sm.frame % 100 == 0:
       self.wide_low_speed_turns_enabled = self.params.get_bool("NAPWideLowSpeedTurns")
@@ -392,7 +400,8 @@ class Controls:
     # The UI continues to display the original model path, not this adjustment.
     new_desired_curvature += self.lane_centering.update(
       model_v2, CS.vEgo, new_desired_curvature,
-      enabled=self.lane_centering_enabled and self.CP.carFingerprint == "TESLA_MODEL_S_PREAP",
+      enabled=(self.lane_centering_enabled and not self.lane_clearance_guard_enabled
+               and self.CP.carFingerprint == "TESLA_MODEL_S_PREAP"),
       active=CC.latActive,
       healthy=self.sm.all_checks(['modelV2', 'liveCalibration', 'carState'])
               and self.sm['liveCalibration'].calStatus == log.LiveCalibrationData.Status.calibrated,
@@ -402,6 +411,26 @@ class Controls:
       offset_setting=self.lane_centering_offset,
       dt=DT_CTRL,
     )
+
+    # Independent, off-by-default clearance guard; never stack the older
+    # position-bias controller with this trajectory constraint.
+    new_desired_curvature += self.lane_clearance_guard.update(
+      model_v2, CS.vEgo, new_desired_curvature,
+      enabled=self.lane_clearance_guard_enabled and self.CP.carFingerprint == "TESLA_MODEL_S_PREAP",
+      active=CC.latActive,
+      healthy=(self.sm.all_checks(['modelV2', 'liveCalibration', 'carState'])
+               and self.sm['liveCalibration'].calStatus == log.LiveCalibrationData.Status.calibrated
+               and CS.canValid and not CS.steerFaultTemporary and not CS.steerFaultPermanent),
+      overriding=(CS.steeringPressed or getattr(CS, 'steeringDisengage', False)
+                  or CS.leftBlinker or CS.rightBlinker or CC.leftBlinker or CC.rightBlinker),
+      maneuver=(self.low_speed_turn_smoothing_active or self.navigation_turn_commit.active
+                or manual_city_intent),
+      dt=DT_CTRL,
+    )
+    if self.lane_clearance_guard_enabled and self.sm.frame % 200 == 0:
+      cloudlog.info("Lane clearance guard: reason=%s correction_accel=%.3f target_accel=%.3f margin=%s",
+                    self.lane_clearance_guard.reason, self.lane_clearance_guard.accel,
+                    self.lane_clearance_guard.target_accel, self.lane_clearance_guard.predicted_margin)
 
     # ----------------------------------------------------------
     # NAP LOW-SPEED TURN RATE ASSIST

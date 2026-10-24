@@ -65,6 +65,13 @@ class Soundd:
   def __init__(self):
     self.load_sounds()
 
+    self.spoken = None
+    try:
+      from openpilot.selfdrive.nap.spoken_audio_v2 import SpokenAudio
+      self.spoken = SpokenAudio(BASEDIR)
+    except Exception:
+      cloudlog.exception("Optional spoken status unavailable")
+
     self.current_alert = AudibleAlert.none
     self.current_volume = MIN_VOLUME
     self.current_sound_frame = 0
@@ -111,7 +118,11 @@ class Soundd:
     if self.current_alert in (AudibleAlert.engage, AudibleAlert.disengage):
       volume = max(volume, 0.85)
 
-    return ret * volume
+    ret *= volume
+    if self.spoken is not None:
+      self.spoken.render(ret, blocked=(self.current_alert != AudibleAlert.none or self.selfdrive_timeout_alert),
+                         ambient_volume=self.current_volume)
+    return ret
 
   def callback(self, data_out: np.ndarray, frames: int, time, status) -> None:
     if status:
@@ -119,7 +130,7 @@ class Soundd:
     data_out[:frames, 0] = self.get_sound_data(frames)
 
   def update_alert(self, new_alert):
-    current_alert_played_once = self.current_alert == AudibleAlert.none or self.current_sound_frame > len(self.loaded_sounds[self.current_alert])
+    current_alert_played_once = self.current_alert == AudibleAlert.none or self.current_sound_frame >= len(self.loaded_sounds[self.current_alert])
     if self.current_alert != new_alert and (new_alert != AudibleAlert.none or current_alert_played_once):
       self.current_alert = new_alert
       self.current_sound_frame = 0
@@ -164,6 +175,9 @@ class Soundd:
           self.current_volume = self.calculate_volume(float(self.spl_filter_weighted.x))
 
         self.get_audible_alert(sm)
+        if self.spoken is not None:
+          self.spoken.update(sm, self.current_alert != AudibleAlert.none or self.selfdrive_timeout_alert,
+                             chime_active=self.current_alert in (AudibleAlert.engage, AudibleAlert.disengage))
 
         rk.keep_time()
 
