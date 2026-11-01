@@ -3,9 +3,9 @@
 This does NOT directly command steering torque or steering angle.
 
 When NavigationDesire has already authorized an intersection turn, this
-helper prevents a clearly straight/opposite model curvature from silently
-winning. The resulting curvature still passes through controlsd's normal
-clip_curvature() and lateral controller.
+helper requires a matching visible turn before providing a bounded entry
+seed. The model owns curvature after acquisition. All output still passes
+through normal clip_curvature() and the lateral controller.
 """
 
 import json
@@ -26,12 +26,6 @@ COMMIT_DISTANCE_M = 22.0
 COMMIT_SPEED_MPH = 25.0
 CONTINUE_SPEED_MPH = 35.0
 
-# Curvature floor ramps up as the intersection gets closer.
-# The model is always free to request MORE curvature in the correct direction.
-CURVATURE_FLOOR_FAR = 0.010
-CURVATURE_FLOOR_NEAR = 0.055
-NEAR_DISTANCE_M = 6.0
-
 # Read modeld's decision at 20 Hz rather than doing file I/O at controlsd's 100 Hz.
 READ_INTERVAL_S = 0.05
 MAX_DECISION_AGE_S = 0.35
@@ -46,6 +40,7 @@ class NavigationTurnCommit:
   def __init__(self):
     self.params = Params()
     self.manual = ManualTurnCommit()
+    self.navigation_geometry = NavigationGeometryCommit()
     self.enabled = False
     self.last_param_read = -1e9
     self.last_read = -1e9
@@ -98,23 +93,6 @@ class NavigationTurnCommit:
 
     except (OSError, ValueError, TypeError, AttributeError):
       pass
-
-  @staticmethod
-  def _floor_for_distance(distance):
-    # 22 m -> 0.010
-    #  6 m -> 0.055
-    # <=6 m -> 0.055
-    if distance <= NEAR_DISTANCE_M:
-      return CURVATURE_FLOOR_NEAR
-
-    span = COMMIT_DISTANCE_M - NEAR_DISTANCE_M
-    progress = (COMMIT_DISTANCE_M - distance) / span
-    progress = max(0.0, min(1.0, progress))
-
-    return (
-      CURVATURE_FLOOR_FAR
-      + progress * (CURVATURE_FLOOR_NEAR - CURVATURE_FLOOR_FAR)
-    )
 
   def update(self, curvature, CS, lat_active, now=None, *, model=None, healthy=False, actual_curvature=0.0):
     now = time.monotonic() if now is None else now
@@ -253,6 +231,10 @@ class NavigationTurnCommit:
 
     if steering_override:
       self.reacquire_start = None
+      # Discard cached entry evidence throughout handover. Releasing the
+      # wheel must collect the existing full geometry dwell/ramp again;
+      # completed or otherwise blocked seeds remain blocked.
+      self.navigation_geometry.suspend()
 
       if confirmed:
         self.driver_assisting = True
@@ -329,43 +311,11 @@ class NavigationTurnCommit:
       self.state = "GUIDING"
       return curvature
 
-    floor = self._floor_for_distance(distance)
-    self.floor = floor
-
-    signed = sign * float(curvature)
-
-    # Model already agrees with navigation and is turning strongly enough.
-    # No synthetic handoff is necessary if the model itself is doing the job.
-    if signed >= floor:
-      self.reacquire_start = None
-      self.active = True
-      self.state = "MODEL TURN"
-      return curvature
-
-    # Model is too straight or pointing the wrong direction.
-    # Establish only a minimum turn request. Never reduce a stronger
-    # correct-direction model request.
-    target = sign * floor
-    output = target
-
-    # If the driver just released steering assistance, blend from the current
-    # live model curvature toward the navigation floor. At blend=0 the output
-    # is exactly the model request; at blend=1 normal turn commitment is back.
-    if self.reacquire_start is not None:
-      elapsed = max(0.0, now - self.reacquire_start)
-      blend = min(1.0, elapsed / REACQUIRE_SECONDS)
-
-      output = float(curvature) + blend * (target - float(curvature))
-
-      if blend < 1.0:
-        self.state = "REACQUIRE"
-      else:
-        self.reacquire_start = None
-        self.state = "TURN ASSIST"
-    else:
-      self.state = "TURN ASSIST"
-
-    self.active = True
+    output = self.navigation_geometry.update(curvature, CS, d, model, healthy,
+                                             actual_curvature, now)
+    self.active = self.navigation_geometry.active
+    self.state = self.navigation_geometry.state
+    self.floor = self.navigation_geometry.floor
     self.output_curvature = output
     return output
 
@@ -1298,3 +1248,125 @@ class ManualTurnEntry:
     if self.phase != 'EXIT':
       self.phase = 'TURN'
     return True
+
+
+class NavigationGeometryCommit:
+  """Reuse proven turn-shape checks instead of inventing a radius from GPS.
+
+  Navigation authorizes direction; visible near-path geometry authorizes a
+  short seed. Once the model supplies the turn, it owns curvature and unwind.
+  """
+  def __init__(self):
+    self.key = None
+    self.reset()
+
+  def reset(self):
+    self.active = self.acquired = self.blocked = False
+    self.started = self.evidence_since = self.last_time = self.frame = self.frame_time = None
+    self.frames = 0
+    self.heading = self.distance = self.floor = 0.0
+    self.state = 'NAV GEOMETRY WAIT'
+
+  def suspend(self):
+    blocked = self.blocked
+    self.reset()
+    self.blocked = blocked
+    self.state = 'NAV DRIVER HANDOVER'
+
+  def update(self, curvature, cs, decision, model, healthy, actual_curvature, now):
+    key = (decision.get('route_id'), decision.get('maneuver_id'), decision.get('desire'))
+    if key != self.key:
+      self.reset()
+      self.key = key
+    self.active = False
+    self.floor = 0.0
+    if self.blocked:
+      return curvature
+    if (not healthy or not paired_decision(decision, model, now)
+        or decision.get('source') != 'navigation'
+        or decision.get('final_desire') != decision.get('desire')
+        or not all(math.isfinite(v) for v in (curvature, actual_curvature, cs.vEgo, now))
+        or cs.vEgo <= 0.3 or cs.steeringPressed or getattr(cs, 'steeringDisengage', False)):
+      self.reset()
+      self.state = 'NAV GEOMETRY INVALID'
+      return curvature
+    dt = 0.0 if self.last_time is None else now - self.last_time
+    if not 0 <= dt <= .15:
+      self.evidence_since = None
+      self.frames = 0
+      self.started = None
+      self.acquired = False
+      self.heading = self.distance = 0.0
+      self.last_time = now
+      self.state = 'NAV GEOMETRY GAP'
+      return curvature
+    sign = -1 if decision['desire'] == 'turnLeft' else 1
+    evidence = ManualTurnCommit.path_evidence(model, sign, require_raw_direction=False,
+                                             continuing=self.started is not None)
+    if evidence is None or not evidence[0]:
+      self.evidence_since = None
+      self.frames = 0
+      self.last_time = None
+      self.state = 'NAV NO MATCHING PATH'
+      # Once entry began, loss of geometry cannot resurrect an old seed.
+      self.blocked = self.started is not None
+      return curvature
+    frame = getattr(model, 'frameId', None)
+    if self.frame is not None and frame < self.frame:
+      self.blocked = True
+      self.state = 'NAV MODEL ORDER'
+      return curvature
+    fresh = frame != self.frame
+    if not fresh and self.frame_time is not None and now - self.frame_time > .15:
+      self.reset()
+      self.state = 'NAV STALE MODEL'
+      return curvature
+    if fresh:
+      self.frame_time = now
+    self.last_time = now
+    if self.started is not None:
+      self.heading += sign * actual_curvature * cs.vEgo * dt
+      self.distance += cs.vEgo * dt
+      if (self.heading >= ManualTurnCommit.EXIT_MIN_HEADING
+          and ManualTurnCommit.turn_exit_evidence(model, curvature)):
+        self.blocked = True
+        self.state = 'NAV COMPLETE'
+        return curvature
+      if (now - self.started > ManualTurnCommit.MAX_SECONDS or self.distance > 60.
+          or self.heading < -math.radians(5) or self.heading > math.radians(120)):
+        self.blocked = True
+        self.state = 'NAV TURN LIMIT'
+        return curvature
+    if self.started is None:
+      if not ManualTurnCommit.entry_evidence(model, sign, cs.vEgo):
+        self.evidence_since = None
+        self.frames = 0
+        self.state = 'NAV ENTRY WAIT'
+        return curvature
+      if fresh:
+        if self.evidence_since is None:
+          self.evidence_since = now
+        self.frames += 1
+      if self.frames < 4 or now - self.evidence_since < ManualTurnCommit.EVIDENCE_SECONDS:
+        self.frame = frame
+        self.state = 'NAV ENTRY QUALIFY'
+        return curvature
+      self.started = now
+    self.frame = frame
+    self.active = True
+    signed = sign * curvature
+    self.acquired = self.acquired or signed >= ManualTurnCommit.MODEL_AUTHORITY_CURVATURE
+    if self.acquired:
+      self.state = 'NAV MODEL PATH'
+      return curvature
+    # Opposite instantaneous steering is not a reason to force a blind arc.
+    if signed < -ManualTurnCommit.MIN_CURVATURE:
+      self.state = 'NAV MODEL DISAGREES'
+      self.active = False
+      return curvature
+    ramp = min(1., max(0., (now - self.started) / ManualTurnCommit.RAMP_SECONDS))
+    self.floor = min(ManualTurnCommit.SEED_MAX_CURVATURE,
+                     ManualTurnCommit.MAX_ACCEL / cs.vEgo**2,
+                     ManualTurnCommit.geometry_floor(model, sign)) * ramp
+    self.state = 'NAV GEOMETRY SEED'
+    return sign * max(signed, self.floor)

@@ -27,8 +27,9 @@ class CurveComfortTests(unittest.TestCase):
       with self.assertRaises(ValueError):write_curve_comfort('fast',path)
       self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()),['comfort'])
 
-  def test_range_starts_at_previous_mild_and_gets_gentler(self):
-    self.assertEqual(PROFILES['more'].map_lateral_accel,4.2)
+  def test_road_curve_budgets_are_bounded_and_ordered(self):
+    self.assertEqual(PROFILES['more'].map_lateral_accel,1.9)
+    self.assertLessEqual(PROFILES['mild'].map_lateral_accel,2.5)
     for name,corner,decel in [('more',1.6,.6),('standard',1.76,.45),('mild',1.92,.3)]:
       self.assertEqual(PROFILES[name].corner_lateral_accel,corner)
       self.assertEqual(PROFILES[name].corner_max_decel,decel)
@@ -80,8 +81,8 @@ class CurveComfortTests(unittest.TestCase):
       for name in ('more','standard','mild'):
         events=curve_events(samples,comfort=PROFILES[name])
         self.assertEqual(len(events),1)
-        # Independent roots of v^2/100 = the piecewise lateral budget(v).
-        expected = {'more': 14.9915098228, 'standard': 16.5601648536, 'mild': 18.1283170298}
+        # Independent circle geometry at the configured road lateral budgets.
+        expected = {'more': 13.7840487521, 'standard': 14.8323969742, 'mild': 15.8113883008}
         self.assertAlmostEqual(events[0]['target_speed_mps'],expected[name],places=2)
         self.assertEqual(events[0]['comfort_profile'],name)
         controls=build_control_curves(events)
@@ -90,10 +91,14 @@ class CurveComfortTests(unittest.TestCase):
         path.write_text(json.dumps(state))
         cap=map_curve_speed_cap(path,now=101.,v_ego=20.)
         self.assertGreater(cap,last);last=cap
-        # A fresh absolute curve target is speed-independent. With an aged
-        # snapshot, different speed means different travel toward that curve.
+        # Faster approach reserves more response distance; it must not
+        # increase the ceiling. Inside the bend the apex target is fixed.
         fresh_cap=map_curve_speed_cap(path,now=100.,v_ego=20.)
-        self.assertEqual(map_curve_speed_cap(path,now=100.,v_ego=10.),fresh_cap)
+        self.assertGreaterEqual(map_curve_speed_cap(path,now=100.,v_ego=10.),fresh_cap)
+        for curve in state['control_curves']:curve['start_distance_m']=-1.
+        path.write_text(json.dumps(state))
+        self.assertEqual(map_curve_speed_cap(path,now=100.,v_ego=10.),
+                         map_curve_speed_cap(path,now=100.,v_ego=20.))
         self.assertIsNone(map_curve_speed_cap(path,now=103.,v_ego=20.))
         state['enabled']=False;path.write_text(json.dumps(state))
         self.assertIsNone(map_curve_speed_cap(path,now=101.,v_ego=20.))

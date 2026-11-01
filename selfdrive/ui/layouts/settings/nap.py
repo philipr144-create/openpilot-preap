@@ -171,8 +171,8 @@ class NAPLayout(Widget):
     self._curve_comfort_buttons = multiple_button_item(
       "Curve Slowdown",
       "Adjust optional Corner Assist and mapped-curve slowing when those features are enabled. "
-      "More matches the previous Mild setting; Standard and Mild slow progressively less. "
-      "Applies to mapped curves and Corner Assist. Cruise speed, leads and stops still take priority. "
+      "More slows earlier/lower; Standard and Mild allow progressively higher road-curve speeds. "
+      "Map Driving Assist includes forward-path curve checks. Lead and stop requests retain priority. "
       "Changes apply during a trip.",
       buttons=["More", "Standard", "Mild"], button_width=180,
       selected_index=PROFILE_NAMES.index(read_curve_comfort().name),
@@ -219,7 +219,8 @@ class NAPLayout(Widget):
     self._add_toggle(
       NAPParamKeys.ADAPTIVE_ACCEL,
       "Adaptive Accel Limits",
-      "Reduces acceleration authority when close to a lead car to prevent overshoot. Full accel on open road or when closing a large gap.",
+      "Limits added acceleration when the selected following gap is short or vision-lead range is inconsistent. "
+      "Braking requests retain priority. Uses the shared smooth recovery. Changes apply during a trip.",
     )
 
     follow_dist = self._params.get(NAPParamKeys.FOLLOW_DISTANCE, return_default=True)

@@ -13,9 +13,11 @@ HIGH_SPEED_BOOST_MPS2 = 0.20
 FULL_SPEED_MPS = 65.0 / 2.2369362921
 OFF_SPEED_MPS = 80.0 / 2.2369362921
 MIN_SPEED_MPS = 20.0 / 2.2369362921
-TRIGGER_DEG = 2.0
-RELEASE_DEG = 1.25
-MIN_HOLD_SEC = 0.25
+# Gradual road-grade changes in recorded previews stay below two degrees.
+# Require a longer sustained preview to reject brief model fluctuations.
+TRIGGER_DEG = 0.5
+RELEASE_DEG = 0.25
+MIN_HOLD_SEC = 0.5
 MAX_RISE_PER_SEC = 0.12
 MAX_FALL_PER_SEC = 0.20
 SPEED_TOLERANCE_MPS = 0.20  # avoid state chatter on small overshoot at 80 mph

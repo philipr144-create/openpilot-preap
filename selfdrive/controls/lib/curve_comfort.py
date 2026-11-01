@@ -8,8 +8,6 @@ import tempfile
 PROFILE_PATH = '/data/nap_curve_comfort.json'
 PROFILE_NAMES = ('more', 'standard', 'mild')
 DEFAULT_PROFILE = 'standard'
-# Fixed reference preserves the previous Mild road-speed curve exactly.
-MAP_BUDGET_REFERENCE = 4.2
 
 
 @dataclass(frozen=True)
@@ -24,12 +22,11 @@ PROFILES = {
   # corner_lateral_accel controls signaled city-turn CornerAssist.
   # map_lateral_accel controls ordinary Map Driving Assist curve speed.
   #
-  # More is exactly the previous Mild preset for both kinds of curves.
-  # Standard/Mild allow 10%/20% more lateral budget (less optional slowing),
-  # with progressively smaller additional city-turn deceleration limits.
-  'more': CurveComfort('more', 1.6, 4.2, .6),
-  'standard': CurveComfort('standard', 1.76, 4.62, .45),
-  'mild': CurveComfort('mild', 1.92, 5.04, .3),
+  # Ordinary road curves use explicit comfort targets, below the previous
+  # speed-growing 3–5 m/s² budgets. City-turn behavior is unchanged.
+  'more': CurveComfort('more', 1.6, 1.9, .6),
+  'standard': CurveComfort('standard', 1.76, 2.2, .45),
+  'mild': CurveComfort('mild', 1.92, 2.5, .3),
 }
 
 
@@ -65,26 +62,12 @@ def write_curve_comfort(name, path=PROFILE_PATH):
 
 
 def road_curve_speed(curvature, comfort):
-  """Geometry-owned road speed with a speed-dependent comfort budget.
+  """Absolute road-curve target shared by mapped and forward-model geometry.
 
-  Solve v*v*k <= lateral_budget(v). Never feed measured vehicle speed back
-  into the target: a fixed road radius must have a fixed target. City-turn
-  tuning is independent. The fixed reference prevents a preset change from
-  silently rescaling the baseline road-speed curve.
+  A fixed radius has a fixed speed, independent of measured or prior speed.
+  These are optional comfort targets, not physical steering/braking limits.
   """
   import math
   if not math.isfinite(curvature) or not .0018 <= curvature <= .12:
     return None
-  scale = comfort.map_lateral_accel / MAP_BUDGET_REFERENCE
-  def budget(v):
-    points = ((0., 1.6), (13.4112, 2.0), (22.352, 3.4), (31.2928, 4.2))
-    for (v0, a0), (v1, a1) in zip(points, points[1:]):
-      if v <= v1:
-        return scale * (a0 + (a1-a0) * (v-v0)/(v1-v0))
-    return comfort.map_lateral_accel
-  lo, hi = 0., math.sqrt(comfort.map_lateral_accel / curvature)
-  for _ in range(40):
-    mid = (lo+hi)/2
-    if mid*mid*curvature <= budget(mid):lo = mid
-    else:hi = mid
-  return lo
+  return math.sqrt(comfort.map_lateral_accel / curvature)

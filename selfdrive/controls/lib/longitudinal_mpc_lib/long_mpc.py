@@ -352,7 +352,8 @@ class LongitudinalMpc:
   def update(
       self, radarstate, v_cruise,
       personality=log.LongitudinalPersonality.standard,
-      nap_follow_dist=None, max_accel=ACCEL_MAX, preap_accel_profile=False):
+      nap_follow_dist=None, max_accel=ACCEL_MAX, preap_accel_profile=False,
+      cruise_speed_profile=None, lead_constraints=None):
     t_follow = get_T_FOLLOW(personality, nap_follow_dist)
     max_accel = float(np.clip(max_accel, 0.0, ACCEL_MAX))
     v_ego = self.x0[1]
@@ -379,13 +380,38 @@ class LongitudinalMpc:
       max_accel,
     )
 
+    # Transient continuity obstacles tighten each raw lead independently,
+    # then fade within their short horizon. They never zero acceleration
+    # authority or replace a newly closer raw observation.
+    if preap_accel_profile and lead_constraints is not None:
+      for index, constraint in enumerate(lead_constraints[:2]):
+        if constraint is None:
+          continue
+        if not np.isfinite(constraint.duration) or not 0. < constraint.duration <= .75:
+          continue
+        trajectory = self.process_lead(constraint)
+        guarded = trajectory[:,0] + get_stopped_equivalence_factor(trajectory[:,1])
+        raw = lead_0_obstacle if index == 0 else lead_1_obstacle
+        weight = np.clip(1. - T_IDXS/constraint.duration, 0., 1.)
+        bounded = np.minimum(raw, raw - weight*np.maximum(0.,raw-guarded))
+        if index == 0:
+          lead_0_obstacle = bounded
+        else:
+          lead_1_obstacle = bounded
+        self.status = True
+
     # Fake an obstacle for cruise, this ensures smooth acceleration to set speed
     # when the leads are no factor.
     v_lower = v_ego + (T_IDXS * cruise_min_accel * 1.05)
     # TODO does this make sense when max_a is negative?
     v_upper = v_ego + (T_IDXS * cruise_max_accel * 1.05)
 
-    v_cruise_clipped = np.clip(v_cruise * np.ones(N+1), v_lower, v_upper)
+    cruise_reference = v_cruise * np.ones(N+1)
+    if preap_accel_profile and cruise_speed_profile is not None:
+      profile = np.asarray(cruise_speed_profile, dtype=float)
+      if profile.shape == (N+1,) and np.all(np.isfinite(profile)) and np.all(profile >= 0.):
+        cruise_reference = np.minimum(cruise_reference, profile)
+    v_cruise_clipped = np.clip(cruise_reference, v_lower, v_upper)
     cruise_obstacle = np.cumsum(T_DIFFS * v_cruise_clipped) + get_safe_obstacle_distance(v_cruise_clipped, t_follow)
 
     x_obstacles = np.column_stack([lead_0_obstacle, lead_1_obstacle, cruise_obstacle])

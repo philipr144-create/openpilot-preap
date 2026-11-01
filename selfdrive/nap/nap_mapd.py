@@ -831,30 +831,35 @@ def signed_curvature(p0, p1, p2):
 
 
 def curvature_samples(samples):
-  if len(samples) < 7:
+  """Heading change per travelled meter, with coarse-map vertex rejection.
+
+  A polygon vertex is not a tiny circular road arc. Spread small heading
+  changes over 120 m; retain the shorter 50 m scale for substantial turns.
+  Long constant-radius bends are invariant to either measurement scale.
+  """
+  if len(samples) < 13:
     return []
-
-  half_n = max(
-    2,
-    int(round(
-      CURVATURE_HALF_WINDOW_M / RESAMPLE_M
-    )),
-  )
-
+  headings = []
+  for a,b in zip(samples,samples[1:]):
+    theta = math.atan2(b['y']-a['y'],b['x']-a['x'])
+    if headings:
+      theta = headings[-1] + (theta-headings[-1]+math.pi)%(2.*math.pi)-math.pi
+    headings.append(theta)
   out = []
-
-  for i in range(half_n, len(samples) - half_n):
-    p0 = samples[i - half_n]
-    p1 = samples[i]
-    p2 = samples[i + half_n]
-
-    k = signed_curvature(p0, p1, p2)
-
-    out.append({
-      "distance": p1["distance"],
-      "curvature": k,
-    })
-
+  # Smoothed derivatives of the unwrapped heading profile. At the edge,
+  # use the available centered span rather than manufacturing a straight.
+  for i in range(5,len(samples)-5):
+    def measure(half):
+      lo,hi = max(0,i-half),min(len(headings)-1,i+half-1)
+      distance = (hi-lo)*RESAMPLE_M
+      if distance <= 0.:return 0.,0.
+      turn = headings[hi]-headings[lo]
+      return turn/distance,abs(turn)
+    narrow,turn = measure(5)
+    broad,_ = measure(12)
+    weight = max(0.,min(1.,(turn-math.radians(12.))/math.radians(12.)))
+    k = broad*(1.-weight)+narrow*weight
+    out.append(dict(distance=samples[i]['distance'],curvature=k))
   return out
 
 
@@ -1454,6 +1459,10 @@ class NapMapD:
       "route_point_count": len(route_points),
       "control_curve": control_curve,
       "control_curves": control_curves[:10],
+      # Full spatial shape feeds the MPC; event percentiles remain UI only.
+      "road_curvature_version": 1,
+      "road_curvature_valid": not path_ambiguous or route_guided,
+      "road_curvature": curvature_samples(samples)[:96],
       "curves": curves[:10],
       # Informational only in v2.
       "events": events[:12],

@@ -136,6 +136,42 @@ class ExperimentalCruiseSmoother:
     return max(lower, min(upper, min(request, value))) if capture_active and previous >= 0. and request >= 0. else value
 
 
+class MovingEngagement:
+  """One moving stalk-enable handoff; pedal overrides cannot rearm it.
+
+  Use the already selected, bounded positive request instead of fabricating
+  a zero-command history. Existing actuator jerk/pedal limits still apply.
+  Consume on the first active frame, including denied/braking cases: no
+  delayed propulsion event may survive a stop, lead or invalid input.
+  """
+  def __init__(self):
+    self.requested = False
+    self.pending = False
+
+  def update(self, *, requested, active, request, speed, cruise, accel,
+             lower, upper, personality, priority, capture):
+    if not requested:
+      self.pending = False
+    elif not self.requested:
+      self.pending = True
+    self.requested = bool(requested)
+    if not self.pending or not active:
+      return None
+    self.pending = False
+    if (priority != 'ORDINARY' or not capture
+        or not all(math.isfinite(v) for v in (request, speed, cruise, accel, lower, upper))
+        or lower > upper or speed < 5. or request <= 0. or upper <= 0.):
+      return None
+    # Do not acquire propulsion near set speed. Use the same stopping-distance
+    # capture bound as the unified smoother, before any state is seeded.
+    gap = cruise - speed - .45 * max(0., accel)
+    if gap <= .5:
+      return None
+    p = personality_index(personality)
+    decel = .50 if p == 1 else DECEL_JERK.get(p, .6)
+    return max(lower, min(upper, request, math.sqrt(2. * decel * gap)))
+
+
 class UnifiedCruiseSmoother:
   """Shared Pre-AP final command shaping across modes and speed constraints.
 
@@ -150,7 +186,7 @@ class UnifiedCruiseSmoother:
     self.filtered_accel = None
 
   def update(self, request, previous, dt, personality, speed, cruise, accel,
-             lower, upper, priority='ORDINARY', capture=True):
+             lower, upper, priority='ORDINARY', capture=True, grade_support=0.):
     if (not all(math.isfinite(v) for v in (request, previous, dt, speed, cruise, accel, lower, upper))
         or not 0 < dt <= .1 or lower > upper):
       self.reset()
@@ -169,7 +205,13 @@ class UnifiedCruiseSmoother:
       gap = max(0., cruise - speed - .45 * max(0., self.filtered_accel))
       capture_cap = math.sqrt(2. * decel * gap)
       if request > 0.:
-        request = min(request, capture_cap)
+        # The planner's bounded, permitted hill-load request is distinct from
+        # ordinary catch-up acceleration. Capturing the whole request at zero
+        # speed error erased predictive support before the climb arrived.
+        # Keep the common slew/profile limits and never create a braking bypass.
+        support = (min(.35, max(0., grade_support))
+                   if math.isfinite(grade_support) and speed <= cruise + .12 else 0.)
+        request = min(request, capture_cap + support)
       # Actual overspeed is an explicit constraint, not ordinary capture.
       if speed > cruise + .5:
         request = min(request, 0.)

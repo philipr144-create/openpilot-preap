@@ -127,7 +127,7 @@ procs = [
   PythonProcess("statsd", "system.statsd", always_run),
   PythonProcess("feedbackd", "selfdrive.ui.feedback.feedbackd", only_onroad),
   PythonProcess("server_v21", "server.server_v21", always_run, restart_if_crash=True),
-  PythonProcess("nap_tailscaled", "server.tailscaled_daemon", always_run),
+  PythonProcess("nap_tailscaled", "server.tailscaled_daemon", always_run, restart_if_crash=True),
   PythonProcess("nap_sentry_monitor", "server.sentry_worker", sentry_monitor),
   PythonProcess("nap_sentry_encoder", "server.sentry_encoder", sentry_stream),
   PythonProcess("nap_sentry_webrtc", "server.nap_sentry", sentry_only),
