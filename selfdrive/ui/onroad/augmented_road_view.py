@@ -13,6 +13,7 @@ from openpilot.selfdrive.ui.onroad.alert_renderer import AlertRenderer
 from openpilot.selfdrive.ui.onroad.driver_state import DriverStateRenderer
 from openpilot.selfdrive.ui.onroad.hud_renderer import HudRenderer
 from openpilot.selfdrive.ui.onroad.model_renderer import ModelRenderer
+from openpilot.selfdrive.ui.onroad.vision_leads import VisionLeadOverlay
 from openpilot.selfdrive.ui.onroad.cameraview import CameraView
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.widgets.label import gui_label
@@ -52,6 +53,7 @@ class AugmentedRoadView(CameraView):
     self._content_rect = rl.Rectangle()
 
     self.model_renderer = ModelRenderer()
+    self.vision_lead_overlay = VisionLeadOverlay(self.model_renderer)
     self._hud_renderer = HudRenderer()
     self.alert_renderer = AlertRenderer()
     # NAP HUD: keep driver-monitoring graphics in the upper obscured region.
@@ -100,6 +102,7 @@ class AugmentedRoadView(CameraView):
 
     # Draw all UI overlays
     self.model_renderer.render(self._content_rect)
+    self.vision_lead_overlay.render(self._content_rect)
     self._hud_renderer.render(self._content_rect)
     self.alert_renderer.render(self._content_rect)
     self.driver_state_renderer.render(self._content_rect)

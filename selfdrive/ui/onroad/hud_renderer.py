@@ -100,8 +100,8 @@ class FontSizes:
   speed_unit: int = 66
   max_speed: int = 40
   set_speed: int = 90
-  ctrl_btn: int = 90
-  ctrl_lbl: int = 55
+  ctrl_btn: int = 64
+  ctrl_lbl: int = 42
 
 @dataclass(frozen=True)
 class Colors:
@@ -175,7 +175,7 @@ class HudRenderer(Widget):
     self._nav_checked = now
     nav = self._read_nav_file('/dev/shm/nap_navigation_desire.json', now, 'received_mono')
     if not nav or not nav.get('route_active'):
-      self._nav_view = ('NAVIGATION', 'NO ACTIVE ROUTE', '', 'Set a destination on the phone')
+      self._nav_view = None
       self._nav_map = ''
       return
     if nav.get('route_state') != 'active' or now >= nav.get('expires_mono', 0):
@@ -231,6 +231,11 @@ class HudRenderer(Widget):
                        f'{count} mapped stops ahead' if state == 'ready' else 'Mapped stops: waiting for lookup')
     self._nav_view = (direction, away, title[:42], detail[:52])
 
+  @staticmethod
+  def _fit_text(font, text, size, width):
+    measured = measure_text_cached(font, text, size).x
+    return min(size, size * width / max(1, measured))
+
   def _draw_nav_view(self, rect):
     self._update_nav_view()
     if self._nav_view is None:
@@ -238,12 +243,12 @@ class HudRenderer(Widget):
 
     direction, away, title, detail = self._nav_view
 
-    # Navigation occupies the right-hand card position.
-    width = min(680, rect.width - 120)
-    height = 275
+    # Navigation and driving intent share one compact left-side column.
+    width = min(700, rect.width - 120)
+    height = 440
     box = rl.Rectangle(
-      rect.x + rect.width - width - 60,
-      rect.y + 260,
+      rect.x + 60,
+      rect.y + 40,
       width,
       height,
     )
@@ -258,38 +263,38 @@ class HudRenderer(Widget):
       self._font_bold,
       ({'LEFT': '<  LEFT', 'RIGHT': 'RIGHT  >'}.get(direction, direction))[:12],
       rl.Vector2(box.x + 24, box.y + 14),
-      58, 0, COLORS.WHITE,
+      44, 0, COLORS.WHITE,
     )
 
     rl.draw_text_ex(
       self._font_bold,
       away[:20],
-      rl.Vector2(box.x + 24, box.y + 78),
-      56, 0, COLORS.BTN_ACTIVE,
+      rl.Vector2(box.x + 24, box.y + 62),
+      44, 0, COLORS.BTN_ACTIVE,
     )
 
     # Street/maneuver description.
     rl.draw_text_ex(
       self._font_semi_bold,
-      title[:38],
-      rl.Vector2(box.x + 24, box.y + 145),
-      30, 0, COLORS.WHITE,
+      title[:34],
+      rl.Vector2(box.x + 24, box.y + 111),
+      self._fit_text(self._font_semi_bold, title[:34], 28, width - 48), 0, COLORS.WHITE,
     )
 
     # Navigation/signal state.
     rl.draw_text_ex(
       self._font_medium,
-      detail[:48],
-      rl.Vector2(box.x + 24, box.y + 191),
-      25, 0, COLORS.GREY,
+      detail[:46],
+      rl.Vector2(box.x + 24, box.y + 151),
+      self._fit_text(self._font_medium, detail[:46], 22, width - 48), 0, COLORS.GREY,
     )
 
     # Map/stop information.
     rl.draw_text_ex(
       self._font_medium,
       self._nav_map[:48],
-      rl.Vector2(box.x + 24, box.y + 229),
-      23, 0, COLORS.GREY,
+      rl.Vector2(box.x + 24, box.y + 184),
+      22, 0, COLORS.GREY,
     )
 
     now = time.monotonic()
@@ -442,37 +447,40 @@ class HudRenderer(Widget):
       'cruise': COLORS.BTN_ACTIVE,
     }
     accent = colors.get(self._intent_kind, COLORS.WHITE)
-    width = min(980, rect.width - 120)
-    height = 250
-    # Driving intentions occupy the driver's visible left-hand position.
-    box = rl.Rectangle(rect.x + 60, rect.y + 235, width, height)
+    width = min(700, rect.width - 120)
+    height = 200
+    top = 280 if self._nav_view is not None else 40
+    box = rl.Rectangle(rect.x + 60, rect.y + top, width, height)
 
-    rl.draw_rectangle_rounded(box, .10, 10, rl.Color(0, 0, 0, 220))
-    rl.draw_rectangle_rounded_lines_ex(box, .10, 10, 5, accent)
+    if self._nav_view is None:
+      rl.draw_rectangle_rounded(box, .10, 10, rl.Color(0, 0, 0, 220))
+      rl.draw_rectangle_rounded_lines_ex(box, .10, 10, 5, accent)
     rl.draw_rectangle_rounded(
       rl.Rectangle(box.x + 16, box.y + 18, 10, box.height - 36),
       .8, 8, accent,
     )
 
-    rl.draw_text_ex(self._font_bold, self._intent_title[:24],
-                    rl.Vector2(box.x + 48, box.y + 20), 64, 0, accent)
+    title = ('TURN REQUESTED' if self._nav_view is not None and self._intent_source == 'NAVIGATION'
+             else self._intent_title[:24])
+    rl.draw_text_ex(self._font_bold, title,
+                    rl.Vector2(box.x + 38, box.y + 16), self._fit_text(self._font_bold, title, 44, width - 76), 0, accent)
 
     source_text = self._intent_source[:22]
-    source_w = measure_text_cached(self._font_semi_bold, source_text, 28).x + 34
-    source_box = rl.Rectangle(box.x + 48, box.y + 91, source_w, 44)
+    source_w = measure_text_cached(self._font_semi_bold, source_text, 24).x + 34
+    source_box = rl.Rectangle(box.x + 38, box.y + 69, source_w, 36)
     rl.draw_rectangle_rounded(source_box, .45, 8, rl.Color(accent.r, accent.g, accent.b, 95))
     rl.draw_text_ex(self._font_semi_bold, source_text,
-                    rl.Vector2(source_box.x + 17, source_box.y + 6), 28, 0, accent)
+                    rl.Vector2(source_box.x + 17, source_box.y + 6), 24, 0, accent)
 
-    rl.draw_text_ex(self._font_medium, self._intent_detail[:48],
-                    rl.Vector2(box.x + 48, box.y + 147), 28, 0, COLORS.GREY)
+    rl.draw_text_ex(self._font_medium, self._intent_detail[:46],
+                    rl.Vector2(box.x + 38, box.y + 119), self._fit_text(self._font_medium, self._intent_detail[:46], 24, width - 76), 0, COLORS.GREY)
 
     metrics = []
     if self._intent_target is not None:
       unit = 'KM/H' if ui_state.is_metric else 'MPH'
       metrics.append(f'PLAN {round(self._intent_target):.0f} {unit}')
     if self._intent_accel <= -0.05:
-      metrics.append(f'DECEL REQUEST {self._intent_accel:.1f} m/s²')
+      metrics.append(f'DECEL {self._intent_accel:.1f} m/s²')
     elif self._intent_accel >= 0.05:
       metrics.append(f'ACCEL {self._intent_accel:.1f} m/s²')
     else:
@@ -480,7 +488,7 @@ class HudRenderer(Widget):
     if self._intent_lead is not None and self._intent_source != 'LEAD':
       metrics.append(f'LEAD {self._intent_lead:.0f} FT')
     rl.draw_text_ex(self._font_semi_bold, '   ·   '.join(metrics)[:64],
-                    rl.Vector2(box.x + 48, box.y + 199), 27, 0, COLORS.WHITE)
+                    rl.Vector2(box.x + 38, box.y + 160), self._fit_text(self._font_semi_bold, '   ·   '.join(metrics)[:64], 23, width - 76), 0, COLORS.WHITE)
 
   def _draw_engagement_stats(self, rect: rl.Rectangle) -> None:
     stats = ui_state.engagement_stats
@@ -488,7 +496,7 @@ class HudRenderer(Widget):
       return
     snapshot = stats.snapshot()
     text = hud_text(snapshot)
-    width = min(1040., rect.width - 330.)
+    width = min(570., rect.width / 2 - 250.)
     if width < 400.:
       return
     box = rl.Rectangle(rect.x + 60., rect.y + rect.height - 82., width, 58.)
@@ -496,7 +504,7 @@ class HudRenderer(Widget):
     size = 30
     extent = measure_text_cached(self._font_medium, text, size)
     if extent.x > width - 36.:
-      size = max(18, int(size * (width - 36.) / extent.x))
+      size = size * (width - 36.) / extent.x
       extent = measure_text_cached(self._font_medium, text, size)
     rl.draw_text_ex(self._font_medium, text,
                     rl.Vector2(box.x + 18., box.y + (box.height - extent.y) / 2.),
@@ -541,7 +549,8 @@ class HudRenderer(Widget):
 
   def _draw_onscreen_controls(self, rect: rl.Rectangle) -> None:
     x = rect.x + 60
-    btn_w = 140; lbl_w = 320; h = 130; gap = 25
+    btn_w = 110; gap = 20; h = 100
+    lbl_w = min(570, rect.width / 2 - 250) - 2 * (btn_w + gap)
     # NAP HUD: controls form a visible left-side stack below driving intentions.
     base_y = rect.y + rect.height - h - 105
     
@@ -573,13 +582,14 @@ class HudRenderer(Widget):
   def _draw_label(self, r: rl.Rectangle, text: str) -> None:
     rl.draw_rectangle_rounded(r, 0.35, 10, COLORS.BLACK_TRANSLUCENT)
     rl.draw_rectangle_rounded_lines_ex(r, 0.35, 10, 4, COLORS.BORDER_TRANSLUCENT)
-    w = measure_text_cached(self._font_semi_bold, text, FONT_SIZES.ctrl_lbl).x
-    rl.draw_text_ex(self._font_semi_bold, text, rl.Vector2(r.x + (r.width - w) / 2, r.y + 35), FONT_SIZES.ctrl_lbl, 0, COLORS.WHITE)
+    size = self._fit_text(self._font_semi_bold, text, FONT_SIZES.ctrl_lbl, r.width - 24)
+    w = measure_text_cached(self._font_semi_bold, text, size).x
+    rl.draw_text_ex(self._font_semi_bold, text, rl.Vector2(r.x + (r.width - w) / 2, r.y + 26), size, 0, COLORS.WHITE)
 
   def user_interacting(self) -> bool: return self._exp_button.is_pressed or (self._btn_pressed is not None)
   def _draw_set_speed(self, rect: rl.Rectangle) -> None:
     set_speed_width = UI_CONFIG.set_speed_width_metric if ui_state.is_metric else UI_CONFIG.set_speed_width_imperial
-    x = rect.x + UI_CONFIG.border_size + UI_CONFIG.button_size + 40
+    x = rect.x + rect.width / 2 + 170
     y = rect.y + rect.height - UI_CONFIG.border_size - UI_CONFIG.set_speed_height
     set_speed_rect = rl.Rectangle(x, y, set_speed_width, UI_CONFIG.set_speed_height)
     rl.draw_rectangle_rounded(set_speed_rect, 0.35, 10, COLORS.BLACK_TRANSLUCENT)

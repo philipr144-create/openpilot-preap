@@ -14,7 +14,7 @@ import time
 
 from openpilot.common.constants import CV
 from openpilot.selfdrive.controls.lib.turn_steering_gate import matching_signal
-from openpilot.selfdrive.controls.lib.turn_context import driver_braking, paired_decision, manual_turn_intent
+from openpilot.selfdrive.controls.lib.turn_context import driver_braking, paired_decision, manual_turn_intent, city_turns_enabled, navigation_turn_intent
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 
@@ -70,6 +70,7 @@ class NavigationTurnCommit:
       return
 
     self.last_read = now
+    self.city_enabled = city_turns_enabled(self.params)
     self.decision = None
 
     try:
@@ -119,6 +120,49 @@ class NavigationTurnCommit:
     self.floor = 0.0
     self.model_curvature = float(curvature)
     self.output_curvature = float(curvature)
+
+    d = self.decision if isinstance(self.decision, dict) else {}
+    nav_key = (d.get('route_id'), d.get('maneuver_id'))
+    if not hasattr(self, '_cancelled_navigation_keys'):
+      self._cancelled_navigation_keys = set()
+    if all(isinstance(v, str) and v for v in nav_key):
+      if CS.steeringPressed or getattr(CS, 'steeringDisengage', False):
+        self._cancelled_navigation_keys.add(nav_key)
+      if nav_key in self._cancelled_navigation_keys:
+        self.manual.cancel()
+        self.navigation_geometry.suspend()
+        self.driver_assisting = False
+        self.reacquire_start = None
+        self.state = 'NAVIGATION CANCELLED BY DRIVER'
+        return curvature
+
+    if not getattr(self, 'city_enabled', False):
+      self.manual.cancel()
+      self.navigation_geometry.suspend()
+      self.manual_veto_direction = 0
+      self.manual_veto_until = -math.inf
+      self.driver_assisting = False
+      self.reacquire_start = None
+      self.state = 'CITY TURNS OFF'
+      return curvature
+
+    nav_turn=self.decision.get('navigation_turn') if isinstance(self.decision,dict) else None
+    nav_request=nav_turn.get('request') if isinstance(nav_turn,dict) else None
+    identity=('navigation',nav_request.get('key') if isinstance(nav_request,dict) else None) if isinstance(nav_turn,dict) else ('driver',None)
+    if identity!=getattr(self,'_city_identity',None):
+      self.manual.reset();self.manual.blocked=False;self._city_identity=identity
+    if isinstance(nav_turn,dict):
+      # Navigation uses the same acquired-path executor, with explicit owner
+      # validation below. It never pretends to be a physical driver request.
+      self.navigation_geometry.suspend()
+      if not self.enabled:
+        self.manual.cancel()
+        self.state='NAVIGATION OFF'
+        return curvature
+      output=self.manual.update(curvature,CS,lat_active,self.decision,model,healthy,actual_curvature,now)
+      self.active=self.manual.active;self.state='NAV SHARED '+self.manual.state
+      self.side=self.manual.side;self.floor=self.manual.floor;self.output_curvature=output
+      return output
 
     manual_output = self.manual.update(curvature, CS, lat_active, self.decision,
                                        model, healthy, actual_curvature, now)
@@ -748,7 +792,8 @@ class ManualTurnCommit:
     self.last_time = now
     self.active = False
     one = bool(cs.leftBlinker) != bool(cs.rightBlinker)
-    if not cs.leftBlinker and not cs.rightBlinker:
+    nav_ok = navigation_turn_intent(cs,decision,model,now) if isinstance(decision,dict) else False
+    if not cs.leftBlinker and not cs.rightBlinker and not nav_ok:
       self.blocked = False
       self.reset()
       return curvature
@@ -760,7 +805,11 @@ class ManualTurnCommit:
       self.suspend()
       self.state = "MANUAL WAIT DECISION"
       return curvature
-    direction = decision.get('manual_turn_direction')
+    nav=decision.get('navigation_turn')
+    nav_request=nav.get('request') if isinstance(nav,dict) else None
+    life=nav.get('lifecycle',{}) if isinstance(nav,dict) else {}
+    nav_ok=navigation_turn_intent(cs,decision,model,now)
+    direction=nav_request.get('direction') if isinstance(nav_request,dict) else decision.get('manual_turn_direction')
     sign = -1.0 if direction == 1 else 1.0
     expected = 'turnLeft' if direction == 1 else 'turnRight'
     stamp = decision.get('received_mono')
@@ -773,7 +822,7 @@ class ManualTurnCommit:
       self.suspend()
       self.state = "MANUAL WAIT FRESH DATA"
       return curvature
-    phase = decision.get('manual_turn_phase')
+    phase=life.get('phase') if isinstance(nav,dict) else decision.get('manual_turn_phase')
     if phase is not None and phase not in ('TURN', 'EXIT'):
       if phase in ('COMPLETE', 'CANCELLED'):
         self.cancel()
@@ -785,26 +834,26 @@ class ManualTurnCommit:
       self.suspend()
       self.state = "MANUAL STOP WAIT"
       return curvature
-    if (not healthy or not lat_active or not one or not fresh or not paired
+    if (not healthy or not lat_active or (not one and not nav_ok) or not fresh or not paired
         or not 0 <= dt <= 0.1 or self.blocked
         or type(direction) is not int or direction not in (1, 2)
-        or (direction == 1) != bool(cs.leftBlinker)
+        or (not nav_ok and (direction == 1) != bool(cs.leftBlinker))
         or decision.get('city_turns_enabled') is not True
         # Physical ownership plus the independent near-corner dwell authorizes
         # the seed; model selection must not be a prerequisite for correcting it.
-        or decision.get('source') not in ('none', 'driver_desire_helper')
+        or not (nav_ok if isinstance(nav,dict) else decision.get('source') in ('none', 'driver_desire_helper')
+                and decision.get('signal_owner')=='driver'
+                and decision.get('synthetic_indicator_request')=='none')
         or decision.get('final_desire') not in ('none', expected)
-        or decision.get('manual_turn_blocked') is True
+        or (life.get('blocked') if isinstance(nav,dict) else decision.get('manual_turn_blocked')) is True
         or decision.get('model_evaluated') is not True
-        or decision.get('signal_owner') != 'driver'
         or decision.get('tap_signal_active') is not False
-        or decision.get('synthetic_indicator_request') != 'none'
         or cs.steeringPressed or getattr(cs, 'steeringDisengage', False)
         or not cs.canValid
         or str(cs.gearShifter) not in ('drive', 'low', 'sport', 'eco')
         or (cs.leftBlindspot if direction == 1 else cs.rightBlindspot)
         or not all(math.isfinite(v) for v in (cs.vEgo, curvature, actual_curvature))
-        or not -0.1 <= cs.vEgo <= (CONTINUE_SPEED_MPH if self.started is not None else COMMIT_SPEED_MPH) * CV.MPH_TO_MS
+        or not -0.1 <= cs.vEgo <= 40.0 * CV.MPH_TO_MS
 ):
       self.cancel()
       return curvature
@@ -1009,16 +1058,29 @@ class ManualTurnCommit:
 
 
 
-class ManualTurnEntry:
-  """Bounded model conditioning from qualified physical driver intent.
+class CityTurnIntent:
+  """Motion-bounded model conditioning from qualified physical driver intent.
 
-  Below 5 mph, a sustained classified hold may request a direction before
-  matching geometry exists. This conditions the model only. Positive added
-  steering retains ManualTurnCommit's independent near-path checks.
+  A sustained classified hold may condition the model before matching geometry
+  exists below 5 mph, or on a qualified slowing approach at or below 25 mph.
+  Positive added steering retains ManualTurnCommit's independent near-path
+  checks; conditioning can still change ordinary model-following steering.
+  Fresh low-speed waiting preserves pending intent without spending the moving
+  search budget. It is a motion heuristic, not traffic-light recognition.
   """
 
   LOW_INTENT_START_SPEED = 5.0 * CV.MPH_TO_MS
-  LOW_INTENT_MAX_DISTANCE = 25.0
+  LOW_INTENT_MAX_DISTANCE = 100.0
+  # Offline candidate admission limits; not validated for deployment.
+  ROLLING_INTENT_START_SPEED = 25.0 * CV.MPH_TO_MS
+  ROLLING_APPROACH_SECONDS = 1.5
+  ROLLING_APPROACH_SPEED_DROP = 0.5
+  ROLLING_APPROACH_HOLD_SECONDS = 1.0
+  ROLLING_APPROACH_REBOUND = 0.25
+  QUEUE_ENTER_SPEED = 5.0 * CV.MPH_TO_MS
+  QUEUE_EXIT_SPEED = 6.0 * CV.MPH_TO_MS
+  QUEUE_TURN_HEADING = math.radians(3)
+  QUEUE_TURN_CURVATURE = .008
 
   def __init__(self):
     self.reset()
@@ -1045,29 +1107,52 @@ class ManualTurnEntry:
     self.started_from_stop = False
     self.intent_distance = 0.0
     self.intent_path_acquired = False
+    self.turn_locked = False
+    self.approach_samples = []
+    self.last_slowing = None
+    self.last_slowing_speed = None
+    self.authorization_trace = {}
+    self.queue_waiting = False
+    self.physical_turn_started = False
+    self.search_elapsed = 0.
+    self.search_distance = 0.
+    self.active_elapsed = 0.
+    self.waiting_elapsed = 0.
+    self.intent_origin = 'none'
+    self.turn_started = None
+    self.last_gates = {}
+    self.last_event = None
+    self.peak_actual_curvature = 0.
+    self.exit_mode = None
 
-  def suspend(self):
+  def suspend(self, reason="FRESH_EVIDENCE_REQUIRED"):
     """Yield all added authority; require fresh evidence without a signal reset."""
     blocked = self.blocked
+    event = self.event(reason)
     self.reset()
     self.blocked = blocked
+    self.last_event = event
     self.phase = 'CANCELLED' if blocked else 'WAIT'
-    self.reason = 'FRESH_EVIDENCE_REQUIRED'
+    self.reason = reason
 
-  def cancel(self):
-    # An interrupted approach is not a completed/cancelled turn. Discard its
-    # evidence and require a full fresh dwell, but permit early signaling.
-    blocked = self.blocked or self.started is not None
+  def cancel(self, reason="AUTHORIZATION_LOST"):
+    # Unaccepted approach evidence can qualify afresh. Revocation of an accepted
+    # stopped or moving request remains latched until the signal is neutral.
+    blocked = self.blocked or self.started is not None or self.stop_armed
+    event = self.event(reason)
     self.reset()
     self.blocked = blocked
+    self.last_event = event
     self.phase = 'CANCELLED' if blocked else 'WAIT'
-    self.reason = 'AUTHORIZATION_OR_PATH_LOST'
+    self.reason = reason
 
-  def complete(self):
+  def complete(self, reason='NEAR_PATH_STRAIGHT'):
+    event = self.event(reason)
     self.reset()
+    self.last_event = event
     self.blocked = True
     self.phase = 'COMPLETE'
-    self.reason = 'NEAR_PATH_STRAIGHT'
+    self.reason = reason
 
   @staticmethod
   def obvious_future_corner(model, sign):
@@ -1095,24 +1180,27 @@ class ManualTurnEntry:
     except (AttributeError, TypeError, ValueError, OverflowError):
       return False
 
-  def update(self, model, direction, speed, authorized, now, driver_assisting=False, transient_unavailable=False, actual_curvature=None):
+  def update(self, model, direction, speed, authorized, now, driver_assisting=False, transient_unavailable=False, actual_curvature=None, stationary_wait=False):
+    self.current_frame = getattr(model, 'frameId', None)
+    self.current_time = now
     if self.blocked:
       return False
     if driver_assisting:
-      self.cancel()
+      self.cancel('DRIVER_OVERRIDE')
       return False
     if transient_unavailable:
-      self.suspend()
+      self.suspend('INPUTS_UNAVAILABLE')
       return False
-    # Lateral may naturally become inactive at standstill. Drop the motion
-    # commitment before checking authorization, so a normal stop cannot latch
-    # the signal out. Rollout still requires engagement and fresh evidence.
-    if self.started is not None and math.isfinite(speed) and speed <= 0.3:
+    # Stopping after physical turn entry still relinquishes the old motion
+    # commitment. Before entry, a normal queue stop retains pending intent.
+    if self.started is not None and self.physical_turn_started and math.isfinite(speed) and speed <= 0.3:
       self.suspend()
-    if (not authorized or self.blocked or not math.isfinite(speed)
-        or not -0.1 <= speed <= (CONTINUE_SPEED_MPH if self.started is not None else COMMIT_SPEED_MPH) * CV.MPH_TO_MS
+    stationary_wait = bool(stationary_wait and math.isfinite(speed) and speed <= .3
+                           and not self.physical_turn_started)
+    if ((not authorized and not stationary_wait) or self.blocked or not math.isfinite(speed)
+        or not -0.1 <= speed <= (CONTINUE_SPEED_MPH if self.started is not None else 40.0) * CV.MPH_TO_MS
         or self.direction not in (0, direction)):
-      self.cancel()
+      self.cancel('AUTHORIZATION_LOST' if not authorized else 'SPEED_OR_DIRECTION_INVALID')
       return False
     self.direction = direction
     sign = -1 if direction == 1 else 1
@@ -1123,43 +1211,80 @@ class ManualTurnEntry:
       continuing=self.started is not None,
     )
     if evidence is None:
-      self.suspend()
+      self.suspend('MODEL_GEOMETRY_UNAVAILABLE')
       return False
+    self.last_gates = {'path_credible': bool(evidence[0]), 'signed_heading_deg': math.degrees(evidence[1]),
+                       'signed_model_curvature': evidence[2]}
     frame = getattr(model, 'frameId', None)
     if type(frame) is not int:
-      self.cancel()
+      self.cancel('MODEL_FRAME_INVALID')
       return False
     if self.last_frame_time is not None and not 0 <= now - self.last_frame_time <= 0.15:
-      self.suspend()
+      self.suspend('MODEL_FRAME_STALE')
       return False
     if frame != self.frame:
       if self.frame is not None and frame < self.frame:
-        self.cancel()
+        self.cancel('MODEL_FRAME_REGRESSED')
         return False
       dt = 0.0 if self.motion_time is None else now - self.motion_time
       self.motion_time = now
+      was_waiting = self.queue_waiting
+      measured_curvature = actual_curvature is not None and math.isfinite(actual_curvature)
+      turning_curvature = measured_curvature and abs(actual_curvature) >= self.QUEUE_TURN_CURVATURE
       if self.started is not None and 0 <= dt <= .15:
         self.intent_distance += max(0.0, speed) * dt
-        if actual_curvature is not None and math.isfinite(actual_curvature):
+        if measured_curvature and (not was_waiting or speed > self.QUEUE_EXIT_SPEED or turning_curvature):
           self.heading += sign * actual_curvature * max(0.0, speed) * dt
-      if (self.started_from_stop and
-          (self.heading < -math.radians(5) or
-           not self.intent_path_acquired and self.intent_distance > self.LOW_INTENT_MAX_DISTANCE)):
-        self.cancel()
+          self.peak_actual_curvature = max(self.peak_actual_curvature, sign*actual_curvature)
+        # A brief steering correction in a queue is not proof of turn entry.
+        # Require observed heading change before permanently ending waiting.
+        if abs(self.heading) >= self.QUEUE_TURN_HEADING:
+          self.physical_turn_started = True
+      queue_speed = self.QUEUE_EXIT_SPEED if was_waiting else self.QUEUE_ENTER_SPEED
+      self.queue_waiting = (not self.physical_turn_started and self.turn_started is None
+                            and speed <= queue_speed and (speed <= .3 or measured_curvature))
+      if 0 <= dt <= .15:
+        if self.queue_waiting and was_waiting:
+          if self.started is not None or self.stop_armed:
+            self.waiting_elapsed += dt
+        elif self.started is not None:
+          self.active_elapsed += dt
+          if self.turn_started is None:
+            self.search_elapsed += dt
+            self.search_distance += max(0.0, speed) * dt
+      if self.started_from_stop and self.heading < -math.radians(5):
+        self.cancel('WRONG_WAY_MOTION')
         return False
+      if self.started is not None and self.turn_started is None and self.search_distance > self.LOW_INTENT_MAX_DISTANCE:
+        self.cancel('SEARCH_DISTANCE_EXPIRED')
+        return False
+      if stationary_wait:
+        self.frame, self.last_frame_time = frame, now
+        self.phase, self.reason = 'ARMED', 'WAITING_FOR_ENGAGEMENT'
+        return False
+      # Model conditioning can precede physical turn entry. Keep separate
+      # bounded clocks so early conditioning does not consume turn completion.
+      if (self.started is not None and self.turn_started is None
+          and self.heading >= ManualTurnCommit.EXIT_MIN_HEADING and evidence[0]):
+        self.turn_started = now
       # Clear model conditioning as well as added steering when the near path
       # straightens after observed turning. A distant next bend must not retain
       # the completed city-turn desire while the stalk remains held.
-      if (self.started is not None and self.heading >= ManualTurnCommit.EXIT_MIN_HEADING
-          and ManualTurnCommit.turn_exit_evidence(model, getattr(getattr(model, 'action', None), 'desiredCurvature', float('nan')))):
-        if self.exit_since is None:
+      straight_exit = (self.started is not None and self.heading >= ManualTurnCommit.EXIT_MIN_HEADING
+                       and ManualTurnCommit.turn_exit_evidence(model, getattr(getattr(model, 'action', None), 'desiredCurvature', float('nan'))))
+      curved_exit = self.curved_exit_evidence(model, actual_curvature, sign)
+      exit_mode = 'NEAR_PATH_STRAIGHT' if straight_exit else 'UNWOUND_ALIGNED_EXIT' if curved_exit else None
+      if exit_mode is not None:
+        if self.exit_since is None or self.exit_mode != exit_mode:
           self.exit_since = now
+        self.exit_mode = exit_mode
         self.phase = 'EXIT'
-        if now - self.exit_since >= .20:
-          self.complete()
+        if now - self.exit_since >= (.20 if straight_exit else .50):
+          self.complete(exit_mode)
           return False
       else:
         self.exit_since = None
+        self.exit_mode = None
         self.phase = 'TURN' if self.started is not None else 'ARMED'
       if self.phase != 'EXIT':
         self.phase = 'TURN' if self.started is not None else 'ARMED'
@@ -1167,9 +1292,49 @@ class ManualTurnEntry:
       self.frame, self.last_frame_time = frame, now
       credible, _, raw = evidence
 
+      # Physical intent admission is distinct from predicted path acquisition.
+      # A rolling request additionally needs a measured slowing approach; an
+      # early signal at steady speed must not start a repeated search window.
+      self.approach_samples.append((now, speed))
+      self.approach_samples = [(t, v) for t, v in self.approach_samples
+                               if 0 <= now-t <= self.ROLLING_APPROACH_SECONDS + .5][-50:]
+      older = [(t, v) for t, v in self.approach_samples if now-t >= self.ROLLING_APPROACH_SECONDS]
+      recent = [v for t, v in self.approach_samples if now-t <= .5]
+      rebound = bool(recent) and speed > min(recent) + self.ROLLING_APPROACH_REBOUND
+      speed_drop = older[-1][1] - speed if older else None
+      if speed_drop is not None and speed_drop >= self.ROLLING_APPROACH_SPEED_DROP and not rebound:
+        self.last_slowing, self.last_slowing_speed = now, speed
+      slowing_age = None if self.last_slowing is None else now-self.last_slowing
+      approach_held = (slowing_age is not None and 0 <= slowing_age <= self.ROLLING_APPROACH_HOLD_SECONDS
+                       and speed <= self.last_slowing_speed + self.ROLLING_APPROACH_REBOUND and not rebound)
+      # The newly admitted 18–25 mph band needs a matching corner, so a
+      # slowing manual lane change does not gain automatic turn conditioning.
+      rolling_ready = (speed <= self.ROLLING_INTENT_START_SPEED and approach_held
+                       and (speed <= 18.0 * CV.MPH_TO_MS
+                            or self.obvious_future_corner(model, sign) and raw >= 0))
+      self.last_gates = {'path_credible': bool(credible), 'signed_heading_deg': math.degrees(evidence[1]),
+                         'signed_model_curvature': evidence[2], 'low_speed': speed <= self.LOW_INTENT_START_SPEED,
+                         'rolling_approach': bool(rolling_ready), 'rolling_speed_limit_mps': self.ROLLING_INTENT_START_SPEED,
+                         'approach_speed_drop_mps': speed_drop, 'slowing_evidence_age_s': slowing_age,
+                         'approach_evidence_held': bool(approach_held), 'speed_rebound': rebound}
+      # High-speed approach gathers history and a geometry lock only. Never
+      # condition the model above the existing steering admission ceiling.
+      if speed > self.ROLLING_INTENT_START_SPEED and self.started is None:
+        corner = credible and raw >= 0 and self.obvious_future_corner(model, sign)
+        if corner:
+          if self.evidence_since is None:
+            self.evidence_since = now
+          self.frames += 1
+        else:
+          self.evidence_since, self.frames = None, 0
+        self.turn_locked = bool(corner and self.frames >= 5
+                                and now-self.evidence_since >= ManualTurnCommit.EVIDENCE_SECONDS)
+        self.phase, self.reason = 'CANDIDATE', 'EARLY_GEOMETRY_LOCK' if self.turn_locked else 'EARLY_INTENT'
+        self.last_gates['turn_locked'] = self.turn_locked
+        return False
       # Intent can begin while stopped/creeping, after six fresh frames.
       # Requesting a model direction never arms a blind actuator turn floor.
-      if speed <= self.LOW_INTENT_START_SPEED and self.started is None:
+      if (speed <= self.LOW_INTENT_START_SPEED or rolling_ready) and self.started is None:
         if self.stop_intent_since is None:
           self.stop_intent_since = now
         self.stop_intent_frames += 1
@@ -1179,6 +1344,7 @@ class ManualTurnEntry:
           and now - self.stop_intent_since >= ManualTurnCommit.EVIDENCE_SECONDS
         ):
           self.stop_armed = True
+          self.intent_origin = 'physical_low_speed' if speed <= self.LOW_INTENT_START_SPEED else 'physical_rolling_approach'
 
       elif self.started is None and not self.stop_armed:
         self.stop_intent_since = None
@@ -1189,16 +1355,17 @@ class ManualTurnEntry:
       # but positive steering still requires its independent matching path.
       if self.started is not None and not credible and self.exit_since is None:
         stop_grace = (
-          self.started_from_stop and not self.intent_path_acquired
-          and now - self.started < ManualTurnCommit.MAX_SECONDS
-          and self.intent_distance <= self.LOW_INTENT_MAX_DISTANCE
+          (self.started_from_stop or self.queue_waiting)
+          and (not self.intent_path_acquired or self.heading < ManualTurnCommit.EXIT_MIN_HEADING)
+          and self.search_elapsed < ManualTurnCommit.MAX_SECONDS
+          and self.search_distance <= self.LOW_INTENT_MAX_DISTANCE
         )
         scene_evidence = ManualTurnCommit.turn_shape_evidence(model, sign, continuing=True)
         brief_geometry_gap = (scene_evidence is not None and scene_evidence[0]
                               and self.last_evidence is not None
                               and now - self.last_evidence <= ManualTurnCommit.HOLD_SECONDS)
         if not (stop_grace or brief_geometry_gap):
-          self.cancel()
+          self.cancel('PATH_CREDIBILITY_LOST')
           return False
         if stop_grace:
           self.last_evidence = now
@@ -1208,6 +1375,12 @@ class ManualTurnEntry:
         or ManualTurnCommit.directional_entry_evidence(model, sign, speed)
         or self.obvious_future_corner(model, sign)
       )
+      self.last_gates['path_entry'] = bool(entry_ok)
+      self.turn_locked = bool(credible and raw >= 0 and entry_ok
+                              and (self.intent_path_acquired or self.frames >= 5))
+      self.last_gates['turn_locked'] = self.turn_locked
+      if self.started is None:
+        self.reason = 'PATH_DWELL' if credible and entry_ok else 'PHYSICAL_INTENT_DWELL' if (speed <= self.LOW_INTENT_START_SPEED or rolling_ready) else 'WAIT_PATH_OR_SLOWING_APPROACH'
       if credible and entry_ok:
         self.last_evidence = now
         if self.evidence_since is None:
@@ -1220,6 +1393,7 @@ class ManualTurnEntry:
             self.stop_armed = True
           elif self.started is None:
             self.started = now
+            self.intent_origin = 'qualified_geometry' 
       else:
         self.evidence_since = None
         self.frames = 0
@@ -1238,17 +1412,88 @@ class ManualTurnEntry:
     # the car rolled several feet into the intersection before the model was
     # finally told which direction the physical blinker intended.
     if speed <= 0.3:
-      return self.stop_armed
+      if self.stop_armed or self.queue_waiting and self.started is not None:
+        self.phase, self.reason = 'ARMED', 'WAITING_FOR_TURN_ENTRY'
+        return True
+      return False
 
     if self.started is None:
       return False
-    if now - self.started >= ManualTurnCommit.MAX_SECONDS or now - self.last_evidence > ManualTurnCommit.HOLD_SECONDS:
-      self.cancel()
+    time_expired = ((self.turn_started is None and self.search_elapsed >= ManualTurnCommit.MAX_SECONDS)
+                    or (self.turn_started is not None and now-self.turn_started >= ManualTurnCommit.MAX_SECONDS)
+                    or self.active_elapsed >= 2*ManualTurnCommit.MAX_SECONDS)
+    if time_expired or now - self.last_evidence > ManualTurnCommit.HOLD_SECONDS:
+      self.cancel('TURN_TIME_EXPIRED' if time_expired else 'PATH_HOLD_EXPIRED')
       return False
     if self.phase != 'EXIT':
-      self.phase = 'TURN'
+      self.phase = 'ARMED' if self.queue_waiting else 'TURN'
+      if self.queue_waiting:
+        self.reason = 'WAITING_FOR_TURN_ENTRY'
     return True
 
+
+  def curved_exit_evidence(self, model, actual_curvature, sign):
+    """Conservative offline exit proxy; not proof of intersection topology."""
+    if (self.started is None or actual_curvature is None or not math.isfinite(actual_curvature)
+        or self.heading < math.radians(60) or self.peak_actual_curvature < .025):
+      return False
+    actual = sign*actual_curvature
+    if not 0 <= actual <= min(.015, .4*self.peak_actual_curvature):
+      return False
+    try:
+      if abs(float(model.action.desiredCurvature)-actual_curvature) > .003:
+        return False
+      indices=[i for i,t in enumerate(model.position.t) if .5 <= t <= 1.5]
+      if len(indices) < 2:
+        return False
+      # Small-angle arc heading k*s, using measured steering curvature and
+      # model forward distance. Agreement must persist for the exit dwell.
+      return all(abs((model.orientation.z[i]-model.orientation.z[0])
+                     - actual_curvature*(model.position.x[i]-model.position.x[0])) <= math.radians(2)
+                 for i in indices)
+    except (AttributeError, IndexError, TypeError, ValueError, OverflowError):
+      return False
+
+  def event(self, reason):
+    return {'reason': reason, 'from_phase': self.phase, 'origin': self.intent_origin,
+            'direction': self.direction, 'distance_m': self.intent_distance,
+            'measured_heading_deg': math.degrees(self.heading), 'gates': dict(self.last_gates),
+            'queue_waiting': self.queue_waiting, 'search_elapsed_s': self.search_elapsed,
+            'search_distance_m': self.search_distance, 'active_elapsed_s': self.active_elapsed,
+            'waiting_elapsed_s': self.waiting_elapsed,
+            'model_input_frame': getattr(self, 'current_frame', None),
+            'producer_mono': getattr(self, 'current_time', None)}
+
+  def diagnostics(self, now, authorization=None):
+    return {'version': 4, 'implementation': 'unified-city-turn-v4', 'producer_mono': now, 'phase': self.phase, 'reason': self.reason,
+            'direction': self.direction, 'blocked': self.blocked, 'origin': self.intent_origin,
+            'path_acquired': self.intent_path_acquired, 'turn_locked': self.turn_locked,
+            'stage': 'TURNING' if self.turn_started is not None else 'WAITING' if self.queue_waiting else 'CONDITIONING' if self.started is not None else self.phase, 'conditioning_active': self.started is not None or self.stop_armed,
+            'model_input_frame': self.frame, 'model_input_age_s': None if self.last_frame_time is None else now-self.last_frame_time,
+            'request_age_s': None if self.started is None else now-self.started,
+            'distance_m': self.intent_distance, 'measured_heading_deg': math.degrees(self.heading),
+            'queue_waiting': self.queue_waiting, 'physical_turn_started': self.physical_turn_started,
+            'search_elapsed_s': self.search_elapsed, 'search_distance_m': self.search_distance,
+            'active_elapsed_s': self.active_elapsed, 'waiting_elapsed_s': self.waiting_elapsed,
+            'gates': dict(self.last_gates), 'last_event': self.last_event, 'eligibility': dict(authorization or {}),
+            'authorization_trace': dict(self.authorization_trace), 'limits': {'search_time_s': ManualTurnCommit.MAX_SECONDS,
+            'search_distance_m': self.LOW_INTENT_MAX_DISTANCE,
+            'rolling_admission_mph': self.ROLLING_INTENT_START_SPEED / CV.MPH_TO_MS,
+            'recognition_mph': 40.0,
+            'approach_window_s': self.ROLLING_APPROACH_SECONDS,
+            'approach_speed_drop_mps': self.ROLLING_APPROACH_SPEED_DROP,
+            'approach_hold_s': self.ROLLING_APPROACH_HOLD_SECONDS,
+            'approach_rebound_mps': self.ROLLING_APPROACH_REBOUND,
+            'queue_enter_mph': self.QUEUE_ENTER_SPEED / CV.MPH_TO_MS,
+            'queue_exit_mph': self.QUEUE_EXIT_SPEED / CV.MPH_TO_MS,
+            'queue_turn_heading_deg': math.degrees(self.QUEUE_TURN_HEADING),
+            'queue_turn_curvature': self.QUEUE_TURN_CURVATURE,
+            'lifetime_clock': 'non_waiting_time',
+            'turn_time_s': ManualTurnCommit.MAX_SECONDS, 'total_lifetime_s': 2*ManualTurnCommit.MAX_SECONDS}}
+
+
+# Compatibility name; there is one manual city-turn lifecycle implementation.
+ManualTurnEntry = CityTurnIntent
 
 class NavigationGeometryCommit:
   """Reuse proven turn-shape checks instead of inventing a radius from GPS.

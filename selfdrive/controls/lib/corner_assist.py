@@ -3,10 +3,12 @@ import json
 import math
 import time
 
-from openpilot.selfdrive.controls.lib.turn_context import driver_braking, paired_decision, manual_turn_intent
+from openpilot.selfdrive.controls.lib.turn_context import driver_braking, paired_decision, manual_turn_intent, city_turns_enabled
 from openpilot.selfdrive.controls.lib.curve_comfort import PROFILES, DEFAULT_PROFILE, read_curve_comfort
 
 from openpilot.selfdrive.controls.lib.turn_speed_plan import TurnSpeedPlan, path_turn_target
+from openpilot.selfdrive.controls.lib.city_turn_plan import paired_turn_plan, profile_target
+from openpilot.selfdrive.controls.lib.turn_context import navigation_request_valid, navigation_signal_matches
 
 SETTINGS = '/data/nap_turn_settings.json'
 
@@ -68,10 +70,9 @@ class CornerAssist:
       if not hasattr(self, 'params'):
         from openpilot.common.params import Params
         self.params = Params()
-      param_val = self.params.get("NAPCornerAssist")
-      if param_val is not None:
-        self.config['corner_assist'] = (param_val is True)
       self.last_config = now
+    # City Turns replaces the old city-corner/propulsion enable split.
+    self.config['corner_assist'] = city_turns_enabled(self.params)
 
   def update(self, base, speed, curvature, coast, active, now, cruise_speed=None, target_override=None):
     """City-speed experiment, with limited additional deceleration and jerk.
@@ -140,39 +141,130 @@ class CornerAssist:
     authority is granted while either pedal is touched or long is disengaged.
     """
     now = time.monotonic()
+    if isinstance(decision,dict) and 'city_turn_plan' in decision and decision.get('signal_owner') in ('driver','navigation'):
+      return self.prepare_shared(sm, CP, reset, cruise_speed, decision, now)
     try:
       cs, cc, model = sm['carState'], sm['carControl'], sm['modelV2']
       fresh = all(sm.valid[k] and sm.alive[k] and 0 <= now-sm.logMonoTime[k]/1e9 <= .5
                   for k in ('carState', 'carControl', 'modelV2'))
       signaled = bool(cs.leftBlinker) != bool(cs.rightBlinker)
-      turn_intent = (manual_turn_intent(cs, decision, model, now)
-                     and decision.get('manual_turn_phase') in (None, 'TURN', 'EXIT'))
+      turn_intent = (manual_turn_intent(cs, decision, model, now, approach=True)
+                     and (decision.get('manual_turn_phase') in (None, 'TURN', 'EXIT')
+                          or decision.get('turn_locked') is True))
       # Completion clears steering/model intent immediately, while the already
       # active speed ceiling releases through the same bounded speed planner.
       if (paired_decision(decision, model, now) and decision.get('manual_turn_phase') == 'COMPLETE'
           and self.turn_plan.target is not None and self.config['corner_assist']
           and fresh and cs.canValid and cc.latActive and not cs.steeringPressed
           and str(cs.gearShifter) == 'drive' and .3 <= cs.vEgo <= 15.65):
-        return self.turn_plan.update(cruise_speed, cs.vEgo, 0., cruise_speed, now, True,
+        # Completion ends the maneuver, not the exit road's curvature.
+        if CP.steerRatio <= 0 or CP.wheelbase <= 0:
+          self.turn_plan.reset()
+          return None
+        actual = abs(math.tan(math.radians(cs.steeringAngleDeg)/CP.steerRatio)/CP.wheelbase)
+        target = path_turn_target(model.position.x, model.position.y,
+                                  self.comfort.corner_lateral_accel, self.comfort.corner_max_decel, cruise_speed)
+        if target is not None and actual >= MIN_CURVATURE:
+          target = min(target, math.sqrt(self.comfort.corner_lateral_accel/actual))
+        return self.turn_plan.update(target, cs.vEgo, actual, cruise_speed, now, True,
                                      driver_braking(cs) or cs.gasPressed, cc.longActive and not reset)
       nav_turn = (paired_decision(decision, model, now) and decision.get("source") == "navigation"
                   and decision.get("confirmed") is True and decision.get("final_desire") in ("turnLeft", "turnRight"))
       eligible = (self.config['corner_assist'] and (turn_intent or nav_turn) and signaled and fresh
                   and cs.canValid and cc.latActive and not cs.steeringPressed
-                  and str(cs.gearShifter) == 'drive' and .3 <= cs.vEgo <= 15.65
+                  and str(cs.gearShifter) == 'drive' and .3 <= cs.vEgo <= 40*.44704
+                  and not getattr(cs, 'steeringDisengage', False)
                   and CP.steerRatio > 0 and CP.wheelbase > 0)
       if not eligible:
         self.turn_plan.reset()
         return None
+      identity = (decision.get('signal_owner'), decision.get('source'),
+                  decision.get('manual_turn_direction'), decision.get('route_id'), decision.get('maneuver_id'))
+      if identity != getattr(self, 'turn_identity', None):
+        self.turn_plan.reset()
+      self.turn_identity = identity
       actual = abs(math.tan(math.radians(cs.steeringAngleDeg)/CP.steerRatio)/CP.wheelbase)
       target = path_turn_target(model.position.x, model.position.y,
                                self.comfort.corner_lateral_accel, self.comfort.corner_max_decel, cruise_speed)
       if target is not None and actual >= MIN_CURVATURE:
         target = min(target, math.sqrt(self.comfort.corner_lateral_accel/actual))
       return self.turn_plan.update(target, cs.vEgo, actual, cruise_speed, now, eligible,
-                                   driver_braking(cs) or cs.gasPressed, cc.longActive and not reset)
+                                   driver_braking(cs) or cs.gasPressed, cc.longActive and not reset, locked=decision.get('turn_locked') is True)
     except (AttributeError, ValueError, TypeError, KeyError, OverflowError):
       self.turn_plan.reset()
+      return None
+
+  def prepare_shared(self, sm, CP, reset, cruise_speed, decision, now):
+    """Consume one acquired profile; do not infer another turn lifecycle."""
+    try:
+      cs,cc,model=sm['carState'],sm['carControl'],sm['modelV2']
+      plan=paired_turn_plan(decision,model,now)
+      fresh=all(sm.valid[k] and sm.alive[k] and 0<=now-sm.logMonoTime[k]/1e9<=.35
+                for k in ('carState','carControl','modelV2'))
+      nav=decision.get('navigation_turn') or {}
+      nav_request=nav.get('request') if isinstance(nav,dict) else None
+      nav_owned=(decision.get('signal_owner')=='navigation' and navigation_request_valid(nav_request,now,allow_release=True)
+                 and plan is not None and plan.get('owner_key')==nav_request['key']
+                 and decision.get('route_id')==nav_request['route_id']
+                 and decision.get('maneuver_id')==nav_request['maneuver_id'])
+      life=nav.get('lifecycle',{}) if nav_owned else {}
+      eligible=(plan is not None and paired_decision(decision,model,now)
+                and self.config['corner_assist'] and decision.get('city_turns_enabled') is True
+                and fresh and cs.canValid and cc.latActive and cc.longActive and not reset
+                and not cs.steeringPressed and not getattr(cs,'steeringDisengage',False)
+                and not driver_braking(cs) and not cs.gasPressed
+                and str(cs.gearShifter)=='drive' and .3<=cs.vEgo<=40*.44704
+                and CP.steerRatio>0 and CP.wheelbase>0
+                and (nav_owned and decision.get('source')=='navigation_city_turn'
+                     or not nav_owned and decision.get('signal_owner')=='driver'
+                     and decision.get('source') in ('none','driver_desire_helper'))
+                and decision.get('tap_signal_active') is False
+                and (nav_owned or decision.get('synthetic_indicator_request')=='none'))
+      if eligible:
+        direction=plan['direction']
+        release=(nav_owned and nav_request.get('release_only') is True
+                 and life.get('phase')=='COMPLETE' and plan['phase']=='HANDOFF')
+        eligible=((release or nav_owned and navigation_signal_matches(cs,nav_request,now)
+                   or not nav_owned and bool(cs.leftBlinker)!=bool(cs.rightBlinker)
+                   and (direction==1)==bool(cs.leftBlinker))
+                  and not (cs.leftBlindspot if direction==1 else cs.rightBlindspot)
+                  and (life.get('direction') if nav_owned else decision.get('manual_turn_direction'))==direction
+                  and plan.get('lateral_phase')==(life.get('phase') if nav_owned else decision.get('manual_turn_phase'))
+                  and ((life.get('blocked') if nav_owned else decision.get('manual_turn_blocked')) is not True
+                       or (life.get('phase') if nav_owned else decision.get('manual_turn_phase'))=='COMPLETE'
+                       and plan['phase'] in ('HANDOFF','COMPLETE')))
+      if not eligible or plan['phase'] not in ('WAITING','APPROACH','TURN','EXIT','HANDOFF'):
+        self.turn_plan.reset()
+        self.plan_reason='NO_SHARED_PROFILE_AUTHORITY'
+        return None
+      identity=(plan.get('owner','driver'),plan.get('owner_key'),plan['id'],plan['direction'])
+      if identity!=getattr(self,'turn_identity',None):
+        self.turn_plan.reset()
+        # A restarted consumer cannot invent the preceding maneuver's handoff.
+        if plan['phase']=='HANDOFF':
+          return None
+      if plan['phase']=='HANDOFF' and self.turn_plan.target is None:
+        return None
+      self.turn_identity=identity
+      actual=abs(math.tan(math.radians(cs.steeringAngleDeg)/CP.steerRatio)/CP.wheelbase)
+      target=profile_target(plan.get('profile'),self.comfort.corner_lateral_accel,
+                            self.comfort.corner_max_decel,cruise_speed)
+      if plan.get('geometry_status')=='HELD_CEILING':
+        age=plan.get('geometry_age_s')
+        if (type(age) not in (int,float) or not math.isfinite(age) or not 0<=age<=.15
+            or self.turn_plan.target is None):
+          self.turn_plan.reset()
+          return None
+        if target is not None:
+          target=min(target,self.turn_plan.target)
+      if target is not None and actual>=MIN_CURVATURE:
+        target=min(target,math.sqrt(self.comfort.corner_lateral_accel/actual))
+      self.plan_reason=plan['phase']
+      return self.turn_plan.update(target,cs.vEgo,actual,cruise_speed,now,True,False,True,
+                                   phase=plan['phase'])
+    except (AttributeError,TypeError,ValueError,KeyError,OverflowError):
+      self.turn_plan.reset()
+      self.plan_reason='SHARED_PROFILE_UNAVAILABLE'
       return None
 
   def apply(self, base, sm, CP, reset, coast, cruise_speed=None, decision=None, prepared=False):

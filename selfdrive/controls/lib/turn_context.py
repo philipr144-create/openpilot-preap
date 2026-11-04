@@ -36,6 +36,10 @@ def maneuver_context(decision, now, model_frame=None):
   mode condition is introduced here.
   """
   d = decision if isinstance(decision, dict) else {}
+  nav=d.get('navigation_turn')
+  life=nav.get('lifecycle',{}) if isinstance(nav,dict) and navigation_request_valid(nav.get('request'),now,allow_release=True) else {}
+  turn_phase=life.get('phase',d.get('manual_turn_phase'))
+  turn_blocked=life.get('blocked',d.get('manual_turn_blocked'))
   kind = classify_route_maneuver({'type': d.get('maneuver_type')})
   desire = d.get('final_desire')
   source = d.get('source') if isinstance(d.get('source'), str) else 'none'
@@ -63,7 +67,9 @@ def maneuver_context(decision, now, model_frame=None):
     phase = 'UNAVAILABLE'
   elif d.get('driver_steering_override') is True:
     phase = 'DRIVER_OVERRIDE'
-  elif d.get('manual_turn_blocked') is True or 'cancelled' in reason.lower():
+  elif turn_phase == 'COMPLETE':
+    phase = 'COMPLETE'
+  elif turn_blocked is True or 'cancelled' in reason.lower():
     phase = 'ABORTED'
   elif 'already passed' in reason.lower():
     phase = 'COMPLETE'
@@ -77,7 +83,7 @@ def maneuver_context(decision, now, model_frame=None):
              'active': 'COMMIT', 'finishing': 'EXIT', 'complete': 'COMPLETE'}.get(str(d.get('tap_status')), 'WAIT_ENTRY')
   elif kind == 'city_turn':
     phase = {'ARMED': 'APPROACH', 'WAIT': 'WAIT_ENTRY', 'ENTER': 'ENTER',
-             'TURN': 'COMMIT', 'EXIT': 'EXIT'}.get(str(d.get('manual_turn_phase')),
+             'TURN': 'COMMIT', 'EXIT': 'EXIT'}.get(str(turn_phase),
              'GUIDANCE' if desire in ('turnLeft', 'turnRight') else 'APPROACH')
   else:
     phase = 'FOLLOW'
@@ -109,12 +115,14 @@ def paired_decision(decision, model, now, require_pair=True):
           and decision.get('model_evaluated') is True)
 
 
-def manual_turn_intent(cs, decision, model, now, require_pair=True):
+def manual_turn_intent(cs, decision, model, now, require_pair=True, approach=False):
   if not paired_decision(decision, model, now, require_pair=require_pair):
     return False
   direction = decision.get('manual_turn_direction')
   speed_max = (35 if decision.get("manual_turn_continuing") is True else 25) * .44704
-  return (math.isfinite(cs.vEgo) and -.1 <= cs.vEgo < speed_max
+  if approach and decision.get('turn_locked') is True:
+    speed_max = 40 * .44704
+  return (math.isfinite(cs.vEgo) and -.1 <= cs.vEgo <= speed_max
           and type(direction) is int and direction in (1, 2)
           and bool(cs.leftBlinker) != bool(cs.rightBlinker)
           and (direction == 1) == bool(cs.leftBlinker)
@@ -122,7 +130,7 @@ def manual_turn_intent(cs, decision, model, now, require_pair=True):
           and decision.get('signal_owner') == 'driver'
           and decision.get('tap_signal_active') is False
           and decision.get('synthetic_indicator_request') == 'none'
-          and decision.get('manual_turn_phase') in (None, 'ARMED', 'TURN', 'EXIT')
+          and decision.get('manual_turn_phase') in ((None, 'CANDIDATE', 'ARMED', 'TURN', 'EXIT') if approach else (None, 'ARMED', 'TURN', 'EXIT'))
           and decision.get('manual_turn_blocked') is not True
           and decision.get('source') in ('none', 'driver_desire_helper')
           and decision.get('final_desire') in ('none', 'turnLeft' if direction == 1 else 'turnRight')
@@ -130,3 +138,113 @@ def manual_turn_intent(cs, decision, model, now, require_pair=True):
           and cs.canValid
           and not (cs.leftBlindspot if direction == 1 else cs.rightBlindspot)
           and str(cs.gearShifter) in ('drive', 'low', 'sport', 'eco'))
+
+
+def city_turns_enabled(params):
+  """Single UI master switch. Missing/invalid values fail closed."""
+  try:
+    value = params.get('NAPCityTurns')
+    return value is True or type(value) in (bytes, str) and value in (b'1', '1')
+  except Exception:
+    return False
+
+
+def navigation_request_valid(request, now, allow_release=False):
+  """Typed navigation lease, never permission manufactured by a lamp alone."""
+  if not isinstance(request,dict) or type(request.get('version')) is not int or request.get('version')!=1 or request.get('owner')!='navigation':
+    return False
+  if (type(request.get('direction')) is not int or request['direction'] not in (1,2)
+      or any(not isinstance(request.get(k),str) or not 0<len(request[k])<=96
+             for k in ('controller','route_id','maneuver_id','key'))
+      or request.get('kind') not in ('turn','end of road')
+      or request.get('city_enabled') is not True or request.get('route_authorized') is not True
+      or request.get('signal_verified') is not True):
+    return False
+  if request.get('release_only') is True:
+    if (not allow_release
+        or not all(type(request.get(k)) in (int,float) and math.isfinite(request[k])
+                   for k in ('release_started_mono','release_until_mono'))
+        or not request['release_started_mono']<=now<request['release_until_mono']
+        or not 0<request['release_until_mono']-request['release_started_mono']<=3.):
+      return False
+  return (all(type(request.get(k)) in (int,float) and math.isfinite(request[k])
+              for k in ('lease_mono','source_mono','expires_mono'))
+          and type(now) in (int,float) and math.isfinite(now)
+          and 0<=now-request['lease_mono']<=.15
+          and request['source_mono']<=now<request['expires_mono']
+          and 0<request['expires_mono']-request['source_mono']<=3.)
+
+
+# Observed factory flash gaps are about .5 s. This bound only bridges those
+# gaps for an already observed synthetic signal with a continuously fresh ack.
+NAV_SIGNAL_DARK_MAX_S = .8
+NAV_SIGNAL_ACK_MAX_S = .25
+
+
+def navigation_signal_matches(cs, request, now):
+  """Keep physical lamps truthful; consume a bounded navigation-only proof."""
+  if not navigation_request_valid(request, now):
+    return False
+  direction = request['direction']
+  left, right = bool(cs.leftBlinker), bool(cs.rightBlinker)
+  if left or right:
+    return left != right and left == (direction == 1)
+  if request.get('signal_source') != 'synthetic_feedback':
+    return False
+  lamp, ack = request.get('signal_last_lamp_mono'), request.get('signal_ack_mono')
+  return (all(type(v) in (int, float) and math.isfinite(v) for v in (lamp, ack))
+          and lamp <= request['lease_mono'] and ack <= request['lease_mono']
+          and 0 <= now-lamp <= NAV_SIGNAL_DARK_MAX_S
+          and 0 <= now-ack <= NAV_SIGNAL_ACK_MAX_S)
+
+
+def navigation_source_valid(state, now):
+  if (not isinstance(state,dict) or type(state.get('version')) is not int or state.get('version')!=4
+      or type(now) not in (int,float) or not math.isfinite(now)
+      or not isinstance(state.get('maneuver'),dict)
+      or not all(isinstance(state['maneuver'].get(k),str) for k in ('type','modifier'))):
+    return False
+  q=state.get('position_quality',{})
+  return (state.get('enabled') is True and state.get('route_active') is True
+          and state.get('route_state')=='active' and not state.get('pause_reason')
+          and all(isinstance(state.get(k),str) and 0<len(state[k])<=96 for k in ('route_id','maneuver_id'))
+          and all(type(state.get(k)) in (int,float) and math.isfinite(state[k]) for k in ('received_mono','expires_mono'))
+          and state['received_mono']<=now<state['expires_mono']
+          and 0<state['expires_mono']-state['received_mono']<=3.
+          and isinstance(q,dict) and q.get('projection_valid') is True and q.get('path_ambiguous') is False
+          and all(type(q.get(k)) in (int,float) and math.isfinite(q[k]) and 0<=q[k]<=limit
+                  for k,limit in (('heading_error_deg',20.),('match_error_m',15.),('gps_accuracy_m',20.),('gps_age_s',1.5)))
+          and q['gps_accuracy_m']>0 and q['gps_age_s']+now-state['received_mono']<1.5)
+
+
+def navigation_turn_intent(cs, decision, model, now, require_pair=True, approach=False):
+  if not paired_decision(decision,model,now,require_pair):
+    return False
+  nav=decision.get('navigation_turn')
+  if not isinstance(nav,dict) or not navigation_request_valid(nav.get('request'),now):
+    return False
+  request=nav['request'];life=nav.get('lifecycle',{})
+  if not isinstance(life,dict):
+    return False
+  direction=request['direction']
+  limit=(40 if approach else 35 if life.get('continuing') is True else 25)*.44704
+  return (decision.get('signal_owner')=='navigation'
+          and decision.get('source')=='navigation_city_turn'
+          and decision.get('city_turns_enabled') is True
+          and decision.get('route_id')==request['route_id']
+          and decision.get('maneuver_id')==request['maneuver_id']
+          and decision.get('tap_signal_active') is False
+          and life.get('blocked') is not True
+          and life.get('phase') in ('CANDIDATE','ARMED','TURN','EXIT')
+          and decision.get('final_desire') in ('none','turnLeft' if direction==1 else 'turnRight')
+          and math.isfinite(cs.vEgo) and -.1<=cs.vEgo<=limit
+          and navigation_signal_matches(cs,request,now) and cs.canValid
+          and not cs.steeringPressed and not getattr(cs,'steeringDisengage',False)
+          and str(cs.gearShifter) in ('drive','low','sport','eco')
+          and not (cs.leftBlindspot if direction==1 else cs.rightBlindspot))
+
+
+def city_turn_intent(cs, decision, model, now, require_pair=True, approach=False):
+  if isinstance(decision,dict) and isinstance(decision.get('navigation_turn'),dict):
+    return navigation_turn_intent(cs,decision,model,now,require_pair,approach)
+  return manual_turn_intent(cs,decision,model,now,require_pair,approach)

@@ -23,6 +23,8 @@ from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.corner_assist import CornerAssist
+from openpilot.selfdrive.controls.lib.turn_propulsion import TurnPropulsionPlan
+from openpilot.selfdrive.controls.lib.turn_context import city_turn_intent, navigation_request_valid
 from openpilot.selfdrive.controls.lib.turn_context import route_reference_speed, maneuver_context
 from openpilot.selfdrive.controls.lib.cruise_refinement import CruiseRefinement, model_support_weight
 from openpilot.selfdrive.controls.lib.map_stop import MapStop, read_snapshot
@@ -431,7 +433,7 @@ def map_curve_speed_cap(path=MAP_CONTEXT_SNAPSHOT, now=None, v_ego=None, consume
   ):
     return reject('SNAPSHOT_READ_ERROR')
 
-def navigation_speed_cap(path=NAV_SNAPSHOT, now=None, v_ego=None, consumed_stops=()):
+def navigation_speed_cap(path=NAV_SNAPSHOT, now=None, v_ego=None, consumed_stops=(), acquired_request=None):
   """Conservative cruise cap from fresh, well-matched route geometry."""
   now = time.monotonic() if now is None else now
   try:
@@ -473,6 +475,14 @@ def navigation_speed_cap(path=NAV_SNAPSHOT, now=None, v_ego=None, consumed_stops
     maneuver = state['maneuver']
     kind, distance = maneuver['type'], maneuver['distance_m']
     if type(distance) not in (int, float) or not math.isfinite(distance) or distance < -8 or distance > 300:
+      return min(caps) if caps else None
+    # The caller supplies this lease only after CornerAssist accepted its
+    # shared speed profile. Keep announcement/preparation until acquisition,
+    # then let that profile own this turn's ceiling and release. A following
+    # maneuver, arrival and mapped stops keep their independent constraints.
+    if (kind in ('turn','end of road') and navigation_request_valid(acquired_request,now,allow_release=True)
+        and state.get('route_id')==acquired_request['route_id']
+        and state.get('maneuver_id')==acquired_request['maneuver_id']):
       return min(caps) if caps else None
     # Map guidance does not identify stop signs. Only turn, end-of-road and
     # destination geometry contribute; the model still handles actual stops.
@@ -531,6 +541,7 @@ class LongitudinalPlanner:
     self.corner_assist = CornerAssist()
     self.map_stop = MapStop()
     self.normal_model_stop = NormalModelStop(dt)
+    self.turn_propulsion = TurnPropulsionPlan()
     self.normal_propulsion = NormalPropulsion(dt)
     self.normal_propulsion_recovery = False
     self.cruise_refinement = CruiseRefinement(dt)
@@ -976,6 +987,22 @@ class LongitudinalPlanner:
       if map_cap is not None:
         v_cruise = min(v_cruise, map_cap)
 
+    # Read one turn decision for both route/profile arbitration and the MPC.
+    city_turn_cap = None
+    turn_decision = None
+    acquired_navigation_request = None
+    if self._is_preap:
+      turn_decision = read_snapshot("/dev/shm/nap_navigation_decision.json")
+      self.maneuver_context = maneuver_context(turn_decision, time.monotonic(), sm['modelV2'].frameId)
+      city_turn_cap = self.corner_assist.prepare(sm, self.CP, reset_state, driver_cruise_speed, turn_decision)
+      if type(city_turn_cap) in (int, float) and math.isfinite(city_turn_cap) and 0. < city_turn_cap <= driver_cruise_speed:
+        v_cruise = min(v_cruise, city_turn_cap)
+        if isinstance(turn_decision,dict) and turn_decision.get('signal_owner')=='navigation':
+          nav_turn=turn_decision.get('navigation_turn')
+          acquired_navigation_request=nav_turn.get('request') if isinstance(nav_turn,dict) else None
+      else:
+        city_turn_cap = None
+
     map_diagnostic = {'reason': 'DISABLED_OR_INACTIVE'}
     curve_cap = None
     curve_recovery_limit = None  # Old log field retained; no second curve gate.
@@ -989,7 +1016,8 @@ class LongitudinalPlanner:
     curve_binding = False
     if self._is_preap and not reset_state:
       if self.nap_navigation_maneuvers:
-        nav_cap = navigation_speed_cap(v_ego=v_ego, consumed_stops=self.map_stop.consumed)
+        nav_cap = navigation_speed_cap(v_ego=v_ego, consumed_stops=self.map_stop.consumed,
+                                       acquired_request=acquired_navigation_request)
         if nav_cap is not None:
           v_cruise = min(v_cruise, nav_cap)
       if self.nap_map_driving_assist:
@@ -1022,19 +1050,6 @@ class LongitudinalPlanner:
 
     self.road_curve_profile = road_speed_profile
     self.road_curve_diagnostic = map_diagnostic
-
-    # One city-turn speed ceiling feeds the existing MPC in both modes.
-    # Pedal ownership and engagement are evaluated inside prepare().
-    city_turn_cap = None
-    turn_decision = None
-    if self._is_preap:
-      turn_decision = read_snapshot("/dev/shm/nap_navigation_decision.json")
-      self.maneuver_context = maneuver_context(turn_decision, time.monotonic(), sm['modelV2'].frameId)
-      city_turn_cap = self.corner_assist.prepare(sm, self.CP, reset_state, driver_cruise_speed, turn_decision)
-      if type(city_turn_cap) in (int, float) and math.isfinite(city_turn_cap) and 0. < city_turn_cap <= driver_cruise_speed:
-        v_cruise = min(v_cruise, city_turn_cap)
-      else:
-        city_turn_cap = None
 
     # Optional Pre-AP follow cap. The NAPAdaptiveAccel toggle is the master
     # gate; when disabled, personality and the normal MPC limits apply.
@@ -1196,6 +1211,69 @@ class LongitudinalPlanner:
       if output_a_target < before_corner:
         corner_accel_limit = float(output_a_target)
 
+    # Unified turn intent is shared, but longitudinal ownership is independent.
+    # This only supplements weak coasting during a measured, acquired turn.
+    # Never bypass model braking, MPC/lead/stop constraints, pedals or stale data.
+    turn_positive_upper = None
+    if self._is_preap:
+      cs, cc, model = sm['carState'], sm['carControl'], sm['modelV2']
+      now = time.monotonic()
+      intent_valid = city_turn_intent(cs, turn_decision, model, now)
+      measured_turn = (isinstance(turn_decision, dict)
+                       and turn_decision.get('city_turn_stage') == 'TURNING')
+      target = min(v_cruise, city_turn_cap) if city_turn_cap is not None else None
+      actual = (abs(math.tan(math.radians(cs.steeringAngleDeg-sm['liveParameters'].angleOffsetDeg)
+                    /self.CP.steerRatio)/self.CP.wheelbase)
+                if self.CP.steerRatio > 0 and self.CP.wheelbase > 0 else float('nan'))
+      direction = ((turn_decision or {}).get('navigation_turn') or {}).get('request',{}).get('direction') if isinstance(((turn_decision or {}).get('navigation_turn') or {}).get('request'),dict) else (turn_decision or {}).get('manual_turn_direction')
+      model_wrong_way = ((-1 if direction == 1 else 1)*model.action.desiredCurvature < -.001)
+      inputs_fresh = (sm.all_checks(service_list=['carState','carControl','modelV2','radarState','liveParameters'])
+                      and all(0 <= now-sm.logMonoTime[k]/1e9 <= .35
+                              for k in ('carState','carControl','modelV2','radarState','liveParameters')))
+      request = self.turn_propulsion.update(float(output_a_target), speed=float(v_ego),
+        target=float(target) if target is not None else float('nan'), actual_curvature=float(actual),
+        mpc_accel=float(output_a_target_mpc), model_accel=float(output_a_target_e2e),
+        upper_accel=float(accel_clip[1]), now=now,
+        ready=bool(inputs_fresh and self.corner_assist.config['corner_assist']
+                   and intent_valid
+                   and measured_turn and cc.longActive and not reset_state),
+        blocked=bool(planning_has_lead or self.output_should_stop or output_should_stop_mpc
+                     or output_should_stop_e2e or normal_stop_active or force_slow_decel
+                     or model.action.shouldStop or corner_braking or model_wrong_way
+                     or not forecast.valid or forecast.planned_stop or model_intent.braking_required
+                     or cs.gasPressed or cs.brakePressed or getattr(cs,'brake',0.) > 0.),
+        profile_owned=isinstance((turn_decision or {}).get('city_turn_plan'),dict))
+      output_a_target = request
+      turn_positive_upper = self.turn_propulsion.upper
+      if self.turn_propulsion.diagnostic.get('supporting'):
+        effective_allow_throttle = True
+        self.propulsion_allowed = True
+      self.turn_propulsion.diagnostic['gates'] = {
+        'inputs_fresh': bool(inputs_fresh), 'long_active': bool(cc.longActive),
+        'city_turns_enabled': bool(self.corner_assist.config['corner_assist']),
+        'intent_valid': bool(intent_valid), 'measured_turn': bool(measured_turn),
+        'lead_present': bool(planning_has_lead), 'stop_requested': bool(self.output_should_stop),
+        'model_braking': bool(model_intent.braking_required), 'force_decel': bool(force_slow_decel),
+        'driver_pedal': bool(cs.gasPressed or cs.brakePressed or getattr(cs,'brake',0.) > 0.),
+        'model_wrong_way': bool(model_wrong_way)}
+      shared_plan=(turn_decision or {}).get('city_turn_plan')
+      shared_plan=shared_plan if isinstance(shared_plan,dict) else {}
+      self.turn_propulsion.diagnostic['turn_plan'] = {
+        'id': shared_plan.get('id'), 'phase': shared_plan.get('phase'),
+        'geometry_status': shared_plan.get('geometry_status'),
+        'speed_target_mps': target, 'owner': self.corner_assist.turn_plan.owner,
+        'model_should_stop': bool(model.action.shouldStop),
+        'mpc_should_stop': bool(output_should_stop_mpc),
+        'e2e_should_stop': bool(output_should_stop_e2e),
+        'normal_stop_active': bool(normal_stop_active),
+        'forecast_stop': bool(forecast.planned_stop)}
+      key = (shared_plan.get('id'), shared_plan.get('phase'),
+             self.turn_propulsion.diagnostic['reason'], self.turn_propulsion.diagnostic['supporting'],
+             tuple(self.turn_propulsion.diagnostic['gates'].items()))
+      if self._frame % 20 == 0 or key != getattr(self, '_turn_long_log_key', None):
+        cloudlog.info('NAP_TURN_LONG %s', json.dumps(self.turn_propulsion.diagnostic, allow_nan=False))
+        self._turn_long_log_key = key
+
     # Hill support is one bounded REQUEST before the common final handoff.
     # It cannot bypass the smoothing used by leads, curves and cruise.
     grade_base_accel = float(output_a_target)
@@ -1315,7 +1393,14 @@ class LongitudinalPlanner:
         output_a_target = limit_positive_accel(output_a_target, previous, v_ego, personality, self.dt)
       if experimental_preap and self.handoff_request < output_a_target_mpc - .01:
         self.mpc.source = LongitudinalPlanSource.e2e
+    # Apply the same comfort/target ceiling after grade and final handoff.
+    # Negative braking requests always remain below a positive ceiling.
+    if turn_positive_upper is not None:
+      output_a_target = min(output_a_target, turn_positive_upper)
     self.output_a_target = np.clip(output_a_target, accel_clip[0], accel_clip[1])
+    if self._is_preap:
+      self.turn_propulsion.publish(time.monotonic(), self.output_a_target,
+        sm['modelV2'].frameId, self.corner_assist.config['corner_assist'], sm['carControl'].longActive)
     # The final command includes all sources and owns the next handoff.
     # Diagnostic contribution is bounded by what survived the common shaping.
     self.nap_grade_applied_last = min(grade_requested_add,

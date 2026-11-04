@@ -1,8 +1,10 @@
-from openpilot.selfdrive.controls.lib.turn_context import driver_braking, classify_route_maneuver, maneuver_context
+from openpilot.selfdrive.controls.lib.turn_context import driver_braking, classify_route_maneuver, maneuver_context, city_turns_enabled
 from openpilot.selfdrive.controls.lib.turn_steering_gate import matching_signal
 from openpilot.selfdrive.modeld.exit_sequence import ExitSequence
+from openpilot.selfdrive.modeld.navigation_city_turn import NavigationCityTurn
 """Driver-confirmed navigation desires and synthetic announcement requests."""
 import json
+import hashlib
 import math
 import os
 import tempfile
@@ -125,10 +127,13 @@ class NavigationDesire:
     self.indicator_request = 'none'
     self.prepared_navigation = None
     self.signal_cancelled_key = None
+    self.cancelled_maneuvers = set()
     self.previous_lat_active = False
     self.turn_guidance_started = False
     self.passed_key = None
     self.exit_sequence = ExitSequence()
+    self.city_bridge = NavigationCityTurn()
+    self.signal_status_path = '/dev/shm/nap_navigation_signal_status.json'
 
   def reset_countdown(self, state=None):
     self._distance_valid = False
@@ -196,13 +201,18 @@ class NavigationDesire:
       return active_request
     maneuver = state['maneuver']
     kind, distance = maneuver['type'], maneuver['distance_m']
+    if (kind in ('turn','end of road') or self.city_bridge.accepted()) and not city_turns_enabled(self.params):
+      return False
+    if self.city_bridge.accepted() and state['route_id']==self.city_bridge.key[0]:
+      return True
     return ((kind in ('fork', 'off ramp') and 10 <= distance <= 300)
             or (kind in ('turn', 'end of road') and -8 <= distance <= TURN_CONFIRM_DISTANCE)
             or self.started is not None)
 
   def update(self, cs, cc, inputs_valid, driver_desire_none=True, now=None,
              signal_owned_by_tap=False, physical_direction=None,
-             exit_corridor=None, exit_model_frame=None):
+             exit_corridor=None, exit_model_frame=None, model=None, model_inputs_valid=False,
+             actual_curvature=None, city_enabled=False):
     now = time.monotonic() if now is None else now
     lat_active = bool(cc.latActive)
     lat_disengaged = self.previous_lat_active and not lat_active
@@ -236,9 +246,13 @@ class NavigationDesire:
     def result(desire, reason, indicator_direction=0):
       if not exit_sequence_used:
         self.exit_sequence.withdraw()
+      if 'navigation_turn' not in self.decision:
+        self.city_bridge.withdraw(reason)
       if desire in ('turnLeft', 'turnRight'):
         self.turn_guidance_started = True
       if self.blocked or not self.confirmed:
+        self.turn_guidance_started = False
+      if self.city_bridge.intent.phase=='COMPLETE':
         self.turn_guidance_started = False
       self.indicator_request = {0: 'none', 1: 'left', 2: 'right'}[indicator_direction]
       self._publish_signal(indicator_direction, current_maneuver_id, desire, reason, now)
@@ -251,13 +265,15 @@ class NavigationDesire:
       return desire
 
     if state is None:
+      self.city_bridge.withdraw('NAVIGATION_WITHDRAWN')
       self.reset_countdown()
-      if ((lat_disengaged or getattr(cs, 'steeringDisengage', False)
+      if ((steering_override or lat_disengaged or getattr(cs, 'steeringDisengage', False)
            or signal is not None or signal_owned_by_tap)
           and self.key is not None and
-          (self.confirmed or self.started is not None or self.indicator_request != 'none')):
+          (steering_override or self.confirmed or self.started is not None or self.indicator_request != 'none')):
         self.blocked = True
         self.signal_cancelled_key = self.key
+        self.cancelled_maneuvers.add(self.key)
       self.confirmed = False
       self.started = None
       return result('none', reason)
@@ -272,29 +288,16 @@ class NavigationDesire:
       self.key = key
       self.turn_guidance_started = False
       self.confirmed = False
-      self.blocked = False
+      self.blocked = key in self.cancelled_maneuvers
       self.started = None
-      self.signal_cancelled_key = None
+      self.signal_cancelled_key = key if self.blocked else None
     self.decision.update(route_id=state['route_id'], maneuver_id=maneuver_id,
                          maneuver_type=kind, modifier=modifier, distance_m=distance)
-    # FINAL_NAV_ARBITRATION_V1
-    #
-    # Permanent cancellation is reserved for an actual navigation-control
-    # ownership loss:
-    #   * lateral control disengages during an active maneuver
-    #   * tap lane change takes signal ownership
-    #   * the route no longer owns navigation signaling
-    #
-    # Steering pressure is temporary handover, as in the ordinary Pre-AP
-    # controller. Yield guidance immediately; after release all route,
-    # vehicle, signal and geometry gates must qualify again. Disengagement
-    # and competing signal owners still cancel the current maneuver.
-    #
-    # Do NOT cancel merely because a physical blinker exists either. The
-    # maneuver-specific code below distinguishes same-side driver signaling
-    # from an opposite-side cancellation request.
+    # Manual steering cancels this route step, including an announced or
+    # queued request. Releasing the wheel is not a new authorization.
     hard_takeover = (
-      lat_disengaged
+      steering_override
+      or (lat_disengaged and (cs.vEgo>.3 or self.city_bridge.intent.physical_turn_started))
       or bool(getattr(cs, 'steeringDisengage', False))
       or signal_owned_by_tap
       or not self.owns_blinker
@@ -303,13 +306,15 @@ class NavigationDesire:
     if (
       hard_takeover
       and (
-        self.confirmed
+        steering_override
+        or self.confirmed
         or self.started is not None
         or self.indicator_request != 'none'
       )
     ):
       self.blocked = True
       self.signal_cancelled_key = key
+      self.cancelled_maneuvers.add(key)
     if self.blocked:
       self.confirmed = False
       self.started = None
@@ -340,6 +345,8 @@ class NavigationDesire:
       self.reset_countdown(state)
       return result('none', 'Navigation requires a forward driving gear')
     side = {'left': 'left', 'slight left': 'left', 'right': 'right', 'slight right': 'right'}.get(modifier)
+    if (self.city_bridge.accepted() or self.city_bridge.handoff_active(now)) and state['route_id']==self.city_bridge.key[0]:
+      side='left' if self.city_bridge.direction==1 else 'right'
     if side is None:
       return result('none', 'Unsupported direction; no U-turn or sharp-turn automation')
     if not reliable_position(state):
@@ -362,6 +369,29 @@ class NavigationDesire:
       self.confirmed = False
       self.started = None
       return result('none', 'Maneuver already passed; waiting for next route step')
+    if kind in ('turn','end of road') or self.city_bridge.accepted() or self.city_bridge.handoff_active(now):
+      if not isinstance(maneuver_id,str) or not maneuver_id:
+        self.city_bridge.withdraw('MANEUVER_ID_MISSING')
+        return result('none','Intersection identifier missing')
+      status=None
+      try:
+        with open(self.signal_status_path) as stream:
+          raw=stream.read(4097)
+        status=json.loads(raw) if len(raw)<=4096 else None
+      except (OSError,ValueError,TypeError):
+        pass
+      outcome=self.city_bridge.step(state,distance,cs,cc,now=now,enabled=city_enabled,
+        model=model,model_valid=model_inputs_valid,physical_direction=physical_direction,
+        signal_status=status,actual_curvature=actual_curvature)
+      self.decision['navigation_turn']=outcome
+      request=outcome.get('request')
+      self.confirmed=request is not None
+      if request is not None:
+        self.decision.update(route_id=request['route_id'],maneuver_id=request['maneuver_id'],
+                             maneuver_type=request['kind'],modifier='left' if request['direction']==1 else 'right')
+        current_maneuver_id=request['maneuver_id']
+      return result(outcome['desire'],outcome['reason'],outcome['indicator'])
+    self.city_bridge.withdraw('NOT_A_CITY_TURN')
     if distance <= 0:
       self.passed_key = key
     if classify_route_maneuver(maneuver) in ('highway_exit', 'road_fork'):
@@ -405,62 +435,7 @@ class NavigationDesire:
         model_frame=exit_model_frame, evidence=exit_corridor)
       self.decision['exit_sequence'] = sequence.diagnostic()
       return result(sequence.desire, sequence.reason, indicator)
-    if kind not in ('turn', 'end of road'):
-      return result('none', 'Maneuver type is display-only: ' + kind)
-    if not isinstance(maneuver_id, str) or not maneuver_id:
-      return result('none', 'Intersection identifier missing; reload navigation server')
-    # The phone/server clamps maneuver distance at zero. Never let a request
-    # begin at zero: that is normally a maneuver which has already been
-    # reached but has not yet advanced to the next route step.
-    if not 0 < distance <= TURN_CONFIRM_DISTANCE:
-      self.confirmed = False
-      self.started = None
-      return result('none', 'Intersection outside active approach window (0–80 m ahead)')
-    self.confirmed = True
-    if signal is not None and signal != side:
-      if self.indicator_request != 'none':
-        self.signal_cancelled_key = key
-      self.started = None
-      return result('none', 'Opposite physical blinker cancelled navigation signal')
-    signal_window = min(TURN_SIGNAL_DISTANCE_MAX,
-                        max(TURN_SIGNAL_DISTANCE_MIN, speed * TURN_SIGNAL_SECONDS))
-    indicator = 1 if side == 'left' else 2
-    if (distance > signal_window or signal is not None or not cc.latActive
-        or not reliable_position(state)
-        or self.signal_cancelled_key == key):
-      indicator = 0
-    elif self.started is None:
-      self.started = now
-
-    # Signaling announces the already-authorized route step and therefore
-    # starts on approach. The model turn desire remains conservatively gated
-    # by speed and vehicle control state.
-    if steering_override:
-      return result('none', 'Driver steering handover; turn guidance waits for release', indicator)
-    speed_max = TURN_CONTINUE_SPEED_MAX if self.turn_guidance_started else TURN_SPEED_MAX
-    if speed >= speed_max:
-      self.turn_guidance_started = False
-      return result('none', 'Turn signal active; model guidance waits below 25 mph' if speed_max == TURN_SPEED_MAX
-                    else 'Turn continuation exceeded 35 mph', indicator)
-    # Longitudinal pedal intervention is independent of navigation lateral
-    # guidance. The driver may control speed through the intersection while
-    # openpilot remains laterally active.
-    if not cc.latActive:
-      return result('none', 'Intersection guidance paused; lateral control inactive', indicator)
-    # Condition the existing policy before the driver must start the corner.
-    # Actuator assistance independently requires matching near-path geometry.
-    desire_window = min(40.0, max(12.0, speed*3.0))
-    self.decision['guidance_window_m'] = desire_window
-    if distance > desire_window:
-      waiting_reason = ('Turn signal active; waiting until model guidance window' if indicator
-                        else 'Turn confirmed; waiting until signal approach window')
-      return result('none', waiting_reason, indicator)
-    if not matching_signal(cs, 1 if side == 'left' else 2):
-      self.turn_guidance_started = False
-      return result('none', 'Turn guidance waiting for matching active blinker', indicator)
-    return result('turnLeft' if side == 'left' else 'turnRight',
-                  'Navigation-authorized low-speed intersection turn',
-                  indicator)
+    return result('none', 'Maneuver type is display-only: ' + kind)
 
   def _publish_signal(self, direction, maneuver_id, desire, reason, now):
     name = None
@@ -468,7 +443,15 @@ class NavigationDesire:
       with tempfile.NamedTemporaryFile(mode='w', dir=os.path.dirname(self.signal_path),
                                        prefix='.nap-nav-signal-', delete=False) as stream:
         name = stream.name
-        stream.write(json.dumps({'time': now, 'active': direction in (1, 2),
+        request=self.city_bridge.request or {}
+        controller=request.get('controller',self.city_bridge.controller)
+        route_id=request.get('route_id',self.decision.get('route_id',''))
+        key=request.get('key') or hashlib.sha256(('|'.join((controller,route_id,maneuver_id))).encode()).hexdigest()[:32]
+        stream.write(json.dumps({'version': 2, 'time': now, 'active': direction in (1, 2),
+                   'route_id': route_id,
+                   'controller': controller, 'request_key': key,
+                   'signal_owner': 'navigation', 'cadence_mode': 'factory',
+                   'stationary_wait_allowed': bool(request and request.get('stationary_wait_allowed')),
                    'direction': direction if direction in (1, 2) else 0,
                    'maneuver_id': maneuver_id if isinstance(maneuver_id, str) else '',
                    'desire': desire, 'reason': reason}, allow_nan=False))
@@ -486,7 +469,12 @@ class NavigationDesire:
                              signal_owner='none', tap_enabled=False,
                              tap_status='unavailable', tap_signal_active=False,
                              manual_turn_direction=0, city_turns_enabled=False, manual_turn_blocked=False,
-                             manual_turn_continuing=False, manual_turn_phase=None, manual_turn_reason=None):
+                             manual_turn_continuing=False, manual_turn_phase=None, manual_turn_reason=None, city_turn_diagnostics=None, city_turn_plan=None):
+    self.city_turn_diagnostics = city_turn_diagnostics
+    self.decision['city_turn_plan'] = city_turn_plan
+    self.decision['turn_locked'] = (isinstance(city_turn_diagnostics, dict)
+                                    and city_turn_diagnostics.get('turn_locked') is True)
+    self.decision['city_turn_stage'] = city_turn_diagnostics.get('stage') if isinstance(city_turn_diagnostics, dict) else None
     # Captured after model.run, before DesireHelper updates for the next frame.
     self.decision.update(selected_desire=selected, final_desire=selected if evaluated else None,
                          source=source, model_evaluated=bool(evaluated), frame_id=int(frame_id),
@@ -510,7 +498,7 @@ class NavigationDesire:
               and self.decision.get('city_turns_enabled') is True
               and self.decision.get('manual_turn_direction') in (1, 2))
     navigation = (self.decision.get('desire') in ('turnLeft', 'turnRight', 'keepLeft', 'keepRight')
-                  or self.decision.get('source') == 'navigation'
+                  or self.decision.get('source') in ('navigation','navigation_city_turn')
                   or self.decision.get('synthetic_indicator_request') in ('left', 'right'))
     # One final fast publication withdraws a request promptly when it ends.
     interval = .05 if (manual or self.manual_diagnostics_active
@@ -527,6 +515,27 @@ class NavigationDesire:
         name = stream.name
         stream.write(json.dumps(self.decision, allow_nan=False))
       os.replace(name, self.diagnostics_path)
+      if isinstance(getattr(self, 'city_turn_diagnostics', None), dict):
+        trace = dict(self.city_turn_diagnostics)
+        if not hasattr(self, 'city_turn_boot_id'):
+          try:
+            with open('/proc/sys/kernel/random/boot_id') as boot:
+              self.city_turn_boot_id = boot.read(80).strip()
+          except OSError:
+            self.city_turn_boot_id = None
+        trace['boot_id'] = self.city_turn_boot_id
+        trace['implementation'] = 'navigation-city-turn-v6-candidate'
+        trace['city_turn_plan'] = self.decision.get('city_turn_plan')
+        trace.update(producer_mono=self.decision.get('received_mono'),
+                     inference_frame=self.decision.get('frame_id'), evaluated=self.decision.get('model_evaluated'),
+                     final_desire=self.decision.get('final_desire'), source=self.decision.get('source'),
+                     owner=self.decision.get('signal_owner'), synthetic=self.decision.get('synthetic_indicator_request'),
+                     tap_active=self.decision.get('tap_signal_active'))
+        with tempfile.NamedTemporaryFile(mode='w', dir=os.path.dirname(self.diagnostics_path),
+                                         prefix='.nap-city-turn-', delete=False) as stream:
+          name = stream.name
+          stream.write(json.dumps(trace, allow_nan=False))
+        os.replace(name, os.path.join(os.path.dirname(self.diagnostics_path), 'nap_city_turn_intent.json'))
     except (OSError, ValueError, TypeError):
       pass  # Diagnostics must never interrupt model inference.
     finally:

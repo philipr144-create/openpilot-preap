@@ -285,42 +285,42 @@ class CityTurnGates(unittest.TestCase):
     self.assertFalse(self.helper.manual_entry.blocked)
 
   def test_nav_speed_distance_and_override(self):
+    self.prepare()
     with tempfile.TemporaryDirectory() as d:
       root=Path(d)
       nav=NavigationDesire(str(root/'nav'), str(root/'diag'), str(root/'signal'))
-      nav.params=N(get_bool=lambda _: True)
-      state=dict(enabled=True, route_active=True, received_mono=100., expires_mono=103.,
-                 route_state='active', route_id='test', maneuver_id='turn1',
-                 position_quality=dict(match_error_m=2., gps_accuracy_m=3., gps_age_s=.1),
+      nav.params=N(get_bool=lambda _: True, get=lambda _: b'1')
+      state=dict(version=4, enabled=True, route_active=True, received_mono=100., expires_mono=103.,
+                 route_state='active', route_id='test', maneuver_id='1',
+                 position_quality=dict(match_error_m=2., gps_accuracy_m=3., gps_age_s=.1,
+                                       projection_valid=True, path_ambiguous=False, heading_error_deg=0.),
                  maneuver=dict(type='turn', modifier='left', distance_m=10.))
-      cc=N(latActive=True)
+      cc=N(latActive=True, enabled=True)
       def tick():
+        self.now += .05
+        self.model.frameId += 1
+        state.update(received_mono=self.now, expires_mono=self.now+3.)
         (root/'nav').write_text(json.dumps(state))
-        return nav.update(self.cs, cc, True, now=101., physical_direction=0)
+        return nav.update(self.cs, cc, True, now=self.now, physical_direction=1,
+                          model=self.model, model_inputs_valid=True, city_enabled=True, actual_curvature=0.)
+      for _ in range(3): self.assertEqual(tick(), 'none')
+      for _ in range(10): tick()
       self.assertEqual(tick(), 'turnLeft')
       self.cs.vEgo=26*.44704
       self.assertEqual(tick(), 'turnLeft')
       self.cs.vEgo=36*.44704
       self.assertEqual(tick(), 'none')
-      self.assertIn('35 mph', nav.decision['reason'])
       self.cs.vEgo=10*.44704
-      state['maneuver']['distance_m']=25.
       self.assertEqual(tick(), 'none')
-      state['maneuver']['distance_m']=10.
-      # Driver effort cancels the acquired route turn; it cannot fight
-      # the driver again on release during the same maneuver.
+      state['maneuver_id']='2'
+      for _ in range(14): tick()
+      self.assertEqual(tick(), 'turnLeft')
       self.cs.steeringPressed=True
       self.assertEqual(tick(), 'none')
-      self.assertTrue(nav.blocked)
       self.assertEqual(nav.indicator_request, 'none')
       self.cs.steeringPressed=False
       self.assertEqual(tick(), 'none')
-      self.assertTrue(nav.blocked)
-      state['maneuver_id']='turn2'
-      self.assertEqual(tick(), 'turnLeft')
-      self.assertFalse(nav.blocked)
-
-      # A maneuver clamped at zero must never start/restart guidance.
+      state['maneuver_id']='3'
       state['maneuver']['distance_m']=0.
       self.assertEqual(tick(), 'none')
 

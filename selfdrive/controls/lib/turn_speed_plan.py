@@ -17,7 +17,7 @@ def path_turn_target(xs, ys, lateral_accel, decel, cruise):
   if distance[-1] < 8.:return None
   caps=[]
   for i,(a,b,c) in enumerate(zip(points,points[1:],points[2:])):
-    if distance[i+2] > 40.:break
+    if distance[i+2] > 100.:break
     ab,bc,ac=math.dist(a,b),math.dist(b,c),math.dist(a,c)
     if min(ab,bc,ac)<.5:continue
     k=abs(2*((b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0])))/(ab*bc*ac)
@@ -39,17 +39,24 @@ class TurnSpeedPlan:
     self.owner='OFF'
     self.last_time=None
 
-  def update(self, target, speed, actual_curvature, cruise, now, eligible, override, long_ready):
+  def update(self, target, speed, actual_curvature, cruise, now, eligible, override, long_ready, locked=False, phase=None):
     if not eligible or target is None or not all(math.isfinite(v) for v in (target,speed,actual_curvature,cruise,now)):
       self.reset()
       return None
     dt=now-self.last_time if self.last_time is not None else .05
+    if self.last_time is not None and not 0 < dt <= .25:
+      self.reset()
+      return None
     previous=self.target
     self.last_time=now
+    # Retain the acquired approach ceiling until physical turn entry. Fresh
+    # caller eligibility is required every tick; this never survives revocation.
+    if phase is None and locked and previous is not None and self.phase == 'APPROACH' and actual_curvature < .008:
+      target = min(target, previous)
     self.target=min(target,cruise)
     if previous is not None and 0<dt<=.25 and self.target>previous:
-      self.target=min(self.target,max(previous,min(speed,self.target))+.6*dt)
-    self.phase=('TURN' if actual_curvature>=.008 else
+      self.target=min(self.target,previous+.6*dt) if phase is not None else min(self.target,max(previous,min(speed,self.target))+.6*dt)
+    self.phase=phase if phase is not None else ('TURN' if actual_curvature>=.008 else
                 'APPROACH' if target<cruise-.1 else 'EXIT')
     self.owner='DRIVER' if override else 'PLANNER' if long_ready else 'WAIT_LONG'
     return self.target if self.owner=='PLANNER' else None

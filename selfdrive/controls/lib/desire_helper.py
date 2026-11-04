@@ -1,8 +1,9 @@
 import json
 import time
+import math
 
 from openpilot.selfdrive.controls.lib.navigation_turn_commit import ManualTurnEntry
-from openpilot.selfdrive.controls.lib.turn_context import driver_braking
+from openpilot.selfdrive.controls.lib.turn_context import driver_braking, city_turns_enabled
 
 from cereal import log
 from openpilot.common.constants import CV
@@ -49,6 +50,7 @@ class DesireHelper:
     self.desire = log.Desire.none
     self.manual_turns_enabled = False
     self.manual_turn_poll = 0
+    self.last_city_toggle_read = -math.inf
     self.params = Params()
 
     # PREAP_MANUAL_TURN_CANCEL_LATCH_V1
@@ -57,9 +59,22 @@ class DesireHelper:
     self.manual_turn_command_active = False
     self.manual_turn_cancelled = False
     self.manual_entry = ManualTurnEntry()
+    self.manual_turn_gates = {}
+    self.manual_turn_direction = 0
+    self.accepted_request_controller = None
+
+  def refresh_city_turns(self, now=None):
+    now = time.monotonic() if now is None else now
+    if now-self.last_city_toggle_read >= .1 or now < self.last_city_toggle_read:
+      self.manual_turns_enabled = city_turns_enabled(self.params)
+      self.last_city_toggle_read = now
+    return self.manual_turns_enabled
 
   def suspend_for_navigation(self, carstate):
     self.manual_entry.reset()
+    self.manual_turn_direction = 0
+    self.accepted_request_controller = None
+    self.manual_turn_gates = {'owner_suppression': True}
     self.manual_turn_command_active = False
     self.lane_change_state = LaneChangeState.off
     self.lane_change_direction = LaneChangeDirection.none
@@ -100,36 +115,28 @@ class DesireHelper:
     return LaneChangeDirection.left if CS.leftBlinker else LaneChangeDirection.right
 
   def update(self, carstate, lateral_active, lane_change_prob, *, manual_turn_direction=0,
-             model=None, inputs_valid=False, now=None, actual_curvature=None):
+             model=None, inputs_valid=False, now=None, actual_curvature=None,
+             manual_turn_request_valid=False, physical_direction=0, manual_turn_request_controller=None):
     now = time.monotonic() if now is None else now
     v_ego = carstate.vEgo
     one_blinker = carstate.leftBlinker != carstate.rightBlinker
+    self.manual_turn_direction = 0
     below_lane_change_speed = v_ego < LANE_CHANGE_SPEED_MIN
 
-    # Restored low-speed manual-blinker turn desires. Independent of longitudinal control.
-    if self.manual_turn_poll % 100 == 0:
-      raw_param = self.params.get("NAPCityTurns")
-      if raw_param is not None:
-        self.manual_turns_enabled = (raw_param is True)
-      else:
-        self.manual_turns_enabled = False
-        try:
-          with open("/data/nap_turn_settings.json") as stream:
-            cfg = json.loads(stream.read(2049))
-          self.manual_turns_enabled = cfg.get("manual_blinker_turns") is True
-        except (OSError, ValueError, TypeError, AttributeError):
-          pass
+    self.refresh_city_turns(now)
     self.manual_turn_poll += 1
 
     if not one_blinker:
       self.manual_turn_cancelled = False
       self.manual_entry.reset()
+      self.accepted_request_controller = None
 
     continuing_turn = self.manual_entry.started is not None
-    turn_speed_max = 35 * CV.MPH_TO_MS if continuing_turn else CITY_TURN_SPEED_MAX
-    if self.manual_turns_enabled and -0.1 <= v_ego < turn_speed_max:
-      # A lamp is not authorization: only a fresh, classified physical hold can
-      # arm. TapModel owns half-stalk requests independently above SPEED_MIN.
+    turn_speed_max = 40 * CV.MPH_TO_MS
+    if self.manual_turns_enabled and -0.1 <= v_ego <= turn_speed_max:
+      # Fresh classified physical intent is required to start. An already
+      # accepted turn may retain its direction with the same signal and live
+      # request producer; it still passes every independent cancellation gate.
       self.lane_change_state = LaneChangeState.off
       self.lane_change_direction = LaneChangeDirection.none
       self.lane_change_timer = 0.0
@@ -138,30 +145,76 @@ class DesireHelper:
       self.prev_one_blinker = one_blinker
       self.desire = log.Desire.none
       direction = manual_turn_direction
-      authorized = (inputs_valid and lateral_active and one_blinker
-                    and type(direction) is int and direction in (1, 2)
-                    and (direction == 1) == bool(carstate.leftBlinker)
-                    and not carstate.steeringPressed
-                    and not getattr(carstate, 'steeringDisengage', False)
-                    and carstate.canValid
-                    and str(carstate.gearShifter) in ('drive', 'low', 'sport', 'eco')
-                    and not (carstate.leftBlindspot if direction == 1 else carstate.rightBlindspot))
+      # The upstream classifier may suppress turn classification above 25 mph.
+      # A fresh physical hold may gather approach evidence, without turn desire.
+      if (v_ego > CITY_TURN_SPEED_MAX and manual_turn_request_valid is True
+          and type(physical_direction) is int and physical_direction in (1, 2)
+          and type(manual_turn_request_controller) is str and manual_turn_request_controller):
+        direction = physical_direction
+      classified = type(direction) is int and direction in (1, 2)
+      accepted = self.manual_entry.direction
+      controller_changed = ((self.manual_entry.started is not None or self.manual_entry.stop_armed or self.manual_entry.turn_locked) and self.accepted_request_controller is not None
+                            and manual_turn_request_controller != self.accepted_request_controller)
+      if controller_changed:
+        self.manual_entry.cancel('REQUEST_CONTROLLER_CHANGED')
+      retained = (type(direction) is int and direction == 0
+                  and (self.manual_entry.started is not None or self.manual_entry.stop_armed) and not self.manual_entry.blocked
+                  and accepted in (1, 2) and one_blinker
+                  and (accepted == 1) == bool(carstate.leftBlinker)
+                  and manual_turn_request_valid is True
+                  and type(manual_turn_request_controller) is str and bool(manual_turn_request_controller)
+                  and manual_turn_request_controller == self.accepted_request_controller
+                  and type(physical_direction) is int and physical_direction in (0, accepted))
+      if retained:
+        direction = accepted
+      self.manual_turn_direction = direction if classified or retained else 0
+      self.manual_turn_gates = {
+        'city_turns_enabled': bool(self.manual_turns_enabled), 'inputs_valid': bool(inputs_valid),
+        'lateral_active': bool(lateral_active), 'single_blinker': bool(one_blinker),
+        'direction_authorized': classified or retained,
+        'request_fresh_for_retention': classified or manual_turn_request_valid is True,
+        'request_controller_unchanged': not controller_changed,
+        'matching_blinker': (direction == 1) == bool(carstate.leftBlinker),
+        'no_driver_override': not carstate.steeringPressed and not getattr(carstate, 'steeringDisengage', False),
+        'can_valid': bool(getattr(carstate, 'canValid', False)),
+        'drive_gear': str(carstate.gearShifter) in ('drive', 'low', 'sport', 'eco'),
+        'blindspot_clear': not (carstate.leftBlindspot if direction == 1 else carstate.rightBlindspot),
+      }
+      authorized = all(self.manual_turn_gates.values())
+      stationary_wait = (not lateral_active and 0 <= v_ego <= .3
+                         and not self.manual_entry.physical_turn_started
+                         and all(v for k, v in self.manual_turn_gates.items() if k != 'lateral_active'))
       self.manual_turn_command_active = self.manual_entry.update(
         model, direction, max(0.0, v_ego), authorized, now,
-        transient_unavailable=not inputs_valid, actual_curvature=actual_curvature,
+        transient_unavailable=not inputs_valid, actual_curvature=actual_curvature, stationary_wait=stationary_wait,
         driver_assisting=(carstate.steeringPressed and not getattr(carstate, "steeringDisengage", False)
                           and inputs_valid and lateral_active and one_blinker
                           and direction in (1, 2)))
+      if (self.manual_entry.started is not None or self.manual_entry.stop_armed or self.manual_entry.turn_locked) and classified:
+        self.accepted_request_controller = (manual_turn_request_controller
+                                            if type(manual_turn_request_controller) is str and manual_turn_request_controller else None)
+      self.manual_entry.authorization_trace = {
+        'raw_classified_direction': manual_turn_direction if type(manual_turn_direction) is int else None,
+        'physical_direction': physical_direction if type(physical_direction) is int else None,
+        'effective_direction': self.manual_turn_direction, 'direction_retained': retained,
+        'request_valid': manual_turn_request_valid is True,
+        'request_controller': manual_turn_request_controller if type(manual_turn_request_controller) is str else None,
+        'reason': ('REQUEST_CONTROLLER_CHANGED' if controller_changed else 'ACCEPTED_TURN_SAME_SIGNAL'
+                   if retained else 'FRESH_CLASSIFICATION' if classified else 'NO_CLASSIFIED_DIRECTION'),
+      }
       self.manual_turn_cancelled = self.manual_entry.blocked
       if self.manual_turn_command_active:
         self.desire = log.Desire.turnLeft if direction == 1 else log.Desire.turnRight
       return
 
+    self.manual_turn_gates = {'city_turns_enabled': bool(self.manual_turns_enabled),
+                              'within_city_turn_speed': -.1 <= v_ego < turn_speed_max}
     if self.manual_entry.started is not None:
-      self.manual_entry.cancel()
+      self.manual_entry.cancel('CITY_TURN_DISABLED_OR_SPEED')
     elif not self.manual_entry.blocked:
       self.manual_entry.reset()
     self.manual_turn_command_active = False
+    self.accepted_request_controller = None
 
     if not lateral_active or self.lane_change_timer > LANE_CHANGE_TIME_MAX:
       self.lane_change_state = LaneChangeState.off

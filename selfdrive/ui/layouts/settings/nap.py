@@ -27,9 +27,11 @@ from openpilot.selfdrive.ui.layouts.settings.nap_content import (
   acknowledgments_html, find_preset_index,
   PREAP_TOGGLES, PREAP_DEV_TOGGLES,
 )
+from server.phone_navigation.tesla_gps_assist import enabled as tesla_gps_enabled, set_enabled as set_tesla_gps_enabled
 from opendbc.car.tesla.preap.nap_params import NAPParamKeys, DEFAULTS
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.selfdrive.nap.spoken_status_v2 import read_enabled as read_spoken_enabled, write_enabled as write_spoken_enabled
+from openpilot.selfdrive.ui.onroad.vision_leads import read_enabled as read_vision_leads, write_enabled as write_vision_leads
 
 
 class SectionHeader(Widget):
@@ -105,6 +107,14 @@ class NAPLayout(Widget):
     # ── Section 1: Pre-AP Driving Features ──
     self._all_items.append(section_header_item("Pre-AP Driving Features"))
     
+    self._tesla_gps_toggle = toggle_item(
+      "Tesla GPS Assist",
+      description="Prefer Tesla GPS for route position, with comma GPS as fallback.",
+      initial_state=tesla_gps_enabled(),
+      callback=self._on_tesla_gps_assist,
+      enabled=self._can_change_tesla_gps_assist(),
+    )
+    self._all_items.append(self._tesla_gps_toggle)
     for toggle in PREAP_TOGGLES:
       param_key = toggle["param"]
       
@@ -268,6 +278,15 @@ class NAPLayout(Widget):
 
     # ── Section 4: Radar ──
     self._all_items.append(section_header_item("Radar"))
+    self._vision_leads_toggle = toggle_item(
+      "Vision Lead Diagnostics",
+      "Show the vision model’s lead estimates: cyan for now, amber for 2 and 4 seconds ahead. "
+      "These can describe the same object. Box sizes are illustrative; this is not a view of all nearby objects. "
+      "Display only; changes apply during a trip.",
+      read_vision_leads(), callback=self._on_vision_leads,
+    )
+    self._all_items.append(self._vision_leads_toggle)
+
 
     self._add_toggle(
       NAPParamKeys.RADAR_ENABLED,
@@ -633,12 +652,38 @@ class NAPLayout(Widget):
     pct = 100. * value['engaged'] / total if total else 0.
     return f"{pct:.1f}% · {value['engaged']:,.0f} mi"
 
+  def _on_vision_leads(self, enabled):
+    if not write_vision_leads(enabled):
+      gui_app.push_widget(ConfirmDialog("Could not save Vision Lead Diagnostics. Please try again.", "OK"))
+    self._vision_leads_toggle.action_item.set_state(read_vision_leads())
+
   def _on_spoken_status(self, enabled):
     write_spoken_enabled(enabled)
     self._spoken_status_toggle.action_item.set_state(read_spoken_enabled())
 
+  @staticmethod
+  def _can_change_tesla_gps_assist():
+    if ui_state.is_offroad:
+      return True
+    try:
+      sm = ui_state.sm
+      if not sm.all_checks(["carState", "selfdriveState"]):
+        return False
+      car, drive = sm["carState"], sm["selfdriveState"]
+      return car.gearShifter == "park" and abs(car.vEgo) < .01 and not drive.enabled and not drive.active
+    except (AttributeError, KeyError):
+      return False
+
+  def _on_tesla_gps_assist(self, enabled):
+    if self._can_change_tesla_gps_assist():
+      set_tesla_gps_enabled(enabled)
+    self._tesla_gps_toggle.action_item.set_state(tesla_gps_enabled())
+
   def _refresh_toggles(self):
     """Sync all toggle states from params (handles external changes)."""
+    self._tesla_gps_toggle.action_item.set_state(tesla_gps_enabled())
+    self._tesla_gps_toggle.action_item.set_enabled(self._can_change_tesla_gps_assist())
+    self._vision_leads_toggle.action_item.set_state(read_vision_leads())
     self._spoken_status_toggle.action_item.set_state(read_spoken_enabled())
     self._spoken_status_toggle.action_item.set_enabled(True)
     self._stats_strip_toggle.action_item.set_state(ui_state.engagement_stats.show_onroad)

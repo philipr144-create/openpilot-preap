@@ -36,6 +36,7 @@ class TapModel:
 
     self.request_valid = False
     self.rearm_gesture = None
+    self.flash_started = None
 
   def update(self, cs, cc, valid, nav_claim, lane_change_prob, now=None):
     now = time.monotonic() if now is None else now
@@ -110,6 +111,7 @@ class TapModel:
       ):
         self.helper.suspend_for_navigation(cs)
         self.status = "waiting"
+        self.flash_started = None
     if self.rearm_gesture is not None and self.rearm_gesture != request.get("gesture"):
       self.rearm_gesture = None
     # `suppress` remains latched after a consumed gesture to prevent replay;
@@ -130,7 +132,21 @@ class TapModel:
       ):
         self.status = "cancelled"
       else:
-        self.status = self.helper.update_tap(cs, lane_change_prob, request["direction"])
+        # Start the lead-in only after carState confirms the requested signal.
+        # A missing/opposite signal or hazards restart the entire waiting period.
+        matching_signal = (bool(cs.leftBlinker) != bool(cs.rightBlinker)
+                           and bool(cs.leftBlinker) == (request["direction"] == 1))
+        if self.status == "waiting":
+          if not matching_signal or not self.signal_active:
+            self.flash_started = None
+          elif self.flash_started is None or now < self.flash_started:
+            self.flash_started = now
+          if self.flash_started is None or now - self.flash_started < .5:
+            self.helper.suspend_for_navigation(cs)
+          else:
+            self.status = self.helper.update_tap(cs, lane_change_prob, request["direction"])
+        else:
+          self.status = self.helper.update_tap(cs, lane_change_prob, request["direction"])
     ended_this_frame = maneuver_was_active and self.status in ("complete", "cancelled", "blocked")
     if (handled or ended_this_frame) and self.status not in ("waiting", "starting", "finishing"):
       self.helper.suspend_for_navigation(cs)

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import json
 import math
 from openpilot.system.hardware import TICI
 os.environ['DEV'] = 'QCOM' if TICI else 'CPU'
@@ -311,6 +312,8 @@ def main(demo=False):
   long_delay = CP.longitudinalActuatorDelay + LONG_SMOOTH_SECONDS
   prev_action = log.ModelDataV2.Action()
 
+  from openpilot.selfdrive.controls.lib.city_turn_plan import CityTurnPlan
+  city_turn_plan = CityTurnPlan()
   DH = DesireHelper()
   tap_model = TapModel(DH) if CP.carFingerprint == "TESLA_MODEL_S_PREAP" else None
   tap_lane_change_prob = 1.0
@@ -358,6 +361,7 @@ def main(demo=False):
       meta_extra = meta_main
 
     sm.update(0)
+    DH.refresh_city_turns(time.monotonic())
 
     driver_desire = DH.desire
     desire = driver_desire
@@ -378,7 +382,14 @@ def main(demo=False):
     nav_request = nav_desire.update(sm['carState'], sm['carControl'], nav_inputs_valid,
                                     driver_desire_none=(desire == log.Desire.none),
                                     signal_owned_by_tap=tap_signal_active,
-                                    physical_direction=physical_direction)
+                                    physical_direction=physical_direction,
+                                    model=last_manual_model,
+                                    model_inputs_valid=(nav_inputs_valid and sm.all_checks(['liveCalibration'])
+                                      and sm['liveCalibration'].calStatus == log.LiveCalibrationData.Status.calibrated
+                                      and 0<=time.monotonic()-last_manual_model_time<=.15),
+                                    city_enabled=DH.manual_turns_enabled,
+                                    actual_curvature=(-math.tan(math.radians(sm['carState'].steeringAngleDeg)/CP.steerRatio)/CP.wheelbase
+                                      if CP.steerRatio>0 and CP.wheelbase>0 else None))
     nav_owned = nav_desire.owns_blinker
     if previous_nav_owner and not nav_owned:
       manual_rearm = True
@@ -405,6 +416,9 @@ def main(demo=False):
       now = time.monotonic()
       DH.update(sm['carState'], sm['carControl'].latActive, tap_lane_change_prob,
                 manual_turn_direction=tap_model.manual_turn_direction if tap_model is not None else 0,
+                manual_turn_request_valid=tap_model.request_valid if tap_model is not None else False,
+                manual_turn_request_controller=tap_model.controller if tap_model is not None else None,
+                physical_direction=tap_model.physical_direction if tap_model is not None else 0,
                 model=last_manual_model,
                 inputs_valid=(nav_inputs_valid and sm.all_checks(['liveCalibration'])
                               and sm['liveCalibration'].calStatus == log.LiveCalibrationData.Status.calibrated
@@ -434,6 +448,11 @@ def main(demo=False):
       desire = getattr(log.Desire, nav_request)
     else:
       selection_source = 'driver_desire_helper'
+    if nav_desire.city_bridge.request is not None and not tap_handled:
+      selection_source='navigation_city_turn'
+    if desire in (log.Desire.turnLeft, log.Desire.turnRight) and not DH.manual_turns_enabled:
+      desire = log.Desire.none
+      selection_source = 'city_turn_disabled'
     if desire in (log.Desire.turnLeft, log.Desire.turnRight):
       turn_direction = 1 if desire == log.Desire.turnLeft else 2
       if not matching_signal(sm['carState'], turn_direction):
@@ -491,20 +510,61 @@ def main(demo=False):
                     ('none', 'turnLeft', 'turnRight', 'laneChangeLeft', 'laneChangeRight', 'keepLeft', 'keepRight')}
     selected_name = desire_names.get(desire, 'unknown')
     signal_owner = ('driver' if physical_direction in (1, 2)
+                    or (selection_source == 'driver_desire_helper' and DH.manual_turn_command_active)
+                    or (DH.manual_turn_direction in (1,2)
+                        and DH.manual_turn_gates.get('direction_authorized') is True
+                        and DH.manual_turn_gates.get('matching_blinker') is True
+                        and tap_model is not None and tap_model.request_valid)
                     else 'navigation' if nav_desire.indicator_request != 'none'
                     else 'tap' if tap_signal_active else 'none')
+    nav_turn=nav_desire.decision.get('navigation_turn') or {}
+    nav_lease=nav_turn.get('request')
+    navigation_city=isinstance(nav_lease,dict) and selection_source=='navigation_city_turn'
+    if navigation_city:
+      signal_owner='navigation'
+    shared_intent=nav_desire.city_bridge.intent if navigation_city else DH.manual_entry
+    shared_turn = city_turn_plan.update(
+      intent=shared_intent, model=last_manual_model, cs=sm['carState'], now=time.monotonic(),
+      enabled=DH.manual_turns_enabled,
+      inputs_valid=(nav_inputs_valid and model_output is not None
+                    and 0 <= time.monotonic()-last_manual_model_time <= .15
+                    and (navigation_city or all(v for k,v in DH.manual_turn_gates.items() if k!='lateral_active'))
+                    and (sm['carControl'].latActive
+                         or -.1 <= sm['carState'].vEgo <= .3 and shared_intent.phase=='ARMED')),
+      controller=nav_lease['controller']+nav_lease['key'] if navigation_city else tap_model.controller if tap_model is not None else None,
+      direction=nav_lease['direction'] if navigation_city else DH.manual_turn_direction,
+      owner=signal_owner, request=nav_lease if navigation_city else None)
     nav_desire.record_model_selection(selected_name, selection_source, model_output is not None,
                                       meta_main.frame_id, signal_owner=signal_owner,
                                       tap_enabled=tap_model.enabled if tap_model is not None else False,
                                       tap_status=tap_model.status if tap_model is not None else 'unavailable',
                                       tap_signal_active=tap_signal_active,
-                                      manual_turn_direction=tap_model.manual_turn_direction if tap_model is not None else 0,
+                                      manual_turn_direction=DH.manual_turn_direction,
                                       city_turns_enabled=DH.manual_turns_enabled,
                                       manual_turn_blocked=DH.manual_entry.blocked,
                                       manual_turn_continuing=DH.manual_entry.started is not None,
                                       manual_turn_phase=DH.manual_entry.phase,
-                                      manual_turn_reason=DH.manual_entry.reason)
+                                      manual_turn_reason=DH.manual_entry.reason,
+                                      city_turn_diagnostics=shared_intent.diagnostics(time.monotonic(), DH.manual_turn_gates),
+                                      city_turn_plan=shared_turn)
     nav_desire.publish_diagnostics()
+    # Persist exact lifecycle transitions in ordinary rlogs, including cases
+    # where a passive server reader misses a short-lived sidecar frame.
+    try:
+      turn_trace = shared_intent.diagnostics(time.monotonic(), DH.manual_turn_gates)
+      turn_trace['city_turn_plan'] = shared_turn
+      turn_trace.update(inference_frame=int(meta_main.frame_id), final_desire=selected_name,
+                        source=selection_source, owner=signal_owner, evaluated=model_output is not None)
+      trace_key = (shared_turn.get('id'), shared_turn.get('phase'), shared_turn.get('geometry_status'),
+                   turn_trace['phase'], turn_trace['reason'], selected_name, selection_source,
+                   signal_owner, turn_trace['blocked'],
+                   turn_trace.get('authorization_trace', {}).get('direction_retained'),
+                   turn_trace.get('authorization_trace', {}).get('raw_classified_direction'))
+      if trace_key != getattr(DH, '_last_turn_trace', None):
+        cloudlog.info('NAP_CITY_TURN %s', json.dumps(turn_trace, allow_nan=False))
+        DH._last_turn_trace = trace_key
+    except (ValueError, TypeError, AttributeError):
+      pass
     mt2 = time.perf_counter()
     model_execution_time = mt2 - mt1
 
