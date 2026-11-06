@@ -514,11 +514,11 @@ class TestNAPUnifiedNavigate(unittest.TestCase):
       self.assertLess(cap, 10.0)
       self.assertGreater(cap, 2.0)
 
-  def test_speed_limit_transition_holds_current_road_limit(self):
-    """Verify that current road speed limit prevents cruise ceiling from rebounding when upcoming drop expires."""
+  def test_speed_limit_does_not_hard_cap_driver_cruise(self):
+    """Verify that current road speed limit does NOT hard-cap cruise speed when no upcoming drop exists."""
     now = 200.0
     with tempfile.NamedTemporaryFile(mode='w', suffix='.json') as tf:
-      # Vehicle crossed into the 45 mph zone (20.1 m/s); upcoming_speed_limit is None
+      # Vehicle driving on 45 mph road (20.1 m/s); upcoming_speed_limit is None
       data = {
         'version': 3, 'enabled': True, 'valid': True, 'control_valid': True, 'status': 'ok',
         'mono_time': now, 'expires_mono': now + 1.0,
@@ -531,9 +531,8 @@ class TestNAPUnifiedNavigate(unittest.TestCase):
       tf.flush()
 
       cap = map_curve_speed_cap(path=tf.name, now=now, v_ego=24.0, include_curves=False, anticipatory_speed_limit_enabled=True)
-      self.assertIsNotNone(cap)
-      # Cap must remain at 20.1168 m/s (45 mph), not None
-      self.assertAlmostEqual(cap, 20.1168, places=3)
+      # Cap must be None so driver can set higher cruise speed without being clamped
+      self.assertIsNone(cap)
 
   def test_turn_propulsion_continuous_through_2_5_mps_transition(self):
     """Verify that taking off into a sharp turn maintains torque without stumbling when crossing 2.5 m/s."""

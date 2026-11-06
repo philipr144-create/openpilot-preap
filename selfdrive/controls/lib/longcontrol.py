@@ -257,9 +257,13 @@ class LongControl:
         if self.releasing_stop:
           # Carry the stop command into release at the configured physical
           # ramp rate, without seeding the feedback integrator with braking.
-          release_ceiling = self.last_output_accel + self.CP.stoppingDecelRate * DT_CTRL
+          # When positive launch/turn acceleration is commanded, release promptly to avoid dead throttle hesitation.
+          release_rate = max(self.CP.stoppingDecelRate * 2.0, 2.5) if a_target > 0.0 else self.CP.stoppingDecelRate
+          release_ceiling = self.last_output_accel + release_rate * DT_CTRL
           if output_accel > release_ceiling:
             output_accel = release_ceiling
+            if a_target > 0.0 and (output_accel >= 0.0 or output_accel >= a_target):
+              self.releasing_stop = False
           else:
             self.releasing_stop = False
         # The planner owns the reference trajectory. Bound only extra

@@ -18,11 +18,17 @@ def classify_route_maneuver(maneuver):
   return 'route_following' if kind in ('depart', 'continue', 'new name', 'merge') else 'unknown'
 
 
-def route_reference_speed(maneuver):
-  """Preserve existing route speeds; exits/lane changes get no guessed cap."""
+def route_reference_speed(maneuver, highway_exit_enabled=False):
+  """Preserve existing route speeds; exits/lane changes get no guessed cap unless highway exit assist enabled."""
   kind = classify_route_maneuver(maneuver)
   if kind == 'arrival':
     return 3.0
+  if highway_exit_enabled and kind in ('highway_exit', 'road_fork'):
+    # Standard exit ramp speed: 15.65 m/s (~35 mph); forks / slight ramps: 20.1 m/s (~45 mph)
+    modifier = maneuver.get('modifier') if isinstance(maneuver, dict) else None
+    if modifier in ('slight right', 'slight left'):
+      return 20.1  # ~45 mph
+    return 15.65  # ~35 mph
   if kind != 'city_turn' or maneuver.get('modifier') not in ('left', 'right', 'slight left', 'slight right'):
     return None
   return 5.0 if maneuver['type'] == 'end of road' else 7.0

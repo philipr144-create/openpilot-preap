@@ -428,15 +428,6 @@ def map_curve_speed_cap(path=MAP_CONTEXT_SNAPSHOT, now=None, v_ego=None, consume
           cap = math.sqrt(target * target + 2.0 * comfort_decel * effective_dist)
           caps.append(cap)
 
-      # Maintain speed ceiling for the current road's posted speed limit
-      # so the transition does not immediately revert to old cruise when crossing the boundary
-      road = state.get('road')
-      if isinstance(road, dict):
-        current_limit = road.get('speed_limit_mps')
-        if (type(current_limit) in (int, float) and math.isfinite(current_limit)
-            and current_limit > 0.0):
-          caps.append(current_limit)
-
     if not caps:
       if use_spatial and diagnostic is not None:
         diagnostic['reason'] = 'SPATIAL_PROFILE' if curve_sink else 'NO_APPLICABLE_CURVE'

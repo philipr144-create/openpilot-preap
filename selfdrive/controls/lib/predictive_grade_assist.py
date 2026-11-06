@@ -12,7 +12,7 @@ MAX_BOOST_MPS2 = 0.35
 HIGH_SPEED_BOOST_MPS2 = 0.20
 FULL_SPEED_MPS = 65.0 / 2.2369362921
 OFF_SPEED_MPS = 80.0 / 2.2369362921
-MIN_SPEED_MPS = 20.0 / 2.2369362921
+MIN_SPEED_MPS = 2.5  # ~5.6 mph (extended to support city, intersection and neighborhood hills)
 # Gradual road-grade changes in recorded previews stay below two degrees.
 # Require a longer sustained preview to reject brief model fluctuations.
 TRIGGER_DEG = 0.5
@@ -127,7 +127,7 @@ class PredictiveGradeAssist:
       ('DRIVER_GAS', gas_pressed), ('DRIVER_BRAKE', brake_pressed),
       ('SPEED_RANGE', speed < MIN_SPEED_MPS or speed > OFF_SPEED_MPS + SPEED_TOLERANCE_MPS),
       ('BRAKING_OWNER', str(brake_reason).upper() not in permissions),
-      ('SPEED_RESTRICTION', target < driver_target - .25),
+      ('SPEED_RESTRICTION', speed > target - .10 and target < driver_target - .25),
       ('NEGATIVE_BASE_REQUEST', base < -.015),
       ('MPC_BRAKING', mpc < -.015),
       ('ABOVE_TARGET', speed > target + .20),

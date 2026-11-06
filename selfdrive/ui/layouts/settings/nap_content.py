@@ -247,6 +247,30 @@ PREAP_TOGGLES = [
         "title": "Corner Assist",
         "description": "Adjust supported controls when approaching detected corners.",
         "type": "bool"
+    },
+    {
+        "param": "NAPTurnPropulsionAssist",
+        "title": "Turn Propulsion Assist",
+        "description": "Autonomous throttle modulation and launch assist through turns and from a stop using steering and map context.",
+        "type": "bool"
+    },
+    {
+        "param": "NAPHighwayExitAssist",
+        "title": "Highway Exit Assist",
+        "description": "Automatically prepares and slows for interstate off-ramps and highway forks using GPS and navigation intent.",
+        "type": "bool"
+    },
+    {
+        "param": "NAPPredictiveGrade",
+        "title": "Predictive Grade Assist",
+        "description": "Model pitch and road grade compensation for smooth uphill and downhill speed holding.",
+        "type": "bool"
+    },
+    {
+        "param": "NAPAnticipatorySpeedLimits",
+        "title": "Anticipatory Speed Limits",
+        "description": "Smoothly decelerates in advance of upcoming lower speed limit zones using forward offline map geometry.",
+        "type": "bool"
     }
 ]
 
