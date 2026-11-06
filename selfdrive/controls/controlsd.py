@@ -474,6 +474,7 @@ class Controls:
       elif (
         abs(nap_target_curvature) < NAP_TURN_RATE_RELEASE_CURVATURE
         and abs(nap_prev_curvature) < NAP_TURN_RATE_RELEASE_CURVATURE
+        and abs(CS.steeringAngleDeg) < 8.0
       ):
         self.nap_turn_rate_assist_active = False
 
