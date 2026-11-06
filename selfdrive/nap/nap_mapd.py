@@ -1134,6 +1134,38 @@ def node_events(geom):
 
   return events
 
+def find_upcoming_speed_limit(geom, ways, current_way):
+  """Detect forward speed limit drops along the mapped path for anticipatory coast/decel."""
+  if not geom or not current_way:
+    return None
+
+  ways_dict = ways if isinstance(ways, dict) else {w.id: w for w in ways}
+  current_speed = parse_speed_mps(current_way.tags.get("maxspeed"))
+
+  for pt in geom:
+    way_id = pt.get("way_id")
+    dist = pt.get("distance", 0.0)
+    if way_id == current_way.id:
+      continue
+    next_way = ways_dict.get(way_id)
+    if not next_way:
+      continue
+    next_speed = parse_speed_mps(next_way.tags.get("maxspeed"))
+    if next_speed is None:
+      continue
+    if current_speed is None:
+      current_speed = next_speed
+      continue
+    if next_speed < current_speed - 0.5:
+      return {
+        "target_mps": round(next_speed, 2),
+        "target_mph": round(next_speed * 2.236936, 1),
+        "distance_m": round(dist, 1),
+        "current_mps": round(current_speed, 2),
+        "way_id": way_id,
+      }
+  return None
+
 def match_confidence(match, speed, lookahead):
   if match is None:
     return 0.0
@@ -1459,6 +1491,7 @@ class NapMapD:
       "route_point_count": len(route_points),
       "control_curve": control_curve,
       "control_curves": control_curves[:10],
+      "upcoming_speed_limit": find_upcoming_speed_limit(geom, self.ways, way),
       # Full spatial shape feeds the MPC; event percentiles remain UI only.
       "road_curvature_version": 1,
       "road_curvature_valid": not path_ambiguous or route_guided,
