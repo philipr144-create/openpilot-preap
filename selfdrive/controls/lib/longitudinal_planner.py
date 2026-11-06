@@ -380,7 +380,7 @@ def map_curve_speed_cap(path=MAP_CONTEXT_SNAPSHOT, now=None, v_ego=None, consume
           if not isinstance(event, dict):
             continue
 
-          if event.get('type') != 'stop_sign' or str(event.get('node_id')) in consumed_stops:
+          if event.get('type') not in ('stop_sign', 'traffic_signal', 'give_way') or str(event.get('node_id')) in consumed_stops:
             continue
 
           distance = event.get(
@@ -403,7 +403,7 @@ def map_curve_speed_cap(path=MAP_CONTEXT_SNAPSHOT, now=None, v_ego=None, consume
             * 0.8
             * max(
               0.0,
-              distance - MAPPED_STOP_APPROACH_BUFFER_M,
+              distance - traveled - MAPPED_STOP_APPROACH_BUFFER_M,
             )
           )
 
@@ -427,6 +427,15 @@ def map_curve_speed_cap(path=MAP_CONTEXT_SNAPSHOT, now=None, v_ego=None, consume
           comfort_decel = 0.65  # gentle coasting regen
           cap = math.sqrt(target * target + 2.0 * comfort_decel * effective_dist)
           caps.append(cap)
+
+      # Maintain speed ceiling for the current road's posted speed limit
+      # so the transition does not immediately revert to old cruise when crossing the boundary
+      road = state.get('road')
+      if isinstance(road, dict):
+        current_limit = road.get('speed_limit_mps')
+        if (type(current_limit) in (int, float) and math.isfinite(current_limit)
+            and current_limit > 0.0):
+          caps.append(current_limit)
 
     if not caps:
       if use_spatial and diagnostic is not None:
@@ -1228,6 +1237,8 @@ class LongitudinalPlanner:
 
     # Release removes only map authority; model/MPC stop requests remain intact.
     self.output_should_stop = self.output_should_stop or map_should_stop
+    if map_should_stop and not sm['carState'].gasPressed:
+      output_a_target = min(output_a_target, -0.5 if v_ego > 1.0 else -1.0)
 
     # CornerAssist is the sole gate for NAP turn-related longitudinal
     # behavior. Do not apply the old blinker-only -2.5 m/s^2 override: it
@@ -1267,13 +1278,16 @@ class LongitudinalPlanner:
       launch_turn = bool(self.nap_turn_propulsion_assist and v_ego < 2.5
                          and (measured_turn or abs(steer_angle_deg) >= 25.0
                               or (intent_valid and abs(cs.steeringAngleDeg) >= 15.0)))
+      turn_in_progress = bool(self.nap_turn_propulsion_assist and v_ego < 8.0
+                              and (abs(steer_angle_deg) >= 20.0 or actual >= 0.005))
+      turn_active = measured_turn or launch_turn or turn_in_progress
       request = self.turn_propulsion.update(float(output_a_target), speed=float(v_ego),
         target=float(target) if target is not None else float('nan'), actual_curvature=float(actual),
         mpc_accel=float(output_a_target_mpc), model_accel=float(output_a_target_e2e),
         upper_accel=float(accel_clip[1]), now=now,
         ready=bool(inputs_fresh and self.corner_assist.config['corner_assist']
-                   and (measured_turn or launch_turn) and cc.longActive and not reset_state
-                   and (intent_valid or launch_turn)),
+                   and turn_active and cc.longActive and not reset_state
+                   and (intent_valid or launch_turn or turn_in_progress)),
         blocked=bool(planning_has_lead or self.output_should_stop or output_should_stop_mpc
                      or output_should_stop_e2e or normal_stop_active or force_slow_decel
                      or model.action.shouldStop or corner_braking or model_wrong_way

@@ -350,10 +350,13 @@ class NavigationDesire:
     if side is None:
       return result('none', 'Unsupported direction; no U-turn or sharp-turn automation')
     if not reliable_position(state):
-      self.reset_countdown(state)
-      self.confirmed = False
-      self.started = None
-      return result('none', 'Navigation position uncertain: GPS accuracy or route match unavailable')
+      if (self.turn_guidance_started or self.confirmed) and speed < 1.0:
+        pass
+      else:
+        self.reset_countdown(state)
+        self.confirmed = False
+        self.started = None
+        return result('none', 'Navigation position uncertain: GPS accuracy or route match unavailable')
     distance = self.maneuver_distance(state, speed, now)
     self.decision.update(raw_distance_m=raw_distance, distance_m=distance,
                          snapshot_age_s=now-state['received_mono'],
@@ -361,10 +364,13 @@ class NavigationDesire:
                          source_gps_age_s=state.get('position_quality',{}).get('gps_age_s'),
                          decision_at_unix=time.time())
     if distance is None:
-      self.confirmed = False
-      self.started = None
-      self.turn_guidance_started = False
-      return result('none', 'Countdown paused; waiting for a fresh route snapshot')
+      if (self.turn_guidance_started or self.confirmed) and speed < 1.0:
+        distance = 0.0
+      else:
+        self.confirmed = False
+        self.started = None
+        self.turn_guidance_started = False
+        return result('none', 'Countdown paused; waiting for a fresh route snapshot')
     if self.passed_key == key:
       self.confirmed = False
       self.started = None

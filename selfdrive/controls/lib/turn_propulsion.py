@@ -32,13 +32,49 @@ class TurnPropulsionPlan:
     self.diagnostic = {'reason': reason, 'supporting': False, 'upper_accel': None}
 
   def update(self, base, *, speed, target, actual_curvature, mpc_accel, model_accel,
-             upper_accel, now, ready, blocked, profile_owned=False):
+             upper_accel, now, ready, blocked, profile_owned=False,
+             turn_assist_enabled=False, steer_angle_deg=0.0):
     values=(base,speed,target,actual_curvature,mpc_accel,model_accel,upper_accel,now)
     if not ready or blocked or not all(type(v) in (int,float) and math.isfinite(v) for v in values):
       self.reset('BLOCKED_OR_UNAVAILABLE');return base
-    if (not .3 <= speed <= 15.65 or target <= 0 or actual_curvature < 0
-        or base < self.WEAK_COAST_MIN or model_accel < self.WEAK_COAST_MIN or mpc_accel <= 0):
-      self.reset('BRAKING_OR_NO_MPC_PERMISSION');return base
+
+    abs_steer = abs(steer_angle_deg) if (type(steer_angle_deg) in (int, float) and math.isfinite(steer_angle_deg)) else 0.0
+
+    # ── Stop-to-Turn Launch Assist (behind UI toggle) ──
+    if turn_assist_enabled and speed < 2.5 and (abs_steer >= 25.0 or actual_curvature >= 0.005):
+      dt = .05 if self.last_time is None else now - self.last_time
+      if not 0 < dt <= .15:
+        self.reset('STALE_TIMESTEP'); return base
+      self.last_time = now
+      steer_intensity = min(1.0, max(0.0, (abs_steer - 25.0) / 75.0))
+      speed_fade = max(0.0, min(1.0, (2.5 - max(0.0, speed)) / 2.5))
+      launch_floor = (0.18 + 0.17 * steer_intensity) * speed_fade
+      launch_cap = min(0.40, upper_accel)
+      self.upper = launch_cap
+      request = min(launch_cap, max(base, launch_floor))
+      self.diagnostic = {
+        'reason': 'LAUNCH_TURN_ASSIST',
+        'supporting': request > max(0., base),
+        'target_mps': target,
+        'speed_mps': speed,
+        'steer_angle_deg': abs_steer,
+        'launch_floor': launch_floor,
+        'upper_accel': launch_cap,
+        'request_accel': request,
+        'base_accel': base,
+      }
+      return request
+
+    if not turn_assist_enabled:
+      if (not .3 <= speed <= 15.65 or target <= 0 or actual_curvature < 0
+          or base < self.WEAK_COAST_MIN or model_accel < self.WEAK_COAST_MIN or mpc_accel <= 0):
+        self.reset('BRAKING_OR_NO_MPC_PERMISSION');return base
+    else:
+      # Turn assist active: do not drop out on mild model hesitation, but respect true braking (< -0.50 m/s^2)
+      if (not .3 <= speed <= 15.65 or actual_curvature < 0 or base < -0.50):
+        self.reset('BRAKING_OR_NO_MPC_PERMISSION');return base
+      if not (type(target) in (int, float) and math.isfinite(target) and target > 0):
+        target = min(max(3.0, speed + 1.5), 6.7)
     dt=.05 if self.last_time is None else now-self.last_time
     if not 0 < dt <= .15:
       self.reset('STALE_TIMESTEP');return base
@@ -46,16 +82,41 @@ class TurnPropulsionPlan:
     lateral=speed*speed*actual_curvature
     remaining=math.sqrt(max(0.,self.TOTAL_COMFORT_ACCEL**2-lateral**2))
     error=target-speed
-    upper=max(0.,min(self.MAX_ACCEL,upper_accel,mpc_accel,remaining,max(0.,error)/dt))
+    if not turn_assist_enabled:
+      upper=max(0.,min(self.MAX_ACCEL,upper_accel,mpc_accel,remaining,max(0.,error)/dt))
+    else:
+      upper=max(0.,min(self.MAX_ACCEL,upper_accel,remaining,max(0.,error)/dt))
     self.upper=upper
+    if turn_assist_enabled and (abs_steer >= 20.0 or actual_curvature >= 0.005 or profile_owned):
+      # Turn assist enabled: provide a comfort-bounded maintenance floor to prevent bogging down in any turn
+      curv_intensity = min(1.0, max(0.0, (actual_curvature - 0.005) / 0.020))
+      steer_intensity = min(1.0, max(0.0, (abs_steer - 20.0) / 60.0))
+      intensity = max(curv_intensity, steer_intensity)
+      maint_floor = (0.10 + 0.18 * intensity) * min(1.0, speed / 2.5)
+      maint_floor = min(maint_floor, remaining * 0.70, upper)
+      request = min(upper, max(base, maint_floor))
+      self.diagnostic = {
+        'reason': 'TURN_SPEED_MAINTENANCE',
+        'supporting': request > max(0., base),
+        'target_mps': target,
+        'speed_error_mps': error if math.isfinite(error) else 0.0,
+        'actual_curvature': actual_curvature,
+        'lateral_accel': lateral,
+        'comfort_remaining': remaining,
+        'upper_accel': upper,
+        'maint_floor': maint_floor,
+        'request_accel': request,
+        'base_accel': base,
+      }
+      return request
     if profile_owned:
-      # The existing MPC owns tracking the shared turn-speed profile. Apply
-      # its ceiling here, without a second PI loop increasing acceleration.
-      self.integral=self.accel=0.
-      self.diagnostic={'reason':'TURN_PROFILE_CEILING','supporting':False,
-        'target_mps':target,'upper_accel':upper,'base_accel':base,
-        'request_accel':min(base,upper)}
-      return min(base,upper)
+      if not turn_assist_enabled:
+        # Stock behavior: apply ceiling only, without a second PI loop
+        self.integral=self.accel=0.
+        self.diagnostic={'reason':'TURN_PROFILE_CEILING','supporting':False,
+          'target_mps':target,'upper_accel':upper,'base_accel':base,
+          'request_accel':min(base,upper)}
+        return min(base,upper)
     # No integral accumulation against a binding ceiling or above target.
     if error > 0 and upper > 0:
       self.integral=min(1.,self.integral+error*dt)
