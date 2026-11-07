@@ -380,7 +380,7 @@ def map_curve_speed_cap(path=MAP_CONTEXT_SNAPSHOT, now=None, v_ego=None, consume
           if not isinstance(event, dict):
             continue
 
-          if event.get('type') not in ('stop_sign', 'traffic_signal', 'give_way') or str(event.get('node_id')) in consumed_stops:
+          if event.get('type') != 'stop_sign' or str(event.get('node_id')) in consumed_stops:
             continue
 
           distance = event.get(

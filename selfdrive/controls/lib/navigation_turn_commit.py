@@ -377,7 +377,7 @@ class ManualTurnCommit:
   # model has already committed deeply into the intersection.
   EVIDENCE_SECONDS = 0.20
   RAMP_SECONDS = 0.25
-  HOLD_SECONDS = 0.75
+  HOLD_SECONDS = 1.75
   MAX_SECONDS = 8.0
   MAX_ACCEL = 1.5
   MIN_CURVATURE = 0.004
@@ -793,9 +793,13 @@ class ManualTurnCommit:
     self.active = False
     one = bool(cs.leftBlinker) != bool(cs.rightBlinker)
     nav_ok = navigation_turn_intent(cs,decision,model,now) if isinstance(decision,dict) else False
-    if not cs.leftBlinker and not cs.rightBlinker and not nav_ok:
+    turn_in_progress = self.started is not None
+    if not cs.leftBlinker and not cs.rightBlinker and not nav_ok and not turn_in_progress:
       self.blocked = False
       self.reset()
+      return curvature
+    if turn_in_progress and ((self.direction == 1 and cs.rightBlinker) or (self.direction == 2 and cs.leftBlinker)):
+      self.cancel()
       return curvature
     if cs.steeringPressed and not getattr(cs, "steeringDisengage", False):
       self.cancel()
@@ -834,10 +838,10 @@ class ManualTurnCommit:
       self.suspend()
       self.state = "MANUAL STOP WAIT"
       return curvature
-    if (not healthy or not lat_active or (not one and not nav_ok) or not fresh or not paired
+    if (not healthy or not lat_active or (not one and not nav_ok and not turn_in_progress) or not fresh or not paired
         or not 0 <= dt <= 0.1 or self.blocked
         or type(direction) is not int or direction not in (1, 2)
-        or (not nav_ok and (direction == 1) != bool(cs.leftBlinker))
+        or (not nav_ok and not turn_in_progress and (direction == 1) != bool(cs.leftBlinker))
         or decision.get('city_turns_enabled') is not True
         # Physical ownership plus the independent near-corner dwell authorizes
         # the seed; model selection must not be a prerequisite for correcting it.
@@ -1027,11 +1031,6 @@ class ManualTurnCommit:
 
     age = now - self.last_evidence
     if age > self.HOLD_SECONDS:
-      self.cancel()
-      return curvature
-    # Loss of turn geometry releases the seed immediately. Final curvature
-    # limiting handles unwind; retaining a synthetic arc here delayed exits.
-    if not credible:
       self.cancel()
       return curvature
     ramp_seconds = (
@@ -1360,9 +1359,7 @@ class CityTurnIntent:
           and self.search_elapsed < ManualTurnCommit.MAX_SECONDS
           and self.search_distance <= self.LOW_INTENT_MAX_DISTANCE
         )
-        scene_evidence = ManualTurnCommit.turn_shape_evidence(model, sign, continuing=True)
-        brief_geometry_gap = (scene_evidence is not None and scene_evidence[0]
-                              and self.last_evidence is not None
+        brief_geometry_gap = (self.last_evidence is not None
                               and now - self.last_evidence <= ManualTurnCommit.HOLD_SECONDS)
         if not (stop_grace or brief_geometry_gap):
           self.cancel('PATH_CREDIBILITY_LOST')
@@ -1508,6 +1505,7 @@ class NavigationGeometryCommit:
   def reset(self):
     self.active = self.acquired = self.blocked = False
     self.started = self.evidence_since = self.last_time = self.frame = self.frame_time = None
+    self.last_evidence = None
     self.frames = 0
     self.heading = self.distance = self.floor = 0.0
     self.state = 'NAV GEOMETRY WAIT'
@@ -1548,12 +1546,17 @@ class NavigationGeometryCommit:
     sign = -1 if decision['desire'] == 'turnLeft' else 1
     evidence = ManualTurnCommit.path_evidence(model, sign, require_raw_direction=False,
                                              continuing=self.started is not None)
-    if evidence is None or not evidence[0]:
+    if evidence is not None and evidence[0]:
+      self.last_evidence = now
+    else:
       self.evidence_since = None
       self.frames = 0
       self.last_time = None
       self.state = 'NAV NO MATCHING PATH'
-      # Once entry began, loss of geometry cannot resurrect an old seed.
+      if self.started is not None and self.last_evidence is not None and (now - self.last_evidence) <= 1.5:
+        self.active = True
+        self.state = 'NAV HOLD GRACE'
+        return curvature
       self.blocked = self.started is not None
       return curvature
     frame = getattr(model, 'frameId', None)

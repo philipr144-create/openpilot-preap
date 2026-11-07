@@ -744,6 +744,8 @@ def raw_geometry(lat0, lon0, points):
     out.append({
       "x": x,
       "y": y,
+      "lat": lat,
+      "lon": lon,
       "distance": cumulative,
       "node": node,
       "way_id": way_id,
@@ -1134,14 +1136,154 @@ def node_events(geom):
 
   return events
 
-def find_upcoming_speed_limit(geom, ways, current_way):
+DEFAULT_HIGHWAY_SPEEDS_MPS = {
+  "motorway": 70.0 * 0.44704,
+  "motorway_link": 45.0 * 0.44704,
+  "trunk": 65.0 * 0.44704,
+  "trunk_link": 40.0 * 0.44704,
+  "primary": 55.0 * 0.44704,
+  "primary_link": 35.0 * 0.44704,
+  "secondary": 50.0 * 0.44704,
+  "secondary_link": 30.0 * 0.44704,
+  "tertiary": 45.0 * 0.44704,
+  "tertiary_link": 25.0 * 0.44704,
+  "residential": 25.0 * 0.44704,
+  "living_street": 15.0 * 0.44704,
+  "service": 15.0 * 0.44704,
+  "unclassified": 35.0 * 0.44704,
+}
+
+LEARNED_SIGNS_PATH = "/data/nap_learned_signs.json"
+
+def load_learned_signs():
+  try:
+    if os.path.exists(LEARNED_SIGNS_PATH):
+      with open(LEARNED_SIGNS_PATH, "r") as f:
+        data = json.load(f)
+        if isinstance(data, list):
+          return data
+  except Exception:
+    pass
+  return []
+
+def record_learned_sign(lat, lon, speed_mps, learned_signs, heading_deg=None):
+  if not (isinstance(lat, (int, float)) and isinstance(lon, (int, float)) and isinstance(speed_mps, (int, float))):
+    return learned_signs
+  if speed_mps <= 0 or speed_mps > 50:
+    return learned_signs
+  for s in learned_signs:
+    if abs(s.get("lat", 0) - lat) < 0.00045 and abs(s.get("lon", 0) - lon) < 0.00055:
+      s_heading = s.get("heading_deg", s.get("bearing_deg"))
+      if heading_deg is not None and s_heading is not None:
+        if abs(angle_diff_deg(s_heading, heading_deg)) > 65.0:
+          continue
+      s["speed_mps"] = round(speed_mps, 2)
+      s["speed_mph"] = round(speed_mps * 2.236936, 1)
+      s["time"] = time.time()
+      if heading_deg is not None:
+        s["heading_deg"] = round(heading_deg, 1)
+      _save_learned_signs(learned_signs)
+      return learned_signs
+  entry = {
+    "lat": round(lat, 5),
+    "lon": round(lon, 5),
+    "speed_mps": round(speed_mps, 2),
+    "speed_mph": round(speed_mps * 2.236936, 1),
+    "time": time.time(),
+  }
+  if heading_deg is not None:
+    entry["heading_deg"] = round(heading_deg, 1)
+  learned_signs.append(entry)
+  _save_learned_signs(learned_signs)
+  return learned_signs
+
+def _save_learned_signs(learned_signs):
+  try:
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", dir="/data", delete=False) as tf:
+      json.dump(learned_signs, tf)
+      temp_name = tf.name
+    os.replace(temp_name, LEARNED_SIGNS_PATH)
+  except Exception:
+    pass
+
+def get_way_speed_mps(way):
+  if not way or not hasattr(way, "tags") or not isinstance(way.tags, dict):
+    return None
+  explicit = parse_speed_mps(way.tags.get("maxspeed"))
+  if explicit is not None:
+    return explicit
+  return DEFAULT_HIGHWAY_SPEEDS_MPS.get(way.tags.get("highway"))
+
+def find_upcoming_speed_limit(geom, ways, current_way, learned_signs=None, current_bearing=None, current_lat=None, current_lon=None):
   """Detect forward speed limit drops along the mapped path for anticipatory coast/decel."""
   if not geom or not current_way:
     return None
 
   ways_dict = ways if isinstance(ways, dict) else {w.id: w for w in ways}
-  current_speed = parse_speed_mps(current_way.tags.get("maxspeed"))
+  current_speed = get_way_speed_mps(current_way)
 
+  # 1. Check forward learned physical signs along geometry & vehicle corridor
+  if learned_signs:
+    # Use origin coords from vehicle GPS or geom[0]
+    lat0 = current_lat if current_lat is not None else (geom[0].get("lat") if geom else None)
+    lon0 = current_lon if current_lon is not None else (geom[0].get("lon") if geom else None)
+
+    candidates = []
+    for sign in learned_signs:
+      s_lat, s_lon = sign.get("lat"), sign.get("lon")
+      s_mps = sign.get("speed_mps")
+      s_heading = sign.get("heading_deg", sign.get("bearing_deg"))
+      if s_lat is None or s_lon is None or s_mps is None:
+        continue
+
+      # Only consider signs lower than current speed
+      if current_speed is not None and s_mps >= current_speed - 0.5:
+        continue
+
+      # Heading check
+      if s_heading is not None and current_bearing is not None:
+        if abs(angle_diff_deg(current_bearing, s_heading)) > 65.0:
+          continue
+
+      # Check direct forward distance and corridor alignment from vehicle
+      matched_dist = None
+      if lat0 is not None and lon0 is not None and current_bearing is not None:
+        dx, dy = local_xy(s_lat, s_lon, lat0, lon0)
+        direct_dist = math.hypot(dx, dy)
+        if 15.0 <= direct_dist <= 350.0:
+          bearing_to_sign = (math.degrees(math.atan2(dx, dy)) + 360.0) % 360.0
+          angle_to_sign = abs(angle_diff_deg(current_bearing, bearing_to_sign))
+          lateral_dist = abs(direct_dist * math.sin(math.radians(angle_to_sign)))
+          if angle_to_sign <= 35.0 and lateral_dist <= 25.0:
+            matched_dist = direct_dist
+
+      # Also check discrete points in geom (for curving roads)
+      if matched_dist is None:
+        for pt in geom:
+          dist = pt.get("distance", 0.0)
+          if dist < 15.0 or dist > 350.0:
+            continue
+          pt_lat, pt_lon = pt.get("lat"), pt.get("lon")
+          if pt_lat is not None and pt_lon is not None:
+            if abs(pt_lat - s_lat) < 0.00060 and abs(pt_lon - s_lon) < 0.00075:
+              matched_dist = dist
+              break
+
+      if matched_dist is not None:
+        candidates.append({
+          "target_mps": round(s_mps, 2),
+          "target_mph": round(s_mps * 2.236936, 1),
+          "distance_m": round(matched_dist, 1),
+          "current_mps": round(current_speed, 2) if current_speed else round(s_mps, 2),
+          "current_mph": round(current_speed * 2.236936, 1) if current_speed else round(s_mps * 2.236936, 1),
+          "source": "learned_sign",
+        })
+
+    if candidates:
+      return min(candidates, key=lambda c: c["distance_m"])
+
+  # 2. Check forward ways in map geometry (explicit maxspeed or classification)
   for pt in geom:
     way_id = pt.get("way_id")
     dist = pt.get("distance", 0.0)
@@ -1150,7 +1292,7 @@ def find_upcoming_speed_limit(geom, ways, current_way):
     next_way = ways_dict.get(way_id)
     if not next_way:
       continue
-    next_speed = parse_speed_mps(next_way.tags.get("maxspeed"))
+    next_speed = get_way_speed_mps(next_way)
     if next_speed is None:
       continue
     if current_speed is None:
@@ -1218,6 +1360,8 @@ class NapMapD:
 
     self.nodes = {}
     self.ways = []
+    self.learned_signs = load_learned_signs()
+    self.last_learned_sign_check = 0.0
 
     self.last_fetch_attempt = 0.0
     self.last_error = None
@@ -1334,6 +1478,21 @@ class NapMapD:
     lon = float(gps.longitude)
     speed = float(gps.speed)
     bearing = float(gps.bearingDeg)
+
+    # Continuously learn new physical speed limit signs from camera
+    if now_mono - self.last_learned_sign_check >= 1.0:
+      self.last_learned_sign_check = now_mono
+      try:
+        if os.path.exists("/dev/shm/mpp_speed_limit"):
+          with open("/dev/shm/mpp_speed_limit", "r") as f:
+            val = float(f.read().strip() or 0.0)
+            if val > 0.0:
+              last_val = getattr(self, "_last_learned_mpp_val", None)
+              if last_val is None or abs(val - last_val) > 0.5:
+                self._last_learned_mpp_val = val
+                self.learned_signs = record_learned_sign(lat, lon, val, self.learned_signs, heading_deg=bearing)
+      except Exception:
+        pass
 
     payload["gps"] = {
       "latitude": lat,
@@ -1491,7 +1650,7 @@ class NapMapD:
       "route_point_count": len(route_points),
       "control_curve": control_curve,
       "control_curves": control_curves[:10],
-      "upcoming_speed_limit": find_upcoming_speed_limit(geom, self.ways, way),
+      "upcoming_speed_limit": find_upcoming_speed_limit(geom, self.ways, way, getattr(self, "learned_signs", None), current_bearing=bearing, current_lat=lat, current_lon=lon),
       # Full spatial shape feeds the MPC; event percentiles remain UI only.
       "road_curvature_version": 1,
       "road_curvature_valid": not path_ambiguous or route_guided,

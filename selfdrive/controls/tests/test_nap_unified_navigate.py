@@ -94,6 +94,96 @@ class TestNAPUnifiedNavigate(unittest.TestCase):
     )
     self.assertGreater(req, 0.0)
     self.assertEqual(tp.diagnostic['reason'], 'TURN_SPEED_MAINTENANCE')
+
+  def test_turn_commit_hold_grace_prevents_premature_abort(self):
+    from openpilot.selfdrive.controls.lib.navigation_turn_commit import ManualTurnCommit
+    def make_model(raw_curv=-0.03, credible=True):
+      if credible:
+        ts = [0.0, 1.0, 2.0, 3.0]
+        xs = [0.0, 4.0, 8.0, 10.0]
+        ys = [0.0, -0.5, -2.0, -4.0]
+        yaw = [0.0, -0.1, -0.3, -0.6]
+      else:
+        ts = [0.0, 1.0, 2.0, 3.0]
+        xs = [0.0, 4.0, 8.0, 10.0]
+        ys = [0.0, 0.0, 0.0, 0.0]
+        yaw = [0.0, 0.0, 0.0, 0.0]
+      return N(frameId=1, position=N(t=ts, x=xs, y=ys), orientation=N(z=yaw), action=N(desiredCurvature=raw_curv))
+
+    c = ManualTurnCommit()
+    cs = N(leftBlinker=True, rightBlinker=False, steeringPressed=False, steeringDisengage=False, vEgo=6.7, gearShifter='drive', canValid=True, leftBlindspot=False, rightBlindspot=False)
+
+    # Qualify entry
+    for i in range(10):
+      m = make_model()
+      m.frameId = i + 1
+      d = {'received_mono': 100.0 + i * 0.05, 'frame_id': i + 1, 'manual_turn_direction': 1, 'city_turns_enabled': True, 'signal_owner': 'driver', 'tap_signal_active': False, 'synthetic_indicator_request': 'none', 'source': 'driver_desire_helper', 'final_desire': 'turnLeft', 'manual_turn_blocked': False, 'model_evaluated': True}
+      c.update(0.0, cs, True, d, m, True, 0.0, 100.0 + i * 0.05)
+
+    self.assertIsNotNone(c.started)
+    self.assertTrue(c.active)
+    self.assertFalse(c.blocked)
+
+    # Simulate momentary loss of evidence (0.1s gap)
+    m_bad = make_model(credible=False)
+    m_bad.frameId = 11
+    d_bad = {'received_mono': 100.55, 'frame_id': 11, 'manual_turn_direction': 1, 'city_turns_enabled': True, 'signal_owner': 'driver', 'tap_signal_active': False, 'synthetic_indicator_request': 'none', 'source': 'driver_desire_helper', 'final_desire': 'turnLeft', 'manual_turn_blocked': False, 'model_evaluated': True}
+    c.update(0.0, cs, True, d_bad, m_bad, True, 0.0, 100.55)
+    self.assertFalse(c.blocked)
+    self.assertTrue(c.active)
+    self.assertEqual(c.state, 'MANUAL UNWIND')
+
+    # Evidence returns
+    m_good = make_model()
+    m_good.frameId = 12
+    d_good = {'received_mono': 100.60, 'frame_id': 12, 'manual_turn_direction': 1, 'city_turns_enabled': True, 'signal_owner': 'driver', 'tap_signal_active': False, 'synthetic_indicator_request': 'none', 'source': 'driver_desire_helper', 'final_desire': 'turnLeft', 'manual_turn_blocked': False, 'model_evaluated': True}
+    c.update(0.0, cs, True, d_good, m_good, True, 0.0, 100.60)
+    self.assertTrue(c.active)
+    self.assertFalse(c.blocked)
+    self.assertEqual(c.state, 'MANUAL TURN')
+
+  def test_turn_commit_latches_across_mechanical_stalk_cancellation(self):
+    from openpilot.selfdrive.controls.lib.navigation_turn_commit import ManualTurnCommit
+    def make_model(raw_curv=-0.03):
+      ts = [0.0, 1.0, 2.0, 3.0]
+      xs = [0.0, 4.0, 8.0, 10.0]
+      ys = [0.0, -0.5, -2.0, -4.0]
+      yaw = [0.0, -0.1, -0.3, -0.6]
+      return N(frameId=1, position=N(t=ts, x=xs, y=ys), orientation=N(z=yaw), action=N(desiredCurvature=raw_curv))
+
+    c = ManualTurnCommit()
+    cs = N(leftBlinker=True, rightBlinker=False, steeringPressed=False, steeringDisengage=False, vEgo=6.7, gearShifter='drive', canValid=True, leftBlindspot=False, rightBlindspot=False)
+
+    for i in range(10):
+      m = make_model()
+      m.frameId = i + 1
+      d = {'received_mono': 100.0 + i * 0.05, 'frame_id': i + 1, 'manual_turn_direction': 1, 'city_turns_enabled': True, 'signal_owner': 'driver', 'tap_signal_active': False, 'synthetic_indicator_request': 'none', 'source': 'driver_desire_helper', 'final_desire': 'turnLeft', 'manual_turn_blocked': False, 'model_evaluated': True}
+      c.update(0.0, cs, True, d, m, True, 0.0, 100.0 + i * 0.05)
+
+    self.assertIsNotNone(c.started)
+    self.assertTrue(c.active)
+
+    # Mechanical cancel cam trips stalk to neutral mid-turn!
+    cs.leftBlinker = False
+    cs.rightBlinker = False
+    m = make_model()
+    m.frameId = 11
+    d = {'received_mono': 100.55, 'frame_id': 11, 'manual_turn_direction': 1, 'city_turns_enabled': True, 'signal_owner': 'driver', 'tap_signal_active': False, 'synthetic_indicator_request': 'none', 'source': 'driver_desire_helper', 'final_desire': 'turnLeft', 'manual_turn_blocked': False, 'model_evaluated': True, 'manual_turn_phase': 'TURN'}
+    c.update(0.0, cs, True, d, m, True, 0.0, 100.55)
+    # Must remain active through the corner!
+    self.assertTrue(c.active)
+    self.assertFalse(c.blocked)
+    self.assertIsNotNone(c.started)
+    self.assertEqual(c.state, 'MANUAL TURN')
+
+    # Driver indicates opposite direction (right turn) -> must cancel immediately
+    cs.rightBlinker = True
+    m = make_model()
+    m.frameId = 12
+    c.update(0.0, cs, True, d, m, True, 0.0, 100.60)
+    self.assertFalse(c.active)
+    self.assertTrue(c.blocked)
+    self.assertIsNone(c.started)
     self.assertTrue(tp.diagnostic['supporting'])
 
     # Verify ISO friction circle comfort limit remaining
@@ -193,6 +283,39 @@ class TestNAPUnifiedNavigate(unittest.TestCase):
     self.assertAlmostEqual(res['target_mps'], 35.0 / 2.236936, places=2)
     self.assertEqual(res['target_mph'], 35.0)
     self.assertEqual(res['distance_m'], 150.0)
+
+  def test_find_upcoming_speed_limit_via_highway_classification(self):
+    w1 = N(id=201, tags={'highway': 'primary', 'ref': 'MO 7'})
+    w2 = N(id=202, tags={'highway': 'residential', 'name': 'Russell Ln'})
+    ways = {201: w1, 202: w2}
+    geom = [
+      {'distance': 0.0, 'way_id': 201},
+      {'distance': 100.0, 'way_id': 201},
+      {'distance': 250.0, 'way_id': 202},
+    ]
+    res = find_upcoming_speed_limit(geom, ways, w1)
+    self.assertIsNotNone(res)
+    self.assertEqual(res['target_mph'], 25.0)
+    self.assertEqual(res['distance_m'], 250.0)
+
+  def test_find_upcoming_speed_limit_via_learned_signs(self):
+    w1 = N(id=301, tags={'highway': 'primary', 'ref': 'MO 7'})
+    ways = {301: w1}
+    geom = [
+      {'distance': 0.0, 'way_id': 301, 'lat': 37.8550, 'lon': -92.3750},
+      {'distance': 200.0, 'way_id': 301, 'lat': 37.8578, 'lon': -92.3778},
+    ]
+    learned = [{'lat': 37.85782, 'lon': -92.37783, 'heading_deg': 285.0, 'speed_mps': 20.12, 'speed_mph': 45.0}]
+    # Matching direction (bearing 280 deg aligns with 285 deg sign)
+    res = find_upcoming_speed_limit(geom, ways, w1, learned_signs=learned, current_bearing=280.0)
+    self.assertIsNotNone(res)
+    self.assertEqual(res['target_mph'], 45.0)
+    self.assertEqual(res['distance_m'], 200.0)
+    self.assertEqual(res['source'], 'learned_sign')
+
+    # Opposite direction (bearing 105 deg opposite to 285 deg sign -> ignored)
+    res_opp = find_upcoming_speed_limit(geom, ways, w1, learned_signs=learned, current_bearing=105.0)
+    self.assertIsNone(res_opp)
 
   def test_map_curve_speed_cap_anticipatory_speed_drop(self):
     now = time.monotonic()
@@ -490,27 +613,40 @@ class TestNAPUnifiedNavigate(unittest.TestCase):
   # ─── 4. Drive 44a Specific Regression Tests ───
 
   def test_stop_sign_and_traffic_signal_map_cap(self):
-    """Verify that both stop_sign and traffic_signal produce approach speed caps."""
+    """Verify stop_sign produces approach speed caps while traffic_signal is left to the vision model."""
     now = 100.0
     with tempfile.NamedTemporaryFile(mode='w', suffix='.json') as tf:
-      # Map context snapshot with a traffic signal at 40m
-      data = {
+      # 1. Traffic signal alone should NOT produce a static map speed cap (vision model decides based on light color)
+      data_sig = {
         'version': 3, 'enabled': True, 'valid': True, 'control_valid': True, 'status': 'ok',
         'mono_time': now, 'expires_mono': now + 1.0,
         'match': {'distance_m': 1.0, 'heading_error_deg': 2.0, 'confidence': 0.95},
         'lookahead_m': 200.0,
         'events': [
           {'type': 'traffic_signal', 'node_id': 101, 'distance_m': 40.0},
-          {'type': 'stop_sign', 'node_id': 102, 'distance_m': 80.0},
         ]
       }
-      tf.write(json.dumps(data))
+      tf.write(json.dumps(data_sig))
       tf.flush()
+      cap_sig = map_curve_speed_cap(path=tf.name, now=now, v_ego=10.0, include_curves=False)
+      self.assertIsNone(cap_sig)
 
-      # map_curve_speed_cap should cap speed down toward MAPPED_STOP_APPROACH_SPEED
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json') as tf:
+      # 2. Stop sign at 40m MUST cap speed down toward MAPPED_STOP_APPROACH_SPEED
+      data_stop = {
+        'version': 3, 'enabled': True, 'valid': True, 'control_valid': True, 'status': 'ok',
+        'mono_time': now, 'expires_mono': now + 1.0,
+        'match': {'distance_m': 1.0, 'heading_error_deg': 2.0, 'confidence': 0.95},
+        'lookahead_m': 200.0,
+        'events': [
+          {'type': 'stop_sign', 'node_id': 102, 'distance_m': 40.0},
+        ]
+      }
+      tf.write(json.dumps(data_stop))
+      tf.flush()
       cap = map_curve_speed_cap(path=tf.name, now=now, v_ego=10.0, include_curves=False)
       self.assertIsNotNone(cap)
-      # 40m traffic signal cap: sqrt(2.23^2 + 2*0.8*(40-5)) ~ sqrt(5 + 56) ~ 7.8 m/s (~17 mph)
+      # 40m stop sign cap: sqrt(2.23^2 + 2*0.8*(40-5)) ~ sqrt(5 + 56) ~ 7.8 m/s (~17 mph)
       self.assertLess(cap, 10.0)
       self.assertGreater(cap, 2.0)
 
@@ -561,6 +697,96 @@ class TestNAPUnifiedNavigate(unittest.TestCase):
     # Must maintain maintenance torque, NOT reset or drop to base 0.05
     self.assertGreater(req_mid, 0.12)
     self.assertEqual(tp.diagnostic['reason'], 'TURN_SPEED_MAINTENANCE')
+
+  def test_turn_commit_hold_grace_prevents_premature_abort(self):
+    from openpilot.selfdrive.controls.lib.navigation_turn_commit import ManualTurnCommit
+    def make_model(raw_curv=-0.03, credible=True):
+      if credible:
+        ts = [0.0, 1.0, 2.0, 3.0]
+        xs = [0.0, 4.0, 8.0, 10.0]
+        ys = [0.0, -0.5, -2.0, -4.0]
+        yaw = [0.0, -0.1, -0.3, -0.6]
+      else:
+        ts = [0.0, 1.0, 2.0, 3.0]
+        xs = [0.0, 4.0, 8.0, 10.0]
+        ys = [0.0, 0.0, 0.0, 0.0]
+        yaw = [0.0, 0.0, 0.0, 0.0]
+      return N(frameId=1, position=N(t=ts, x=xs, y=ys), orientation=N(z=yaw), action=N(desiredCurvature=raw_curv))
+
+    c = ManualTurnCommit()
+    cs = N(leftBlinker=True, rightBlinker=False, steeringPressed=False, steeringDisengage=False, vEgo=6.7, gearShifter='drive', canValid=True, leftBlindspot=False, rightBlindspot=False)
+
+    # Qualify entry
+    for i in range(10):
+      m = make_model()
+      m.frameId = i + 1
+      d = {'received_mono': 100.0 + i * 0.05, 'frame_id': i + 1, 'manual_turn_direction': 1, 'city_turns_enabled': True, 'signal_owner': 'driver', 'tap_signal_active': False, 'synthetic_indicator_request': 'none', 'source': 'driver_desire_helper', 'final_desire': 'turnLeft', 'manual_turn_blocked': False, 'model_evaluated': True}
+      c.update(0.0, cs, True, d, m, True, 0.0, 100.0 + i * 0.05)
+
+    self.assertIsNotNone(c.started)
+    self.assertTrue(c.active)
+    self.assertFalse(c.blocked)
+
+    # Simulate momentary loss of evidence (0.1s gap)
+    m_bad = make_model(credible=False)
+    m_bad.frameId = 11
+    d_bad = {'received_mono': 100.55, 'frame_id': 11, 'manual_turn_direction': 1, 'city_turns_enabled': True, 'signal_owner': 'driver', 'tap_signal_active': False, 'synthetic_indicator_request': 'none', 'source': 'driver_desire_helper', 'final_desire': 'turnLeft', 'manual_turn_blocked': False, 'model_evaluated': True}
+    c.update(0.0, cs, True, d_bad, m_bad, True, 0.0, 100.55)
+    self.assertFalse(c.blocked)
+    self.assertTrue(c.active)
+    self.assertEqual(c.state, 'MANUAL UNWIND')
+
+    # Evidence returns
+    m_good = make_model()
+    m_good.frameId = 12
+    d_good = {'received_mono': 100.60, 'frame_id': 12, 'manual_turn_direction': 1, 'city_turns_enabled': True, 'signal_owner': 'driver', 'tap_signal_active': False, 'synthetic_indicator_request': 'none', 'source': 'driver_desire_helper', 'final_desire': 'turnLeft', 'manual_turn_blocked': False, 'model_evaluated': True}
+    c.update(0.0, cs, True, d_good, m_good, True, 0.0, 100.60)
+    self.assertTrue(c.active)
+    self.assertFalse(c.blocked)
+    self.assertEqual(c.state, 'MANUAL TURN')
+
+  def test_turn_commit_latches_across_mechanical_stalk_cancellation(self):
+    from openpilot.selfdrive.controls.lib.navigation_turn_commit import ManualTurnCommit
+    def make_model(raw_curv=-0.03):
+      ts = [0.0, 1.0, 2.0, 3.0]
+      xs = [0.0, 4.0, 8.0, 10.0]
+      ys = [0.0, -0.5, -2.0, -4.0]
+      yaw = [0.0, -0.1, -0.3, -0.6]
+      return N(frameId=1, position=N(t=ts, x=xs, y=ys), orientation=N(z=yaw), action=N(desiredCurvature=raw_curv))
+
+    c = ManualTurnCommit()
+    cs = N(leftBlinker=True, rightBlinker=False, steeringPressed=False, steeringDisengage=False, vEgo=6.7, gearShifter='drive', canValid=True, leftBlindspot=False, rightBlindspot=False)
+
+    for i in range(10):
+      m = make_model()
+      m.frameId = i + 1
+      d = {'received_mono': 100.0 + i * 0.05, 'frame_id': i + 1, 'manual_turn_direction': 1, 'city_turns_enabled': True, 'signal_owner': 'driver', 'tap_signal_active': False, 'synthetic_indicator_request': 'none', 'source': 'driver_desire_helper', 'final_desire': 'turnLeft', 'manual_turn_blocked': False, 'model_evaluated': True}
+      c.update(0.0, cs, True, d, m, True, 0.0, 100.0 + i * 0.05)
+
+    self.assertIsNotNone(c.started)
+    self.assertTrue(c.active)
+
+    # Mechanical cancel cam trips stalk to neutral mid-turn!
+    cs.leftBlinker = False
+    cs.rightBlinker = False
+    m = make_model()
+    m.frameId = 11
+    d = {'received_mono': 100.55, 'frame_id': 11, 'manual_turn_direction': 1, 'city_turns_enabled': True, 'signal_owner': 'driver', 'tap_signal_active': False, 'synthetic_indicator_request': 'none', 'source': 'driver_desire_helper', 'final_desire': 'turnLeft', 'manual_turn_blocked': False, 'model_evaluated': True, 'manual_turn_phase': 'TURN'}
+    c.update(0.0, cs, True, d, m, True, 0.0, 100.55)
+    # Must remain active through the corner!
+    self.assertTrue(c.active)
+    self.assertFalse(c.blocked)
+    self.assertIsNotNone(c.started)
+    self.assertEqual(c.state, 'MANUAL TURN')
+
+    # Driver indicates opposite direction (right turn) -> must cancel immediately
+    cs.rightBlinker = True
+    m = make_model()
+    m.frameId = 12
+    c.update(0.0, cs, True, d, m, True, 0.0, 100.60)
+    self.assertFalse(c.active)
+    self.assertTrue(c.blocked)
+    self.assertIsNone(c.started)
 
 
 if __name__ == '__main__':

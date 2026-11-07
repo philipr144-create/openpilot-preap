@@ -128,10 +128,13 @@ def manual_turn_intent(cs, decision, model, now, require_pair=True, approach=Fal
   speed_max = (35 if decision.get("manual_turn_continuing") is True else 25) * .44704
   if approach and decision.get('turn_locked') is True:
     speed_max = 40 * .44704
+  in_turn = decision.get('manual_turn_phase') in ('TURN', 'EXIT')
+  matching_blinker = ((direction == 1) == bool(cs.leftBlinker)) if not in_turn else (not (cs.rightBlinker if direction == 1 else cs.leftBlinker))
+  blinker_ok = (bool(cs.leftBlinker) != bool(cs.rightBlinker)) if not in_turn else matching_blinker
   return (math.isfinite(cs.vEgo) and -.1 <= cs.vEgo <= speed_max
           and type(direction) is int and direction in (1, 2)
-          and bool(cs.leftBlinker) != bool(cs.rightBlinker)
-          and (direction == 1) == bool(cs.leftBlinker)
+          and blinker_ok
+          and matching_blinker
           and decision.get('city_turns_enabled') is True
           and decision.get('signal_owner') == 'driver'
           and decision.get('tap_signal_active') is False

@@ -84,5 +84,29 @@ class TestPreAPLongControl(unittest.TestCase):
       previous = limited
 
 
+  def test_takeoff_clears_held_stop(self):
+    from openpilot.selfdrive.controls.lib.map_stop import MapStop
+    ms = MapStop()
+    ms.phase = "held"
+    ms.event = ("route1", "stop_node_123")
+
+    # When driver presses gas while held at stop
+    cap, should_stop = ms.update(
+      nav={}, resume={"session": "s1", "sequence": 1, "cruise": True, "enabled": True, "healthy": True, "brake": False, "paused": False, "received_mono": 100., "expires_mono": 102.},
+      enabled=True, active=True, inputs_valid=True, v_ego=0.5, gas=True, now=100.1)
+
+    self.assertIsNone(cap)
+    self.assertFalse(should_stop)
+    self.assertEqual(ms.phase, "idle")
+    self.assertIn("stop_node_123", ms.consumed)
+
+    # When driver lets off gas into the turn:
+    cap2, should_stop2 = ms.update(
+      nav={}, resume={"session": "s1", "sequence": 1, "cruise": True, "enabled": True, "healthy": True, "brake": False, "paused": False, "received_mono": 100.2, "expires_mono": 102.},
+      enabled=True, active=True, inputs_valid=True, v_ego=3.0, gas=False, now=100.3)
+
+    self.assertIsNone(cap2)
+    self.assertFalse(should_stop2)
+
 if __name__ == '__main__':
   unittest.main()

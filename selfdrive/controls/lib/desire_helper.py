@@ -157,24 +157,24 @@ class DesireHelper:
                             and manual_turn_request_controller != self.accepted_request_controller)
       if controller_changed:
         self.manual_entry.cancel('REQUEST_CONTROLLER_CHANGED')
+      turn_in_progress = (self.manual_entry.started is not None and not self.manual_entry.blocked)
       retained = (type(direction) is int and direction == 0
                   and (self.manual_entry.started is not None or self.manual_entry.stop_armed) and not self.manual_entry.blocked
-                  and accepted in (1, 2) and one_blinker
-                  and (accepted == 1) == bool(carstate.leftBlinker)
-                  and manual_turn_request_valid is True
-                  and type(manual_turn_request_controller) is str and bool(manual_turn_request_controller)
-                  and manual_turn_request_controller == self.accepted_request_controller
+                  and accepted in (1, 2) and (one_blinker or turn_in_progress)
+                  and (((accepted == 1) == bool(carstate.leftBlinker)) or turn_in_progress)
+                  and (manual_turn_request_valid is True or turn_in_progress)
+                  and (not controller_changed or turn_in_progress)
                   and type(physical_direction) is int and physical_direction in (0, accepted))
       if retained:
         direction = accepted
       self.manual_turn_direction = direction if classified or retained else 0
       self.manual_turn_gates = {
         'city_turns_enabled': bool(self.manual_turns_enabled), 'inputs_valid': bool(inputs_valid),
-        'lateral_active': bool(lateral_active), 'single_blinker': bool(one_blinker),
+        'lateral_active': bool(lateral_active), 'single_blinker': bool(one_blinker or turn_in_progress),
         'direction_authorized': classified or retained,
-        'request_fresh_for_retention': classified or manual_turn_request_valid is True,
-        'request_controller_unchanged': not controller_changed,
-        'matching_blinker': (direction == 1) == bool(carstate.leftBlinker),
+        'request_fresh_for_retention': classified or manual_turn_request_valid is True or turn_in_progress,
+        'request_controller_unchanged': not controller_changed or turn_in_progress,
+        'matching_blinker': bool(((direction == 1) == bool(carstate.leftBlinker)) or turn_in_progress),
         'no_driver_override': not carstate.steeringPressed and not getattr(carstate, 'steeringDisengage', False),
         'can_valid': bool(getattr(carstate, 'canValid', False)),
         'drive_gear': str(carstate.gearShifter) in ('drive', 'low', 'sport', 'eco'),

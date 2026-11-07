@@ -110,8 +110,13 @@ class MapStop:
       if self.event is not None and v_ego <= .3 and resume.get('paused') is True:
         self.phase = 'held'
     # Hold the *logical* stop through map loss while the driver brakes. A fresh
-    # accepted tap above is the only automatic release of an acquired held stop.
+    # accepted tap or taking off via gas pedal/motion fulfills the held stop.
     if self.phase == 'held':
+      if gas or v_ego > 1.5:
+        if self.event is not None:
+          self.consumed[self.event[1]] = self.travel
+        self.clear()
+        return None, False
       allowed = active and status_ok and resume.get('healthy') is True and not gas
       return (0., True) if allowed else (None, False)
     if not status_ok or resume.get('healthy') is not True:
